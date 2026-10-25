@@ -72,32 +72,35 @@ impl From<serde_json::Error> for AppError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryLink {
+pub struct MemoryReference {
     pub target_key: String,
-    pub relation: String,
+    pub reference_type: String,
 }
 
 #[derive(
     Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, clap::ValueEnum,
 )]
 #[allow(non_camel_case_types)]
-pub enum ClaimType {
-    #[serde(rename = "explicit user statement")]
-    #[value(name = "explicit user statement")]
-    EXPLICIT_USER_STATEMENT,
-    #[serde(rename = "verified observation")]
-    #[value(name = "verified observation")]
-    VERIFIED_OBSERVATION,
-    #[serde(rename = "inference")]
-    #[value(name = "inference")]
-    INFERENCE,
+pub enum Basis {
+    #[serde(rename = "stated")]
+    #[value(name = "stated")]
+    STATED,
+    #[serde(rename = "observed")]
+    #[value(name = "observed")]
+    OBSERVED,
+    #[serde(rename = "inferred")]
+    #[value(name = "inferred")]
+    INFERRED,
+    #[serde(rename = "assumed")]
+    #[value(name = "assumed")]
+    ASSUMED,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryMetadata {
     pub summary: Option<String>,
-    pub claim_type: Option<ClaimType>,
+    pub basis: Option<Basis>,
     pub scope: Option<String>,
     pub observed_at: Option<i64>,
     pub verified_at: Option<i64>,
@@ -126,7 +129,7 @@ pub struct MetadataPatch {
         deserialize_with = "deserialize_nullable",
         skip_serializing_if = "Option::is_none"
     )]
-    pub claim_type: Option<Option<ClaimType>>,
+    pub basis: Option<Option<Basis>>,
     #[serde(
         default,
         deserialize_with = "deserialize_nullable",
@@ -160,11 +163,24 @@ impl MetadataPatch {
                 .summary
                 .clone()
                 .unwrap_or_else(|| current.summary.clone()),
-            claim_type: self.claim_type.unwrap_or(current.claim_type),
+            basis: self.basis.unwrap_or(current.basis),
             scope: self.scope.clone().unwrap_or_else(|| current.scope.clone()),
             observed_at: self.observed_at.unwrap_or(current.observed_at),
             verified_at: self.verified_at.unwrap_or(current.verified_at),
             review_after: self.review_after.unwrap_or(current.review_after),
+        }
+    }
+}
+
+impl From<MemoryMetadata> for MetadataPatch {
+    fn from(metadata: MemoryMetadata) -> Self {
+        Self {
+            summary: Some(metadata.summary),
+            basis: Some(metadata.basis),
+            scope: Some(metadata.scope),
+            observed_at: Some(metadata.observed_at),
+            verified_at: Some(metadata.verified_at),
+            review_after: Some(metadata.review_after),
         }
     }
 }
@@ -188,21 +204,21 @@ pub struct MemoryRecord {
     pub body: String,
     #[serde(flatten)]
     pub metadata: MemoryMetadata,
-    pub kind: String,
+    pub r#type: String,
     pub tags: Vec<String>,
-    pub links: Vec<MemoryLink>,
-    pub actor: String,
+    pub references: Vec<MemoryReference>,
+    pub author: String,
     pub system_version: i64,
     pub system_created_at: i64,
     pub system_updated_at: i64,
     pub system_deleted_at: Option<i64>,
+    pub system_created_by: String,
+    pub system_updated_by: String,
+    pub system_deleted_by: Option<String>,
 }
 
-fn default_kind() -> String {
-    "note".into()
-}
-fn default_actor() -> String {
-    "human".into()
+fn default_type() -> String {
+    "general".into()
 }
 fn default_limit() -> usize {
     20
@@ -219,15 +235,14 @@ pub struct CreateMemory {
     pub title: String,
     pub body: String,
     #[serde(flatten)]
-    pub metadata: MemoryMetadata,
-    #[serde(default = "default_kind")]
-    pub kind: String,
+    pub metadata: MetadataPatch,
+    #[serde(default = "default_type")]
+    pub r#type: String,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub links: Vec<MemoryLink>,
-    #[serde(default = "default_actor")]
-    pub actor: String,
+    pub references: Vec<MemoryReference>,
+    pub author: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -239,11 +254,10 @@ pub struct UpdateMemory {
     pub body: Option<String>,
     #[serde(flatten)]
     pub metadata: MetadataPatch,
-    pub kind: Option<String>,
+    pub r#type: Option<String>,
     pub tags: Option<Vec<String>>,
-    pub links: Option<Vec<MemoryLink>>,
-    #[serde(default = "default_actor")]
-    pub actor: String,
+    pub references: Option<Vec<MemoryReference>>,
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -259,8 +273,6 @@ pub struct RestoreMemory {
     pub key: String,
     pub expected_version: i64,
     pub revision: Option<i64>,
-    #[serde(default = "default_actor")]
-    pub actor: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -278,12 +290,12 @@ pub struct GetMemories {
 #[serde(deny_unknown_fields)]
 pub struct ListMemories {
     pub scope: Option<String>,
-    pub claim_type: Option<ClaimType>,
-    pub kind: Option<String>,
+    pub basis: Option<Basis>,
+    pub r#type: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub linked_to: Option<String>,
-    pub linked_from: Option<String>,
+    pub referenced_to: Option<String>,
+    pub referenced_from: Option<String>,
     #[serde(default)]
     pub include_deleted: bool,
     #[serde(default = "default_limit")]
@@ -295,11 +307,11 @@ impl Default for ListMemories {
     fn default() -> Self {
         Self {
             scope: None,
-            claim_type: None,
-            kind: None,
+            basis: None,
+            r#type: None,
             tags: vec![],
-            linked_to: None,
-            linked_from: None,
+            referenced_to: None,
+            referenced_from: None,
             include_deleted: false,
             limit: 20,
             cursor: None,
@@ -311,9 +323,9 @@ impl Default for ListMemories {
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
     pub scope: Option<String>,
-    pub claim_type: Option<ClaimType>,
+    pub basis: Option<Basis>,
     pub query: String,
-    pub kind: Option<String>,
+    pub r#type: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -322,18 +334,32 @@ pub struct SearchRequest {
     pub fuzzy: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub history: bool,
+    pub as_of: Option<i64>,
+    #[serde(default)]
+    pub include_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub key: String,
     pub title: String,
+    pub body: String,
     pub version: i64,
     pub score: f32,
     #[serde(flatten)]
     pub metadata: MemoryMetadata,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub excerpt: Option<String>,
+    pub r#type: String,
+    pub author: String,
+    pub tags: Vec<String>,
+    pub references: Vec<MemoryReference>,
+    pub system_created_at: i64,
+    pub system_updated_at: i64,
+    pub system_deleted_at: Option<i64>,
+    pub system_created_by: String,
+    pub system_updated_by: String,
+    pub system_deleted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -349,6 +375,9 @@ pub struct TaxonomyRecord {
     pub id: i64,
     pub key: String,
     pub name: String,
+    pub author: String,
+    pub system_created_by: String,
+    pub system_updated_by: String,
     pub system_created_at: i64,
     pub system_updated_at: i64,
 }
@@ -358,6 +387,16 @@ pub struct TaxonomyRecord {
 pub struct TaxonomyInput {
     pub key: String,
     pub name: String,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuthorRecord {
+    pub author: String,
+    pub system_created_at: i64,
+    pub system_updated_at: i64,
+    pub system_created_by: String,
+    pub system_updated_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,49 +414,22 @@ pub struct HistoryRequest {
     pub before_version: Option<i64>,
 }
 
-pub fn markdown_paragraphs(body: &str) -> impl Iterator<Item = &str> {
-    let mut lines = body.split_inclusive('\n');
-    let mut position = 0;
-
-    std::iter::from_fn(move || {
-        let mut start = None;
-        let mut end = position;
-
-        for line in lines.by_ref() {
-            let line_start = position;
-            position += line.len();
-
-            if line.trim().is_empty() {
-                if let Some(start) = start {
-                    return Some(&body[start..end]);
-                }
-
-                continue;
-            }
-
-            start.get_or_insert(line_start);
-            end = line_start + line.trim_end_matches(['\r', '\n']).len();
-        }
-
-        start.map(|start| &body[start..end])
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CreateMemory, GetMemories, MemoryView, UpdateMemory};
+    use super::{GetMemories, MemoryMetadata, UpdateMemory};
     use serde_json::json;
 
     #[test]
     fn metadata_updates_distinguish_omission_null_and_values() {
-        let created: CreateMemory = serde_json::from_value(json!({
-            "key": "example", "body": "Exact Markdown", "summary": "Saved summary", "scope": "project"
-        })).unwrap();
+        let created: MemoryMetadata = serde_json::from_value(json!({
+            "summary": "Saved summary", "scope": "project"
+        }))
+        .unwrap();
         let update: UpdateMemory = serde_json::from_value(json!({
             "key": "example", "expected_version": 1, "summary": null, "verified_at": 123
         }))
         .unwrap();
-        let metadata = update.metadata.apply(&created.metadata);
+        let metadata = update.metadata.apply(&created);
         assert_eq!(metadata.summary, None);
         assert_eq!(metadata.scope.as_deref(), Some("project"));
         assert_eq!(metadata.verified_at, Some(123));
@@ -429,15 +441,15 @@ mod tests {
     #[test]
     fn reads_default_to_full_and_metadata_rejects_invalid_types() {
         let request: GetMemories = serde_json::from_value(json!({"keys": ["example"]})).unwrap();
-        assert_eq!(request.view, MemoryView::FULL);
+        assert!(!request.include_deleted);
         assert!(
-            serde_json::from_value::<CreateMemory>(json!({
-                "key": "example", "body": "Exact Markdown", "claim_type": "certain"
+            serde_json::from_value::<super::CreateMemory>(json!({
+                "key": "example", "body": "Exact Markdown", "basis": "certain"
             }))
             .is_err()
         );
         assert!(
-            serde_json::from_value::<CreateMemory>(json!({
+            serde_json::from_value::<super::CreateMemory>(json!({
                 "key": "example", "body": "Exact Markdown", "verified_at": 1.5
             }))
             .is_err()

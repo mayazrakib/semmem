@@ -2683,6 +2683,7 @@ dependencies = [
  "clap",
  "colored_json",
  "comfy-table",
+ "crossterm",
  "fs2",
  "jsonwebtoken",
  "parking_lot",

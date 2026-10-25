@@ -1,5 +1,7 @@
 # Performance qualification
 
+The retained measurements predate the new schema v1 and historical revision index. They do not establish performance for current full-body responses or historical search.
+
 The historical version-two section describes the earlier schema and its former application limits. They are retained as historical evidence, not measurements of the metadata update. New benchmark runs use a fresh compatible fixture and report construction, process startup, first request, and warm requests separately. A process restart reuses operating-system caches and does not establish cold-disk performance.
 
 Measurements use a release build on Linux x86-64 under a Microsoft hypervisor, with an AMD Ryzen 9 9950X3D reported by the host and 24 available logical CPUs. Rust 1.98.0 compiled the benchmark with thin LTO. SQLite uses WAL and FULL synchronization; successful writes include durable index publication. Storage and filesystem behavior affect these results.
@@ -24,7 +26,7 @@ All isolated acceptance gates passed. The loaded write p95 exceeded the separate
 
 The final restart probe opened the existing index in 4.97 ms, then served its first request in 1.16 ms. The initial schema-three process built the index in 176.06 seconds, then served its first request in 1.63 ms. Those construction and reopening workloads are distinct. Every startup probe ran in its own process; operating-system caches were not flushed. These measurements exclude HTTP, OAuth, MCP framing, and client/model latency.
 
-[Current source checksums](../benchmark/semmem-source.sha256) identify the delivered source. The initializer, revision metadata, paragraph projection, CLI lifecycle, and frontmatter editor are covered by the current tests. Tantivy retains its required finite writer arena and index-maintenance merge policy; those settings do not reject caller input. Production request counts, payloads, query expansion, pool growth, and queues have no application ceilings, and no token budgeting or embeddings are used.
+[Historical source checksums](../benchmark/semmem-source.sha256) identify the source measured in that historical run. The current initializer and revision-aware retrieval require fresh measurements. Tantivy retains its required finite writer arena and index-maintenance merge policy; those settings do not reject caller input. Production request counts, payloads, query expansion, pool growth, and queues have no application ceilings, and no token budgeting or embeddings are used.
 
 ## Historical version-two results
 

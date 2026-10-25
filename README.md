@@ -21,16 +21,21 @@ The service owns the database and search index. Terminal clients connect through
 After starting the service, add, find, and edit memories:
 
 ```sh
-semmem add reading --title "Reading preferences" --tag personal
+semmem register author "mayaz rakib"
+semmem add reading --author "mayaz rakib" --title "Reading preferences" --tag personal
 semmem search "libary"
 semmem show reading
 semmem edit reading
 semmem history reading
 ```
 
-`add [KEY]` prompts for missing metadata before opening a Markdown-only draft using `VISUAL`, then `EDITOR`, then `vim`. Supplied metadata flags skip their corresponding prompts. Blank optional answers remain unknown; the default title is the key, and the default kind is `note`. Tags and links are entered one at a time, ending with a blank answer. Prompts go to standard error so JSON output remains structured. Use `--no-input` with a key to use flags and defaults without prompts. End-of-input cancels before the editor or a database write. `edit KEY` opens the complete memory object: YAML frontmatter contains the structured fields, and the remaining text is the exact Markdown body. Edit the title, kind, tags, links, summary, claim type, scope, and observation or review dates in the frontmatter. Internal IDs, the key, the actor, and system metadata are read-only. Unchanged edits create no revision, and failed saves preserve the draft. Keys are stable identifiers supplied by the caller; readable names and UUIDs are accepted.
+`add [KEY]` prompts for missing metadata before opening a Markdown draft using `VISUAL`, then `EDITOR`, then `vim`. Select a registered author with the arrow keys, or select the empty entry and enter a custom name. New names register automatically. Noninteractive creation requires `--no-input`, a key, and `--author`. The default title is the key, and the default type is `general`. Prompts use stderr. End-of-input or cancellation stops before saving. Failed editor saves preserve the draft.
 
-Search supports exact phrases, prefixes, spelling mistakes, and kind, tag, scope, or claim-type filters. `list` browses memories and their incoming or outgoing relationships. The `taxonomy` commands manage kinds, tags, and relation types. Search returns structured JSON by default. Add `--json` for structured output from other commands, and use `--help` for each command's options.
+`edit KEY` opens YAML frontmatter and the exact Markdown body. Content fields, including author, are editable. Internal IDs, the key, and system audit fields are read-only. Unchanged edits create no revision. `semmem deregister author "Name"` removes an unused author; saved records and revisions prevent deregistration.
+
+Search supports phrases, prefixes, fuzzy matching, and type, tag, scope, or basis filters. Results contain complete bodies and timestamps and are ordered by descending score. `--history` searches all retained revisions; `--as-of TIMESTAMP` searches the state at a UTC Unix millisecond timestamp. These modes are mutually exclusive. `--include-deleted` includes deleted revision states. Ordinary search returns current live memories.
+
+`list` browses memories and references; `taxonomy` manages types, tags, and reference types. Search returns JSON by default. Use `--json` for structured output from other commands.
 
 Reads return the version required for guarded writes. For a memory at version two, deletion and restoration use:
 
@@ -39,13 +44,13 @@ semmem delete reading --expected-version 2
 semmem restore reading --expected-version 3
 ```
 
-`delete` retains history, and `restore` appends a new revision. `purge` requires `--confirm` and permanently removes the memory, its history, and incoming references, including historical links. Lists and history return summaries; use `show --version` to read a historical body.
+`delete` retains history, and `restore` appends a new revision. `purge` requires `--confirm` and permanently removes the memory, its history, and incoming references, including historical references. All reads and mutation responses return full bodies. Use `show --version` to select a historical revision.
 
 Writes commit to SQLite and become searchable before success is returned. Stale versions produce conflicts instead of overwriting newer edits. Startup recovers pending index changes, and identical creates with the same key are retry-safe. SQLite uses WAL with FULL synchronization; durability depends on storage honoring synchronization requests. See [the schema](docs/schema.md) for storage and lifecycle details.
 
-## Metadata and staged retrieval
+## Metadata and Retrieval
 
-Set `summary`, `claim_type`, `scope`, `observed_at`, `verified_at`, and `review_after` in the edit frontmatter. The `add` command also accepts corresponding command options. Claim types are `explicit user statement`, `verified observation`, and `inference`. Timestamp values use UTC milliseconds since Unix epoch. Set optional values to YAML `null` to clear them; unknown values are not inferred.
+Set `summary`, `basis`, `scope`, `observed_at`, `verified_at`, and `review_after` in the edit frontmatter. The `add` command also accepts corresponding command options. Basis values are `stated`, `observed`, `inferred`, and `assumed`. Timestamp values use UTC milliseconds since Unix epoch. Omitted creation dates `observed_at` and `verified_at` default to the current timestamp. Explicit null remains unknown. Updates preserve omitted values, and explicit null clears nullable metadata.
 
 ```sh
 semmem edit reading
@@ -54,9 +59,9 @@ semmem show reading --view summary
 semmem show reading
 ```
 
-Search is compact stage one; `show` and MCP `get_memories` provide full content by default as stage two. Their `summary` view avoids full bodies and associations. Manual summaries are returned intact; fallback previews contain complete paragraphs. No embeddings or token budgeting are used.
+Every retrieval returns complete Markdown bodies, associations, and any stored summary. The accepted `summary` view is a compatibility alias for full records. No excerpts, embeddings, or token budgeting are used.
 
-New databases initialize at schema version three. Earlier schemas are rejected and left intact; this version provides no conversion. The service removes application size, count, and runtime deadline restrictions. Caller-selected pagination, atomic writes, version checks, and unavoidable library representation constraints remain.
+New databases initialize at schema version one. Earlier schemas are rejected and left intact; this version provides no conversion. The service removes application size, count, and runtime deadline restrictions. Caller-selected pagination, atomic writes, version checks, and unavoidable library representation constraints remain.
 
 ## Remote MCP
 

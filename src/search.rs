@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{
-    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery, TermSetQuery,
+    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, RangeQuery, TermQuery,
+    TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
@@ -19,7 +21,7 @@ use tantivy::{
     DocId, Index, IndexReader, IndexWriter, ReloadPolicy, SegmentReader, TantivyDocument, Term,
 };
 
-use crate::models::{MemoryMetadata, MemoryRecord, SearchHit, SearchRequest, SearchResponse};
+use crate::models::{MemoryRecord, SearchHit, SearchRequest, SearchResponse};
 
 const INDEX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const MIN_MERGE_SEGMENTS: usize = 4;
@@ -45,10 +47,14 @@ struct SearchFields {
     title: Field,
     summary: Field,
     scope: Field,
-    claim_type: Field,
+    basis: Field,
     metadata: Field,
     body: Field,
-    kind: Field,
+    memory_type: Field,
+    is_current: Field,
+    is_deleted: Field,
+    valid_from: Field,
+    valid_until: Field,
     tags: Field,
 }
 
@@ -132,49 +138,73 @@ impl SearchIndex {
     }
 
     pub fn upsert(&mut self, memory: &MemoryRecord) -> Result<()> {
-        if memory.id <= 0 || memory.system_version <= 0 {
-            bail!("Indexed memory identity and version must be positive");
+        self.replace_revisions(&memory.key, std::slice::from_ref(memory))
+    }
+
+    pub fn replace_revisions(&mut self, key: &str, revisions: &[MemoryRecord]) -> Result<()> {
+        let mut ordered = revisions.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|memory| memory.system_version);
+
+        for memory in &ordered {
+            if memory.id <= 0 || memory.system_version <= 0 || memory.key != key {
+                bail!("Indexed revision identity, key, and version must be valid");
+            }
         }
 
-        self.remove(&memory.key)?;
-
-        if memory.system_deleted_at.is_some() {
-            return Ok(());
+        if ordered
+            .windows(2)
+            .any(|pair| pair[0].system_version == pair[1].system_version)
+        {
+            bail!("Indexed revision versions must be unique");
         }
 
-        let fields = &self.reader.fields;
-        let mut document = TantivyDocument::default();
-        document.add_u64(fields.id, memory.id as u64);
-        document.add_text(fields.key, &memory.key);
-        document.add_i64(fields.version, memory.system_version);
-        document.add_text(fields.title, &memory.title);
-        document.add_text(fields.metadata, serde_json::to_string(&memory.metadata)?);
+        self.remove(key)?;
 
-        if let Some(summary) = &memory.metadata.summary {
-            document.add_text(fields.summary, summary);
-        }
-
-        if let Some(scope) = &memory.metadata.scope {
-            document.add_text(fields.scope, scope);
-        }
-
-        if let Some(claim_type) = memory.metadata.claim_type {
-            document.add_text(
-                fields.claim_type,
-                serde_json::to_value(claim_type)?
-                    .as_str()
-                    .context("Claim type must be text")?,
+        for (position, memory) in ordered.iter().enumerate() {
+            let fields = &self.reader.fields;
+            let mut document = TantivyDocument::default();
+            document.add_u64(fields.id, memory.id as u64);
+            document.add_text(fields.key, &memory.key);
+            document.add_i64(fields.version, memory.system_version);
+            document.add_text(fields.title, &memory.title);
+            document.add_text(fields.metadata, serde_json::to_string(memory)?);
+            document.add_u64(fields.is_current, u64::from(position + 1 == ordered.len()));
+            document.add_u64(
+                fields.is_deleted,
+                u64::from(memory.system_deleted_at.is_some()),
             );
+            document.add_i64(fields.valid_from, memory.system_updated_at);
+
+            if let Some(next) = ordered.get(position + 1) {
+                document.add_i64(fields.valid_until, next.system_updated_at);
+            }
+
+            if let Some(summary) = &memory.metadata.summary {
+                document.add_text(fields.summary, summary);
+            }
+
+            if let Some(scope) = &memory.metadata.scope {
+                document.add_text(fields.scope, scope);
+            }
+
+            if let Some(basis) = memory.metadata.basis {
+                document.add_text(
+                    fields.basis,
+                    serde_json::to_value(basis)?
+                        .as_str()
+                        .context("Basis must be text")?,
+                );
+            }
+
+            document.add_text(fields.body, &memory.body);
+            document.add_text(fields.memory_type, &memory.r#type);
+
+            for tag in &memory.tags {
+                document.add_text(fields.tags, tag);
+            }
+
+            self.writer.add_document(document)?;
         }
-
-        document.add_text(fields.body, &memory.body);
-        document.add_text(fields.kind, &memory.kind);
-
-        for tag in &memory.tags {
-            document.add_text(fields.tags, tag);
-        }
-
-        self.writer.add_document(document)?;
 
         Ok(())
     }
@@ -220,32 +250,16 @@ impl SearchReader {
         let parts = parse_query(&request.query)?;
         let searcher = self.reader.searcher();
         let mut cache = ExpansionCache::default();
-        let exact = self.build_query(&parts, request, false, &searcher, &mut cache)?;
-        let (mut hits, exact_total) =
-            self.collect_hits(&searcher, exact.as_ref(), request.limit, &parts, &cache)?;
+        if request.history && request.as_of.is_some() {
+            return Err(InvalidSearchQuery("History and as_of cannot be combined.".into()).into());
+        }
+
         let has_fuzzy_terms = request.fuzzy
             && parts.iter().any(|part| {
                 !part.is_phrase && part.terms.iter().any(|term| term.chars().count() >= 4)
             });
-        let mut fuzzy_total = 0;
-
-        if has_fuzzy_terms {
-            let expanded = self.build_query(&parts, request, true, &searcher, &mut cache)?;
-            let approximate =
-                BooleanQuery::new(vec![(Occur::Must, expanded), (Occur::MustNot, exact)]);
-            let remaining = request.limit - hits.len();
-
-            if remaining == 0 {
-                fuzzy_total = searcher.search(&approximate, &Count)? as u64;
-            } else {
-                let (approximate_hits, count) =
-                    self.collect_hits(&searcher, &approximate, remaining, &parts, &cache)?;
-                hits.extend(approximate_hits);
-                fuzzy_total = count;
-            }
-        }
-
-        let total = exact_total + fuzzy_total;
+        let query = self.build_query(&parts, request, has_fuzzy_terms, &searcher, &mut cache)?;
+        let (hits, total) = self.collect_hits(&searcher, query.as_ref(), request.limit)?;
         let truncated = total > hits.len() as u64;
 
         Ok(SearchResponse {
@@ -339,11 +353,11 @@ impl SearchReader {
             }
         }
 
-        if let Some(kind) = &request.kind {
+        if let Some(memory_type) = &request.r#type {
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.kind, kind),
+                    Term::from_field_text(self.fields.memory_type, memory_type),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -359,14 +373,14 @@ impl SearchReader {
             ));
         }
 
-        if let Some(claim_type) = request.claim_type {
-            let value = serde_json::to_value(claim_type)?;
+        if let Some(basis) = request.basis {
+            let value = serde_json::to_value(basis)?;
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
                     Term::from_field_text(
-                        self.fields.claim_type,
-                        value.as_str().context("Claim type must be text")?,
+                        self.fields.basis,
+                        value.as_str().context("Basis must be text")?,
                     ),
                     IndexRecordOption::Basic,
                 )),
@@ -378,6 +392,41 @@ impl SearchReader {
                 Occur::Must,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.tags, tag),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
+        if !request.include_deleted {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(self.fields.is_deleted, 0),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
+        if let Some(timestamp) = request.as_of {
+            clauses.push((
+                Occur::Must,
+                Box::new(RangeQuery::new(
+                    Bound::Unbounded,
+                    Bound::Included(Term::from_field_i64(self.fields.valid_from, timestamp)),
+                )),
+            ));
+            clauses.push((
+                Occur::MustNot,
+                Box::new(RangeQuery::new(
+                    Bound::Unbounded,
+                    Bound::Included(Term::from_field_i64(self.fields.valid_until, timestamp)),
+                )),
+            ));
+        } else if !request.history {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(self.fields.is_current, 1),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -451,69 +500,59 @@ impl SearchReader {
         searcher: &tantivy::Searcher,
         query: &dyn Query,
         limit: usize,
-        parts: &[QueryPart],
-        cache: &ExpansionCache,
     ) -> Result<(Vec<SearchHit>, u64)> {
         let collector = TopDocs::with_limit(limit).tweak_score(|segment: &SegmentReader| {
-            let identities = segment
+            let keys = segment
                 .fast_fields()
-                .u64("id")
-                .expect("Search schema always has an unsigned identity fast field")
+                .str("key")
+                .expect("Search schema always has a key fast field")
+                .expect("Search schema always has a key string column");
+            let versions = segment
+                .fast_fields()
+                .i64("version")
+                .expect("Search schema always has a version fast field")
                 .first_or_default_col(0);
 
-            move |document: DocId, score: f32| (score, Reverse(identities.get_val(document)))
+            move |document: DocId, score: f32| {
+                let mut key = String::new();
+                let ordinal = keys
+                    .term_ords(document)
+                    .next()
+                    .expect("Indexed revision always has a key");
+                keys.ord_to_str(ordinal, &mut key)
+                    .expect("Indexed revision key must be readable");
+
+                (score, Reverse(key), versions.get_val(document))
+            }
         });
         let (documents, total) = searcher.search(query, &(collector, Count))?;
-        let preview_terms = parts
-            .iter()
-            .flat_map(|part| part.terms.iter().cloned())
-            .chain(
-                cache
-                    .cached
-                    .values()
-                    .flat_map(|terms| terms.iter().cloned()),
-            )
-            .collect::<BTreeSet<_>>();
         let mut hits = Vec::with_capacity(documents.len());
 
-        for ((score, _), address) in documents {
+        for ((score, _, _), address) in documents {
             let document: TantivyDocument = searcher.doc(address)?;
-            let key = document
-                .get_first(self.fields.key)
-                .and_then(|value| value.as_str())
-                .context("Indexed memory has no public key")?
-                .to_owned();
-            let version = document
-                .get_first(self.fields.version)
-                .and_then(|value| value.as_i64())
-                .context("Indexed memory has no version")?;
-            let title = document
-                .get_first(self.fields.title)
-                .and_then(|value| value.as_str())
-                .context("Indexed memory has no title")?
-                .to_owned();
-            let body = document
-                .get_first(self.fields.body)
-                .and_then(|value| value.as_str())
-                .context("Indexed memory has no body")?;
-            let metadata: MemoryMetadata = serde_json::from_str(
+            let memory: MemoryRecord = serde_json::from_str(
                 document
                     .get_first(self.fields.metadata)
                     .and_then(|value| value.as_str())
-                    .context("Indexed memory has no metadata")?,
+                    .context("Indexed revision has no stored record")?,
             )?;
-            let excerpt = metadata
-                .summary
-                .as_deref()
-                .is_none_or(|summary| summary.trim().is_empty())
-                .then(|| create_excerpt(body, &preview_terms, parts));
             hits.push(SearchHit {
-                key,
-                title,
-                version,
+                key: memory.key,
+                title: memory.title,
+                body: memory.body,
+                version: memory.system_version,
                 score,
-                metadata,
-                excerpt,
+                metadata: memory.metadata,
+                r#type: memory.r#type,
+                author: memory.author,
+                tags: memory.tags,
+                references: memory.references,
+                system_created_at: memory.system_created_at,
+                system_updated_at: memory.system_updated_at,
+                system_deleted_at: memory.system_deleted_at,
+                system_created_by: memory.system_created_by,
+                system_updated_by: memory.system_updated_by,
+                system_deleted_by: memory.system_deleted_by,
             });
         }
 
@@ -539,15 +578,19 @@ fn build_schema() -> (Schema, SearchFields) {
         .set_stored();
     let fields = SearchFields {
         id: builder.add_u64_field("id", FAST),
-        key: builder.add_text_field("key", STRING | STORED),
-        version: builder.add_i64_field("version", STORED),
+        key: builder.add_text_field("key", STRING | STORED | FAST),
+        version: builder.add_i64_field("version", STORED | FAST),
         title: builder.add_text_field("title", text_options.clone()),
         summary: builder.add_text_field("summary", text_options.clone()),
         scope: builder.add_text_field("scope", STRING),
-        claim_type: builder.add_text_field("claim_type", STRING),
+        basis: builder.add_text_field("basis", STRING),
         metadata: builder.add_text_field("metadata", STORED),
         body: builder.add_text_field("body", text_options),
-        kind: builder.add_text_field("kind", STRING),
+        memory_type: builder.add_text_field("type", STRING),
+        is_current: builder.add_u64_field("is_current", FAST | tantivy::schema::INDEXED),
+        is_deleted: builder.add_u64_field("is_deleted", FAST | tantivy::schema::INDEXED),
+        valid_from: builder.add_i64_field("valid_from", FAST),
+        valid_until: builder.add_i64_field("valid_until", FAST),
         tags: builder.add_text_field("tags", STRING),
     };
 
@@ -598,48 +641,4 @@ fn parse_query(query: &str) -> Result<Vec<QueryPart>> {
     }
 
     Ok(parts)
-}
-
-fn create_excerpt(body: &str, terms: &BTreeSet<String>, parts: &[QueryPart]) -> String {
-    let mut analyzer = build_analyzer();
-    let phrases = parts
-        .iter()
-        .filter(|part| part.is_phrase)
-        .collect::<Vec<_>>();
-    let mut fallback = None;
-    let mut term_match = None;
-
-    for paragraph in crate::models::markdown_paragraphs(body) {
-        fallback.get_or_insert(paragraph);
-        let mut stream = analyzer.token_stream(paragraph);
-        let mut tokens = Vec::new();
-        let mut has_term = false;
-
-        while stream.advance() {
-            let token = &stream.token().text;
-            has_term |= terms.contains(token);
-
-            if !phrases.is_empty() {
-                tokens.push(token.clone());
-            }
-        }
-
-        if phrases.iter().any(|phrase| {
-            tokens
-                .windows(phrase.terms.len())
-                .any(|window| window == phrase.terms)
-        }) {
-            return paragraph.to_owned();
-        }
-
-        if has_term {
-            if phrases.is_empty() {
-                return paragraph.to_owned();
-            }
-
-            term_match.get_or_insert(paragraph);
-        }
-    }
-
-    term_match.or(fallback).unwrap_or(body).to_owned()
 }

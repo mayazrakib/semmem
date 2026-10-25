@@ -51,7 +51,7 @@ async fn handle_request(
             StatusCode::OK,
             Json(json!({"memories": [{
                 "id": 1, "key": "example", "title": "Example", "body": "Original body\n",
-                "kind": "note", "tags": [], "links": [], "actor": "human",
+                "type": "general", "tags": [], "references": [], "author": "test author", "system_created_by": "human", "system_updated_by": "human", "system_deleted_by": null,
                 "system_version": 4, "system_created_at": 1, "system_updated_at": 2,
                 "system_deleted_at": null
             }]})),
@@ -104,7 +104,21 @@ async fn run_cli_with_input(
     input: Option<&str>,
 ) -> Output {
     let socket = socket.to_path_buf();
-    let arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
+    let mut arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
+
+    if arguments.first().is_some_and(|name| name == "add")
+        && !arguments.iter().any(|value| value == "--author")
+    {
+        arguments.extend(["--author".into(), "test author".into()]);
+    }
+
+    if arguments.first().is_some_and(|name| name == "taxonomy")
+        && arguments
+            .iter()
+            .any(|value| value == "create" || value == "update")
+    {
+        arguments.extend(["--author".into(), "test author".into()]);
+    }
     let input = input.map(str::to_owned);
 
     tokio::task::spawn_blocking(move || {
@@ -164,25 +178,34 @@ async fn interactive_add_collects_metadata_before_opening_an_empty_body_editor()
     let record = &stdout["saved"]["memories"][0];
     assert_eq!(record["key"], "prompted");
     assert_eq!(record["title"], "Prompted title");
-    assert_eq!(record["kind"], "decision");
+    assert_eq!(record["type"], "decision");
     assert_eq!(record["summary"], "Manual summary");
-    assert_eq!(record["claim_type"], "verified observation");
+    assert_eq!(record["basis"], "observed");
     assert_eq!(record["scope"], "project");
     assert_eq!(record["observed_at"], 100);
     assert_eq!(record["verified_at"], 200);
     assert_eq!(record["review_after"], 300);
     assert_eq!(record["tags"], json!(["research", "persistent"]));
     assert_eq!(
-        record["links"],
-        json!([{"relation": "supports", "target_key": "target"}])
+        record["references"],
+        json!([{"reference_type": "supports", "target_key": "target"}])
     );
     assert_eq!(record["body"], "# Body only\n\nExact café.\n");
     assert_eq!(state.requests.lock().unwrap().len(), 1);
     let prompts = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
 
     for field in [
-        "key", "title", "kind", "summary", "claim", "scope", "observed", "verified", "review",
-        "tag", "link",
+        "key",
+        "title",
+        "type",
+        "summary",
+        "basis",
+        "scope",
+        "observed",
+        "verified",
+        "review",
+        "tag",
+        "reference",
     ] {
         assert!(prompts.contains(field), "Missing {field} prompt: {prompts}");
     }
@@ -200,7 +223,7 @@ async fn interactive_add_reprompts_invalid_values_and_keeps_blank_metadata_unkno
         root.path(),
         "[ ! -s \"$1\" ] || exit 23\nprintf 'Body\\n' > \"$1\"",
     );
-    let input = "\nvalid-key\n\n\n\nnot-a-claim\n4\ninference\n\nyesterday\n123\n1.5\n200\n\n\ninvalid-link\nsupports=\nsupports=target\n\n";
+    let input = "\nvalid-key\n\n\n\nnot-a-basis\n5\ninferred\n\nyesterday\n123\n1.5\n200\n\n\ninvalid-link\nsupports=\nsupports=target\n\n";
     let output = run_cli_with_input(&socket, editor, &["add"], Some(input)).await;
     assert!(
         output.status.success(),
@@ -212,8 +235,8 @@ async fn interactive_add_reprompts_invalid_values_and_keeps_blank_metadata_unkno
     let record = &requests[0].1["memories"][0];
     assert_eq!(record["key"], "valid-key");
     assert_eq!(record["title"], "valid-key");
-    assert_eq!(record["kind"], "note");
-    assert_eq!(record["claim_type"], "inference");
+    assert_eq!(record["type"], "general");
+    assert_eq!(record["basis"], "inferred");
     assert_eq!(record["observed_at"], 123);
     assert_eq!(record["verified_at"], 200);
     assert!(record["summary"].is_null());
@@ -221,14 +244,14 @@ async fn interactive_add_reprompts_invalid_values_and_keeps_blank_metadata_unkno
     assert!(record["review_after"].is_null());
     assert_eq!(record["tags"], json!([]));
     assert_eq!(
-        record["links"],
-        json!([{"relation": "supports", "target_key": "target"}])
+        record["references"],
+        json!([{"reference_type": "supports", "target_key": "target"}])
     );
     let prompts = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    assert!(prompts.matches("claim").count() >= 3, "{prompts}");
+    assert!(prompts.matches("basis").count() >= 3, "{prompts}");
     assert!(prompts.matches("observed").count() >= 2, "{prompts}");
     assert!(prompts.matches("verified").count() >= 2, "{prompts}");
-    assert!(prompts.matches("link").count() >= 3, "{prompts}");
+    assert!(prompts.matches("reference").count() >= 3, "{prompts}");
     server.abort();
 }
 
@@ -275,12 +298,12 @@ async fn fully_supplied_add_flags_skip_prompts_without_no_input() {
             "flags",
             "--title",
             "Flags",
-            "--kind",
+            "--type",
             "decision",
             "--summary",
             "Flag summary",
-            "--claim-type",
-            "explicit user statement",
+            "--basis",
+            "stated",
             "--scope",
             "project",
             "--observed-at",
@@ -291,7 +314,7 @@ async fn fully_supplied_add_flags_skip_prompts_without_no_input() {
             "300",
             "--tag",
             "research",
-            "--link",
+            "--reference",
             "supports=target",
         ],
         Some(""),
@@ -330,9 +353,9 @@ async fn noninteractive_add_preserves_defaults_and_requires_a_key() {
         assert_eq!(requests.len(), 1);
         let record = &requests[0].1["memories"][0];
         assert_eq!(record["title"], "");
-        assert_eq!(record["kind"], "note");
+        assert_eq!(record["type"], "general");
         assert!(record["summary"].is_null());
-        assert!(record["claim_type"].is_null());
+        assert!(record["basis"].is_null());
         assert_eq!(record["tags"], json!([]));
     }
     let missing = run_cli(&socket, editor, &["add", "--no-input"]).await;
@@ -455,7 +478,7 @@ async fn frontmatter_edits_update_metadata_and_body() {
     let server = start_service(&socket, state.clone()).await;
     let editor = write_editor(
         root.path(),
-        r#"sed -i -e 's/^summary: null$/summary: Complete summary/' -e 's/^scope: null$/scope: project/' -e 's/^claim_type: null$/claim_type: verified observation/' -e 's/^observed_at: null$/observed_at: 100/' -e 's/^verified_at: null$/verified_at: 200/' -e 's/^review_after: null$/review_after: 300/' "$1"
+        r#"sed -i -e 's/^summary: null$/summary: Complete summary/' -e 's/^scope: null$/scope: project/' -e 's/^basis: null$/basis: observed/' -e 's/^observed_at: null$/observed_at: 100/' -e 's/^verified_at: null$/verified_at: 200/' -e 's/^review_after: null$/review_after: 300/' "$1"
 printf 'Additional content\n' >> "$1""#,
     );
     let output = run_cli(&socket, editor, &["edit", "example"]).await;
@@ -470,7 +493,7 @@ printf 'Additional content\n' >> "$1""#,
     let record = &requests[1].1["memories"][0];
     assert_eq!(record["summary"], "Complete summary");
     assert_eq!(record["scope"], "project");
-    assert_eq!(record["claim_type"], "verified observation");
+    assert_eq!(record["basis"], "observed");
     assert_eq!(record["observed_at"], 100);
     assert_eq!(record["verified_at"], 200);
     assert_eq!(record["review_after"], 300);

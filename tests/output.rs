@@ -43,3 +43,38 @@ fn argument_errors_keep_their_failure_status_and_use_four_space_indentation() {
         assert_eq!(indentation % 4, 0, "{line:?}");
     }
 }
+
+#[test]
+fn search_help_exposes_new_vocabulary_and_history_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
+        .args(["search", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+
+    for option in [
+        "--type",
+        "--basis",
+        "--history",
+        "--as-of",
+        "--include-deleted",
+    ] {
+        assert!(text.contains(option), "{text}");
+    }
+
+    for old in ["--kind", "--claim-type"] {
+        assert!(!text.contains(old), "{text}");
+    }
+}
+
+#[test]
+fn noninteractive_add_rejects_missing_author_before_editor_or_write() {
+    let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
+        .args(["add", "missing-author", "--no-input"])
+        .env("VISUAL", "/bin/false")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--author"));
+}

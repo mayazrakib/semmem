@@ -190,9 +190,12 @@ fn error_response(error: AppError) -> Response {
     let status = match error.code.as_str() {
         "invalid_input" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
-        "version_conflict" | "already_exists" | "referenced" | "referenced_taxonomy" => {
-            StatusCode::CONFLICT
-        }
+        "version_conflict"
+        | "already_exists"
+        | "referenced"
+        | "referenced_taxonomy"
+        | "referenced_author"
+        | "default_type" => StatusCode::CONFLICT,
         "database_busy" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };

@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use semmem::models::{
-    ClaimType, CreateMemory, MemoryLink, MemoryMetadata, MetadataPatch, UpdateMemory,
-};
+use semmem::models::{Basis, CreateMemory, MemoryReference, MetadataPatch, UpdateMemory};
 use semmem::service::Service;
 use semmem::storage::Store;
 use serde::{Deserialize, Serialize};
@@ -173,7 +171,7 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "fixture_version": 3,
+            "fixture_version": 1,
             "startup_processes": {
                 "initial": initial_process,
                 "reopened": reopened_process,
@@ -219,7 +217,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 .context("Existing data directory is not a completed benchmark fixture")?,
         )?;
 
-        if identity.version != 3 || identity.memories != memories {
+        if identity.version != 1 || identity.memories != memories {
             bail!("Existing benchmark fixture differs; choose another data directory");
         }
 
@@ -227,12 +225,13 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     }
 
     let mut store = Store::open(database_path)?;
+    store.register_author("benchmark", "benchmark")?;
 
     for first in (0..memories).step_by(64) {
         let batch = (first..(first + 64).min(memories))
             .map(create_fixture_memory)
             .collect::<Vec<_>>();
-        store.create_memories(&batch)?;
+        store.create_memories(&batch, "benchmark")?;
 
         if first / 100_000 != (first + batch.len()) / 100_000 {
             eprintln!("Seeded {} memories", first + batch.len());
@@ -248,19 +247,19 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 title: Some(format!("Revised observation {index}")),
                 body: None,
                 metadata: MetadataPatch::default(),
-                kind: None,
+                r#type: None,
                 tags: None,
-                links: None,
-                actor: "benchmark".into(),
+                references: None,
+                author: Some("benchmark".into()),
             })
             .collect::<Vec<_>>();
-        store.update_memories(&revisions)?;
+        store.update_memories(&revisions, "benchmark")?;
     }
 
     std::fs::write(
         identity_path,
         serde_json::to_vec(&FixtureIdentity {
-            version: 3,
+            version: 1,
             memories,
         })?,
     )?;
@@ -279,7 +278,7 @@ fn create_fixture_memory(index: usize) -> CreateMemory {
         "travel",
         "mathematics",
     ];
-    let kinds = ["note", "preference", "decision", "observation"];
+    let memory_types = ["note", "preference", "decision", "observation"];
     let target_bytes = if index.is_multiple_of(10) { 4096 } else { 512 };
     let mut body = format!(
         "# Observation {index}\n\nmarker{index:07}: This persistent registry records durable memory about {}.\n\n",
@@ -290,10 +289,10 @@ fn create_fixture_memory(index: usize) -> CreateMemory {
         body.push_str("Readable Markdown preserves useful context, source observations, and practical decisions. UTF-8: café, 東京, 🦀.\n");
     }
 
-    let links = if index > 0 && index.is_multiple_of(64) {
-        vec![MemoryLink {
+    let references = if index > 0 && index.is_multiple_of(64) {
+        vec![MemoryReference {
             target_key: format!("bench-record-{:07}", index - 1),
-            relation: "related to".into(),
+            reference_type: "related to".into(),
         }]
     } else {
         vec![]
@@ -303,30 +302,30 @@ fn create_fixture_memory(index: usize) -> CreateMemory {
         key: format!("bench-record-{index:07}"),
         title: format!("{} observation {index}", topics[index % topics.len()]),
         body,
-        metadata: MemoryMetadata {
+        metadata: MetadataPatch {
             summary: index.is_multiple_of(3).then(|| {
-                format!(
+                Some(format!(
                     "Manually supplied {} observation {index}",
                     topics[index % topics.len()]
-                )
+                ))
             }),
-            claim_type: Some(if index.is_multiple_of(2) {
-                ClaimType::VERIFIED_OBSERVATION
+            basis: Some(Some(if index.is_multiple_of(2) {
+                Basis::OBSERVED
             } else {
-                ClaimType::EXPLICIT_USER_STATEMENT
-            }),
-            scope: Some(format!("project/{}", topics[index % topics.len()])),
-            observed_at: Some(1_700_000_000_000 + index as i64),
+                Basis::STATED
+            })),
+            scope: Some(Some(format!("project/{}", topics[index % topics.len()]))),
+            observed_at: Some(Some(1_700_000_000_000 + index as i64)),
             verified_at: None,
-            review_after: index.is_multiple_of(5).then_some(1_800_000_000_000),
+            review_after: index.is_multiple_of(5).then_some(Some(1_800_000_000_000)),
         },
-        kind: kinds[index % kinds.len()].into(),
+        r#type: memory_types[index % memory_types.len()].into(),
         tags: vec![
             topics[index % topics.len()].into(),
             format!("group-{}", index % 32),
         ],
-        links,
-        actor: "benchmark".into(),
+        references,
+        author: "benchmark".into(),
     }
 }
 

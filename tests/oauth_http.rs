@@ -146,7 +146,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
     let created = peer
         .call_tool(
             CallToolRequestParams::new("create_memories").with_arguments(
-                json!({"memories":[{"key":"network","body":"Network MCP memory"}]})
+                json!({"memories":[{"key":"network","author":"test author", "body":"Network MCP memory"}]})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -154,6 +154,10 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
         )
         .await?;
     assert_ne!(created.is_error, Some(true));
+    let record = &created.structured_content.as_ref().unwrap()["memories"][0];
+    assert_eq!(record["author"], "test author");
+    assert_eq!(record["system_created_by"], "test-human");
+    assert_eq!(record["system_updated_by"], "test-human");
     let large_body = format!(
         "largeauthenticatedneedle\n\n{}",
         " ".repeat(5 * 1024 * 1024)
@@ -161,7 +165,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
     let created_large = peer
         .call_tool(
             CallToolRequestParams::new("create_memories").with_arguments(
-                json!({"memories":[{"key":"network-large", "body": large_body, "summary":"Authenticated manual summary", "scope":"network"}]})
+                json!({"memories":[{"key":"network-large", "author":"test author", "body": large_body, "summary":"Authenticated manual summary", "scope":"network"}]})
                     .as_object().unwrap().clone(),
             ),
         ).await?;
@@ -181,7 +185,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
         compact["memories"][0]["summary"],
         "Authenticated manual summary"
     );
-    assert!(compact["memories"][0].get("body").is_none());
+    assert!(compact["memories"][0].get("body").is_some());
     let found = peer
         .call_tool(
             CallToolRequestParams::new("search_memories")

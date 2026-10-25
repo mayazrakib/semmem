@@ -11,8 +11,8 @@ use comfy_table::{ContentArrangement, Table};
 use serde_json::{Value, json};
 
 use crate::models::{
-    ClaimType, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryLink, MemoryMetadata,
-    MemoryRecord, MemoryVersion, MemoryView, RestoreMemory, SearchRequest,
+    Basis, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryMetadata, MemoryRecord,
+    MemoryReference, MemoryVersion, MemoryView, MetadataPatch, RestoreMemory, SearchRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -61,21 +61,37 @@ pub enum Command {
         #[arg(long)]
         scope: Option<String>,
         #[arg(long, value_enum)]
-        claim_type: Option<ClaimType>,
+        basis: Option<Basis>,
         #[arg(long)]
-        kind: Option<String>,
+        r#type: Option<String>,
         #[arg(long = "tag")]
         tags: Vec<String>,
         #[arg(long)]
         exact: bool,
         #[arg(long)]
         prefix: bool,
+        #[arg(long, conflicts_with = "as_of")]
+        history: bool,
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            help = "Search the snapshot at UTC Unix milliseconds."
+        )]
+        as_of: Option<i64>,
+        #[arg(long)]
+        include_deleted: bool,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
-    #[command(name = "list", about = "Browse memories by kind, tag, or relationship.")]
+    #[command(
+        name = "list",
+        about = "Browse memories by type, tag, or relationship."
+    )]
     LIST(BrowseArguments),
-    #[command(name = "show", about = "Read complete memories or historical versions.")]
+    #[command(
+        name = "show",
+        about = "Read complete memories or historical versions."
+    )]
     SHOW {
         keys: Vec<String>,
         #[arg(long, value_enum, default_value = "full")]
@@ -101,11 +117,13 @@ pub enum Command {
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
-        kind: Option<String>,
+        author: Option<String>,
+        #[arg(long)]
+        r#type: Option<String>,
         #[arg(long = "tag")]
         tags: Vec<String>,
-        #[arg(long = "link", value_parser = parse_link)]
-        links: Vec<MemoryLink>,
+        #[arg(long = "reference", value_parser = parse_reference)]
+        references: Vec<MemoryReference>,
     },
     #[command(
         name = "edit",
@@ -146,8 +164,24 @@ pub enum Command {
         before_version: Option<i64>,
     },
     #[command(
+        name = "register",
+        about = "Register an author for memory attribution."
+    )]
+    REGISTER {
+        #[command(subcommand)]
+        resource: AuthorCommand,
+    },
+    #[command(
+        name = "deregister",
+        about = "Deregister an unused author. Referenced authors cannot be deregistered."
+    )]
+    DEREGISTER {
+        #[command(subcommand)]
+        resource: AuthorCommand,
+    },
+    #[command(
         name = "taxonomy",
-        about = "List, create, rename, or delete kinds, tags, and relationship types."
+        about = "List, create, rename, or delete types, tags, and reference types."
     )]
     TAXONOMY {
         #[arg(value_enum)]
@@ -157,12 +191,19 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum AuthorCommand {
+    #[command(name = "author", about = "Choose the author name.")]
+    AUTHOR { name: String },
+}
+
 #[derive(Debug, Args)]
 pub struct MetadataArguments {
     #[arg(long)]
     summary: Option<String>,
     #[arg(long, value_enum)]
-    claim_type: Option<ClaimType>,
+    basis: Option<Basis>,
     #[arg(long)]
     scope: Option<String>,
     #[arg(
@@ -189,7 +230,7 @@ impl From<MetadataArguments> for MemoryMetadata {
     fn from(arguments: MetadataArguments) -> Self {
         Self {
             summary: arguments.summary,
-            claim_type: arguments.claim_type,
+            basis: arguments.basis,
             scope: arguments.scope,
             observed_at: arguments.observed_at,
             verified_at: arguments.verified_at,
@@ -203,15 +244,15 @@ pub struct BrowseArguments {
     #[arg(long)]
     scope: Option<String>,
     #[arg(long, value_enum)]
-    claim_type: Option<ClaimType>,
+    basis: Option<Basis>,
     #[arg(long)]
-    kind: Option<String>,
+    r#type: Option<String>,
     #[arg(long = "tag")]
     tags: Vec<String>,
     #[arg(long)]
-    linked_to: Option<String>,
+    referenced_to: Option<String>,
     #[arg(long)]
-    linked_from: Option<String>,
+    referenced_from: Option<String>,
     #[arg(long)]
     include_deleted: bool,
     #[arg(long, default_value_t = 20)]
@@ -230,12 +271,12 @@ pub struct VersionArguments {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum TaxonomyCategory {
-    #[value(name = "kinds")]
-    KINDS,
+    #[value(name = "types")]
+    TYPES,
     #[value(name = "tags")]
     TAGS,
-    #[value(name = "relations")]
-    RELATIONS,
+    #[value(name = "references")]
+    REFERENCES,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,9 +290,19 @@ pub enum TaxonomyAction {
         cursor: Option<String>,
     },
     #[command(name = "create")]
-    CREATE { key: String, name: String },
+    CREATE {
+        key: String,
+        name: String,
+        #[arg(long)]
+        author: String,
+    },
     #[command(name = "update")]
-    UPDATE { key: String, name: String },
+    UPDATE {
+        key: String,
+        name: String,
+        #[arg(long)]
+        author: String,
+    },
     #[command(name = "delete")]
     DELETE { key: String },
 }
@@ -287,18 +338,18 @@ pub fn default_socket_path() -> PathBuf {
     default_data_dir().join("service.sock")
 }
 
-fn parse_link(value: &str) -> Result<MemoryLink, String> {
+fn parse_reference(value: &str) -> Result<MemoryReference, String> {
     let (relation, target_key) = value
         .split_once('=')
-        .ok_or_else(|| "Use --link relation=target_key.".to_string())?;
+        .ok_or_else(|| "Use --reference reference_type=target_key.".to_string())?;
 
     if relation.is_empty() || target_key.is_empty() {
         return Err("Both relationship type and target key must be nonempty.".into());
     }
 
-    Ok(MemoryLink {
+    Ok(MemoryReference {
         target_key: target_key.into(),
-        relation: relation.into(),
+        reference_type: relation.into(),
     })
 }
 
@@ -368,18 +419,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::START => crate::lifecycle::execute("start").await?,
         Command::STOP => crate::lifecycle::execute("stop").await?,
         Command::STATUS => crate::lifecycle::execute("status").await?,
-        Command::SEARCH { query, scope, claim_type, kind, tags, exact, prefix, limit } => {
-            let request = SearchRequest { query, scope, claim_type, kind, tags, prefix, fuzzy: !exact, limit };
+        Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit, history, as_of, include_deleted } => {
+            let request = SearchRequest { query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit, history, as_of, include_deleted };
             client.request("search_memories", serde_json::to_value(request)?).await?
         },
         Command::LIST(arguments) => {
             let request = ListMemories {
                 scope: arguments.scope,
-                claim_type: arguments.claim_type,
-                kind: arguments.kind,
+                basis: arguments.basis,
+                r#type: arguments.r#type,
                 tags: arguments.tags,
-                linked_to: arguments.linked_to,
-                linked_from: arguments.linked_from,
+                referenced_to: arguments.referenced_to,
+                referenced_from: arguments.referenced_from,
                 include_deleted: arguments.include_deleted,
                 limit: arguments.limit,
                 cursor: arguments.cursor,
@@ -389,16 +440,21 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::SHOW { keys, view, include_deleted, version } => {
             client.request("get_memories", serde_json::to_value(GetMemories { keys, view, include_deleted, version })?).await?
         },
-        Command::ADD { key, no_input, metadata, title, kind, tags, links } => {
-            let mut fields = NewMemoryFields { key, title, kind, metadata: metadata.into(), tags, links };
+        Command::ADD { key, no_input, metadata, title, r#type, tags, references, author } => {
+            let mut fields = NewMemoryFields { key, title, r#type, metadata: metadata.into(), tags, references };
 
             if !no_input {
                 prompt_missing_metadata(&mut std::io::stdin().lock(), &mut std::io::stderr().lock(), &mut fields)?;
             }
 
+            let author = match author {
+                Some(author) => validate_author(author)?,
+                None if no_input => bail!("An author is required with --no-input. Supply --author."),
+                None => prompt_author(&client).await?,
+            };
             let key = fields.key.context("A key is required with --no-input.")?;
             let title = fields.title.unwrap_or_default();
-            let kind = fields.kind.unwrap_or_else(|| "note".into());
+            let r#type = fields.r#type.unwrap_or_else(|| "general".into());
             let draft = Draft::open("")?;
             let body = draft.read()?;
 
@@ -409,7 +465,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let memory = CreateMemory { key, title, body, metadata: fields.metadata, kind, tags: fields.tags, links: fields.links, actor: "human".into() };
+            let memory = CreateMemory { key, title, body, metadata: create_metadata(fields.metadata), r#type, tags: fields.tags, references: fields.references, author };
             let result = client.request("create_memories", json!({"memories": [memory]})).await;
             finish_draft(draft, result)?
         },
@@ -433,9 +489,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let has_changes = request.body.as_ref().is_some_and(|body| body != &memory.body)
                 || request.metadata.apply(&memory.metadata) != memory.metadata
                 || request.title.as_ref().is_some_and(|title| title != &memory.title)
-                || request.kind.as_ref().is_some_and(|kind| kind != &memory.kind)
+                || request.r#type.as_ref().is_some_and(|r#type| r#type != &memory.r#type)
                 || request.tags.as_ref().is_some_and(|tags| tags != &memory.tags)
-                || request.links.as_ref().is_some_and(|links| links != &memory.links);
+                || request.references.as_ref().is_some_and(|references| references != &memory.references)
+                || request.author.as_ref().is_some_and(|author| author != &memory.author);
 
             if !has_changes {
                 eprintln!("No changes were made. No revision was created.");
@@ -454,23 +511,29 @@ pub async fn execute(cli: Cli) -> Result<()> {
             client.request("purge_memories", json!({"memories": [MemoryVersion {key: version.key, expected_version: version.expected_version}]})).await?
         },
         Command::RESTORE { version, revision } => {
-            let request = RestoreMemory {key: version.key, expected_version: version.expected_version, revision, actor: "human".into()};
+            let request = RestoreMemory {key: version.key, expected_version: version.expected_version, revision};
             client.request("restore_memories", json!({"memories": [request]})).await?
         },
         Command::HISTORY { key, limit, before_version } => {
             client.request("list_memory_revisions", serde_json::to_value(HistoryRequest { key, limit, before_version })?).await?
         },
+        Command::REGISTER { resource: AuthorCommand::AUTHOR { name } } => {
+            client.request("register_author", json!({"author": validate_author(name)?})).await?
+        },
+        Command::DEREGISTER { resource: AuthorCommand::AUTHOR { name } } => {
+            client.request("deregister_author", json!({"author": validate_author(name)?})).await?
+        },
         Command::TAXONOMY { category, action } => {
             let (list, suffix) = match category {
-                TaxonomyCategory::KINDS => ("list_kinds", "kind"),
+                TaxonomyCategory::TYPES => ("list_types", "type"),
                 TaxonomyCategory::TAGS => ("list_tags", "tag"),
-                TaxonomyCategory::RELATIONS => ("list_relation_types", "relation_type"),
+                TaxonomyCategory::REFERENCES => ("list_reference_types", "reference_type"),
             };
 
             match action {
                 TaxonomyAction::LIST { limit, cursor } => client.request(list, json!({"limit": limit, "cursor": cursor})).await?,
-                TaxonomyAction::CREATE { key, name } => client.request(&format!("create_{suffix}"), json!({"key": key, "name": name})).await?,
-                TaxonomyAction::UPDATE { key, name } => client.request(&format!("update_{suffix}"), json!({"key": key, "name": name})).await?,
+                TaxonomyAction::CREATE { key, name, author } => client.request(&format!("create_{suffix}"), json!({"key": key, "name": name, "author": validate_author(author)?})).await?,
+                TaxonomyAction::UPDATE { key, name, author } => client.request(&format!("update_{suffix}"), json!({"key": key, "name": name, "author": validate_author(author)?})).await?,
                 TaxonomyAction::DELETE { key } => client.request(&format!("delete_{suffix}"), json!({"key": key})).await?,
             }
         },
@@ -481,13 +544,125 @@ pub async fn execute(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+fn create_metadata(metadata: MemoryMetadata) -> MetadataPatch {
+    MetadataPatch {
+        summary: metadata.summary.map(Some),
+        basis: metadata.basis.map(Some),
+        scope: metadata.scope.map(Some),
+        observed_at: metadata.observed_at.map(Some),
+        verified_at: metadata.verified_at.map(Some),
+        review_after: metadata.review_after.map(Some),
+    }
+}
+
+fn validate_author(author: String) -> Result<String> {
+    if author.trim().is_empty() || author.chars().any(char::is_control) {
+        bail!("The author must be nonempty and contain no control characters.");
+    }
+
+    Ok(author.trim().to_owned())
+}
+
+async fn prompt_author(client: &LocalClient) -> Result<String> {
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let response = client.request("list_authors", json!({})).await?;
+        let authors = response
+            .get("items")
+            .and_then(Value::as_array)
+            .context("The service returned an invalid author list.")?;
+        let choices: Vec<&str> = authors
+            .iter()
+            .filter_map(|item| item.get("author").and_then(Value::as_str))
+            .collect();
+
+        if let Some(author) = select_author(&choices)? {
+            return Ok(author);
+        }
+    }
+
+    loop {
+        let author = prompt_line(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stderr().lock(),
+            "Author (required)",
+        )?;
+
+        match validate_author(author) {
+            Ok(author) => return Ok(author),
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+}
+
+fn select_author(authors: &[&str]) -> Result<Option<String>> {
+    use crossterm::cursor::MoveToColumn;
+    use crossterm::event::{Event, KeyCode, KeyEventKind, read};
+    use crossterm::execute;
+    use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
+
+    struct RawTerminal;
+
+    impl Drop for RawTerminal {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    let mut output = std::io::stderr();
+    writeln!(
+        output,
+        "Author: use Up/Down and Enter; the blank option enters a new author."
+    )?;
+    enable_raw_mode()?;
+    let terminal = RawTerminal;
+    let mut selected = 0;
+
+    loop {
+        execute!(output, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        write!(output, "> {}", authors.get(selected).copied().unwrap_or(""))?;
+        output.flush()?;
+
+        if let Event::Key(key) = read()? {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Up => {
+                    selected = if selected == 0 {
+                        authors.len()
+                    } else {
+                        selected - 1
+                    }
+                }
+                KeyCode::Down => selected = (selected + 1) % (authors.len() + 1),
+                KeyCode::Enter => {
+                    drop(terminal);
+                    writeln!(output)?;
+
+                    return Ok(authors.get(selected).map(|author| (*author).to_owned()));
+                }
+                KeyCode::Esc => bail!("Author selection was cancelled. No memory was created."),
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    bail!("Author selection was cancelled. No memory was created.");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 struct NewMemoryFields {
     key: Option<String>,
     title: Option<String>,
-    kind: Option<String>,
+    r#type: Option<String>,
     metadata: MemoryMetadata,
     tags: Vec<String>,
-    links: Vec<MemoryLink>,
+    references: Vec<MemoryReference>,
 }
 
 fn prompt_line(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
@@ -570,10 +745,10 @@ fn prompt_missing_metadata(
         });
     }
 
-    if fields.kind.is_none() {
-        let value = prompt_line(input, output, "Kind [note]")?;
-        fields.kind = Some(if value.trim().is_empty() {
-            "note".into()
+    if fields.r#type.is_none() {
+        let value = prompt_line(input, output, "Type [general]")?;
+        fields.r#type = Some(if value.trim().is_empty() {
+            "general".into()
         } else {
             value
         });
@@ -583,12 +758,12 @@ fn prompt_missing_metadata(
         fields.metadata.summary = prompt_optional_text(input, output, "Summary (optional)")?;
     }
 
-    if fields.metadata.claim_type.is_none() {
+    if fields.metadata.basis.is_none() {
         loop {
             let value = prompt_line(
                 input,
                 output,
-                "Claim type (1 explicit user statement, 2 verified observation, 3 inference; blank for unknown)",
+                "Basis (1 stated, 2 observed, 3 inferred, 4 assumed; blank for unknown)",
             )?;
             let value = value.trim();
 
@@ -596,22 +771,23 @@ fn prompt_missing_metadata(
                 break;
             }
 
-            let claim_type = match value {
-                "1" => Ok(ClaimType::EXPLICIT_USER_STATEMENT),
-                "2" => Ok(ClaimType::VERIFIED_OBSERVATION),
-                "3" => Ok(ClaimType::INFERENCE),
-                _ => ClaimType::from_str(value, false),
+            let basis = match value {
+                "1" => Ok(Basis::STATED),
+                "2" => Ok(Basis::OBSERVED),
+                "3" => Ok(Basis::INFERRED),
+                "4" => Ok(Basis::ASSUMED),
+                _ => Basis::from_str(value, false),
             };
 
-            match claim_type {
-                Ok(claim_type) => {
-                    fields.metadata.claim_type = Some(claim_type);
+            match basis {
+                Ok(basis) => {
+                    fields.metadata.basis = Some(basis);
 
                     break;
                 }
                 Err(_) => writeln!(
                     output,
-                    "Choose 1, 2, 3, a listed claim type, or leave blank for unknown."
+                    "Choose 1, 2, 3, 4, a listed basis, or leave blank for unknown."
                 )?,
             }
         }
@@ -625,7 +801,7 @@ fn prompt_missing_metadata(
         fields.metadata.observed_at = prompt_timestamp(
             input,
             output,
-            "Observed at (UTC Unix milliseconds; blank for unknown)",
+            "Observed at (UTC Unix milliseconds; blank for current time)",
         )?;
     }
 
@@ -633,7 +809,7 @@ fn prompt_missing_metadata(
         fields.metadata.verified_at = prompt_timestamp(
             input,
             output,
-            "Verified at (UTC Unix milliseconds; blank for unknown)",
+            "Verified at (UTC Unix milliseconds; blank for current time)",
         )?;
     }
 
@@ -658,16 +834,20 @@ fn prompt_missing_metadata(
         }
     }
 
-    if fields.links.is_empty() {
+    if fields.references.is_empty() {
         loop {
-            let value = prompt_line(input, output, "Link (relation=target_key; blank to finish)")?;
+            let value = prompt_line(
+                input,
+                output,
+                "Reference (reference_type=target_key; blank to finish)",
+            )?;
 
             if value.trim().is_empty() {
                 break;
             }
 
-            match parse_link(&value) {
-                Ok(link) => fields.links.push(link),
+            match parse_reference(&value) {
+                Ok(link) => fields.references.push(link),
                 Err(message) => writeln!(output, "{message}")?,
             }
         }
@@ -761,7 +941,10 @@ fn finish_draft(draft: Draft, result: Result<Value>) -> Result<Value> {
 
             Ok(value)
         }
-        Err(error) => bail!("{error}\nThe draft was preserved at {}.", draft.path.display()),
+        Err(error) => bail!(
+            "{error}\nThe draft was preserved at {}.",
+            draft.path.display()
+        ),
     }
 }
 
@@ -785,15 +968,15 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
         table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
         table.set_header([
             "Key",
-            "Title / Summary / Excerpt",
-            "Kind",
+            "Title / Summary",
+            "Type",
             "Scope",
-            "Claim",
+            "Basis",
             "Version",
         ]);
 
         for record in records {
-            let text = ["summary", "excerpt", "title", "name"]
+            let text = ["summary", "title", "name", "author"]
                 .into_iter()
                 .find_map(|field| {
                     record
@@ -815,13 +998,13 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
                     .to_string(),
                 clean_terminal_text(text),
                 record
-                    .get("kind")
+                    .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
                 clean_terminal_text(record.get("scope").and_then(Value::as_str).unwrap_or("")),
                 record
-                    .get("claim_type")
+                    .get("basis")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
@@ -846,10 +1029,13 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
             }
         }
 
-        if records.len() == 1
-            && let Some(body) = records[0].get("body").and_then(Value::as_str)
-        {
-            termimad::print_text(&clean_terminal_text(body));
+        for record in records {
+            if let Some(body) = record.get("body").and_then(Value::as_str) {
+                let key =
+                    clean_terminal_text(record.get("key").and_then(Value::as_str).unwrap_or(""));
+                println!("\n{key}");
+                termimad::print_text(&clean_terminal_text(body));
+            }
         }
 
         if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {

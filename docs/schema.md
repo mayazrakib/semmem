@@ -1,65 +1,59 @@
-# Database schema
+# Database Schema
 
-SQLite stores the canonical UTF-8 Markdown bodies and all authoritative fields. Search uses a separate, rebuildable Tantivy index. The schema has no arbitrary metadata column, entity-attribute-value table, or JSON revision snapshot. The sole initializer is [initialize.sql](../initialize.sql), which includes per-revision deletion state and metadata. It creates schema version three for fresh databases. Existing incompatible schemas are rejected without conversion.
+SQLite stores canonical Markdown bodies and authoritative fields. Tantivy provides a rebuildable full-text index. [initialize.sql](../initialize.sql) is the sole initializer for the new schema v1. Existing incompatible schemas, including earlier schemas carrying version one, are rejected without migration or database changes.
 
-## Tables and relationships
+## Tables and Attribution
 
 | Table | Responsibility |
 |---|---|
-| `database_identity` | Identifies this database so a search index from another database is not reused |
-| `memories` | Stable identity, current revision number, and lifecycle fields |
-| `memory_revisions` | Complete title, Markdown body, metadata, kind, actor, operation, and version for each edit |
-| `memory_kinds` | Stable kind keys and readable names |
+| `database` | Database identity for search-index ownership |
+| `memories` | Stable memory identity, current revision, and lifecycle fields |
+| `memory_revisions` | Complete content and metadata for each revision |
+| `memory_types` | Stable type keys and readable names |
 | `tags` | Stable tag keys and readable names |
-| `relation_types` | Stable relationship keys and readable names |
-| `actors` | Deduplicated authorship labels |
-| `memory_revision_tags` | Tags belonging to a particular revision |
-| `memory_revision_links` | Typed outgoing links belonging to a particular revision |
-| `index_events` | Transactional search-index publication events, including purge tombstones |
+| `reference_types` | Stable reference type keys and readable names |
+| `authors` | Registered content authors |
+| `memory_revision_tags` | Per-revision tags |
+| `memory_revision_references` | Per-revision typed references |
+| `index_events` | Transactional search publication events |
 
-Each memory has an integer internal `id` and a unique public `key`. Content belongs to a revision. A deferred composite foreign key ensures that the memory's current `(id, system_version)` identifies an existing revision. The `current_memories` view joins identity, current content, kind, and actor for reads.
+Every application table has mandatory author attribution through a non-null `author` foreign key to `authors`. Public records expose author names. An internal system author bootstraps database and housekeeping records and is excluded from registered-author choices. References use `target_key` and `reference_type`. The default memory type is `general`.
 
-Kinds, tags, actors, and relationship names occur in their own tables. Revision associations reference integer keys instead of repeating names. Junction tables have composite primary keys and use `WITHOUT ROWID`. Foreign keys are enabled on service connections. The application uses parameterized SQL, and the migration defines strict tables.
+Content author and trusted writer identity are separate. System attribution uses `system_created_by`, `system_updated_by`, and `system_deleted_by`. Clients cannot set system audit fields. Creation requires a nonblank author; new names register automatically. Updates preserve authorship unless explicitly changed. Deletion and restoration preserve content authorship. Registration is idempotent, and deregistration rejects authors referenced by saved rows or history.
 
-Memory writes create missing kind, tag, and relationship-type rows using the supplied key as their initial name. The default kind is `note`. Explicit taxonomy operations can create entries in advance or change their readable names. Link targets must identify existing memories or memories created in the same batch. Taxonomy deletion rejects entries still referenced by current or historical revisions.
+A deferred composite foreign key ensures that each memory's current `(id, system_version)` identifies an existing revision. Strict normalized tables retain complete content, tags, and references. Missing taxonomy keys are created from memory writes; explicit taxonomy operations can set readable names. Referenced taxonomy entries cannot be deleted.
 
-## Revision metadata
-
-The following nullable fields belong to every revision and survive history, deletion, and restoration:
+## Revision Metadata
 
 | Field | Meaning |
 |---|---|
-| `summary` | Manually supplied retrieval summary, returned in full |
-| `claim_type` | `explicit user statement`, `verified observation`, or `inference` |
-| `scope` | Project or environment label, with exact-match filtering |
-| `observed_at` | When the fact was observed or stated |
-| `verified_at` | When the fact was last checked |
-| `review_after` | When the fact should be reconsidered |
+| `summary` | Stored summary, returned intact |
+| `basis` | `stated`, `observed`, `inferred`, or `assumed` |
+| `scope` | Project or environment label |
+| `observed_at` | Observation timestamp; defaults to current time on creation |
+| `verified_at` | Verification timestamp; defaults to current time on creation |
+| `review_after` | Optional review timestamp |
 
-Metadata timestamps are signed integer UTC milliseconds since Unix epoch. Unknown values remain `NULL`; the service does not infer provenance, verification, or expiration. On updates, omission preserves a value, explicit JSON `null` clears it, and a supplied value replaces it. Editing a record does not update `verified_at` automatically.
+Timestamps use signed integer UTC milliseconds since Unix epoch. Explicit null remains valid for nullable metadata. On creation, omitted observation and verification timestamps receive defaults. Updates preserve omitted values; explicit null clears them. Ordinary edits do not automatically refresh verification time. Identical creation retries remain idempotent despite timestamp defaults.
 
-## Revisions and lifecycle
+## Revisions and Lifecycle
 
-The trailing `system_*` fields describe internal lifecycle state. Timestamps use UTC Unix milliseconds. `system_version` starts at one and increases for each saved memory revision. `system_operation` records `create`, `update`, `delete`, or `restore`.
+`system_version` starts at one and increases for every saved revision. `system_operation` identifies creation, update, deletion, or restoration. Writes save content and associations atomically and require the expected version for existing memories. Restoration appends a revision instead of rewinding the version counter.
 
-Memory content and associations are saved together in one transaction. Revisions retain Markdown, kind, actor, tags, and outgoing relationships through normalized rows. Updates use an expected version, so a concurrent edit produces a conflict instead of silently overwriting content. Restoration appends a new current revision rather than rewinding the version counter.
+Soft deletion creates a deletion revision. Current reads and searches exclude deleted memories unless explicitly requested. Purge removes the memory, every revision, and incoming and outgoing reference rows, including historical references. Surviving memories whose current references change receive a new guarded revision while preserving content authorship and deletion state. Purge does not rewrite free text or promise forensic erasure from storage media or external backups.
 
-Soft deletion creates a deletion revision and sets `system_deleted_at`. Ordinary reads, browsing, and search omit deleted memories. Explicit reads can include them. Permanent purge requires the current expected version and removes active or deleted memories. It removes the memory, its revisions, its tag associations, and its outgoing links. It also removes incoming link rows from other memories' current and historical revisions to preserve referential integrity. Those erased historical links cannot be restored. Surviving memories whose current links change receive a new system-authored revision and version, preserving concurrent-edit protection and any existing deletion state. Taxonomy rows and free text in other memories are not rewritten by a purge.
+## Retrieval and Historical Search
 
-Purge removes logical database records. It does not promise forensic erasure from storage media, old database pages, index segments, logs, or external backups.
+Search, browsing, history, reads, and mutation responses return complete bodies and stored summaries. The accepted `summary` view is a compatibility alias for full records. There are no generated excerpts. Search hits always include `body`, `system_created_at`, `system_updated_at`, revision identity, score, author, and metadata.
 
-## Indexes and publication
+Current live search is the default. `history: true` searches all retained revisions. `as_of` selects the revision effective at a UTC Unix millisecond timestamp; it cannot be combined with history mode. Revisions become effective inclusively at their update timestamp and cease to be effective when the next revision begins. If revisions share a timestamp, the highest applicable version wins. `include_deleted` applies to the selected revision's state, so pre-deletion history remains searchable by default.
 
-The schema indexes active memories by descending update time and ID, revision lookup by memory and version, revision kinds and actors, tag-to-revision membership, and incoming relationships. Primary keys cover identity, public-key, and association lookups. Browse pagination uses the last update timestamp and ID; revision pagination uses the last version. Taxonomy lists use key-based pagination.
+Filters evaluate the selected revision's metadata. Exact and fuzzy candidates are ranked together before limiting results. Scores descend globally, with key ascending and version descending as deterministic tie breaks. Pagination and batch sizes are caller controlled; the service introduces no token budget or arbitrary payload ceiling.
 
-Search, browse, history, and memory mutation responses omit full Markdown bodies. Search returns a complete manual summary or a matching paragraph excerpt. `get_memories` defaults to `view: full`, returning exact content and associations; `view: summary` selects compact metadata with a manual summary or the first nonempty paragraph. Pagination is caller controlled, with no application maximum page size. The service imposes no token budget, payload ceiling, query-expansion ceiling, or batch-count ceiling.
+## Index Publication and Recovery
 
-SQLite runs in write-ahead logging mode with `synchronous=FULL`, cached prepared statements, a reusable dynamically growing read pool, and an unbounded writer queue. The writer groups pending requests before publishing the search index. Each memory batch has its own transaction.
+SQLite uses WAL with `synchronous=FULL`. A single writer coordinates transactions with a reusable read pool. Transactional index events identify changed memory keys even after purge. Publication refreshes every retained revision of an affected memory and removes all indexed versions after purge. Successful writes are acknowledged after search publication.
 
-Index events are written in the same transaction as memory changes. Their textual memory keys deliberately survive memory deletion, allowing search tombstones to be published after a purge. The service advances the search watermark and acknowledges processed events after committing the index. Startup replays pending events; an index with an incompatible database identity or an unreadable index is replaced and rebuilt from current records.
+The index stores revision identity, effective intervals, current/deleted state, full bodies, and metadata. Startup rebuilds from all canonical revisions when the database identity or search generation changes or the index is unusable. Pending events are replayed after crashes. Search candidates are validated against SQLite according to the requested temporal mode before returning results.
 
-Successful writes are acknowledged after search publication. If SQLite commits but publication fails, the response identifies the committed state and leaves events available for recovery. Search candidates are checked against current SQLite state before they are returned.
-
-Use the CLI and MCP interfaces for mutations so versioning, revisions, and search publication remain coordinated. New databases initialize transactionally at schema version three. Existing incompatible schemas fail explicitly before database settings or content are modified. Search schema generations are tracked independently and can trigger a rebuild without changing canonical memories.
-
-The runtime has no application request or busy-wait deadline. SQLite contention yields and retries; cancellation and authorization validation remain in effect. Machine address space, SQLite representations, and Tantivy-required writer arena configuration remain library constraints. Index maintenance batches process all pending work; their size does not reject caller input. All retrieval uses readable text and ordinary lexical ranking, without embeddings or model inference.
+Publication failures report committed state and affected versions. Callers inspect current records before retrying. Index generation is independent of SQLite schema version. Library representation and machine resource limits remain; index maintenance does not impose application-level request ceilings.

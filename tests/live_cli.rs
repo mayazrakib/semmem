@@ -28,7 +28,21 @@ async fn run_cli_with_input(
 ) -> anyhow::Result<Value> {
     let socket = socket.to_path_buf();
     let editor = editor.to_path_buf();
-    let arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
+    let mut arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
+
+    if arguments.first().is_some_and(|name| name == "add")
+        && !arguments.iter().any(|value| value == "--author")
+    {
+        arguments.extend(["--author".into(), "test author".into()]);
+    }
+
+    if arguments.first().is_some_and(|name| name == "taxonomy")
+        && arguments
+            .iter()
+            .any(|value| value == "create" || value == "update")
+    {
+        arguments.extend(["--author".into(), "test author".into()]);
+    }
     let input = input.map(str::to_owned);
     let output = tokio::task::spawn_blocking(move || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_semmem"));
@@ -70,7 +84,7 @@ async fn interactive_add_persists_prompted_metadata_and_body_without_frontmatter
     let service = Service::open(root.path().join("data"))?;
     service.dispatch(
         "create_memories",
-        serde_json::json!({"memories": [{"key": "target", "body": "Related target."}]}),
+        serde_json::json!({"memories": [{"key": "target", "body": "Related target.", "author": "test author"}]}),
         "human",
     )?;
     let socket = root.path().join("service.sock");
@@ -88,17 +102,17 @@ async fn interactive_add_persists_prompted_metadata_and_body_without_frontmatter
     let shown = run_cli(&socket, &editor, &["show", "prompted"]).await?;
     let record = &shown["memories"][0];
     assert_eq!(record["title"], "Prompted title");
-    assert_eq!(record["kind"], "decision");
+    assert_eq!(record["type"], "decision");
     assert_eq!(record["summary"], "Manual summary");
-    assert_eq!(record["claim_type"], "explicit user statement");
+    assert_eq!(record["basis"], "stated");
     assert_eq!(record["scope"], "project");
     assert_eq!(record["observed_at"], 100);
     assert_eq!(record["verified_at"], 200);
     assert_eq!(record["review_after"], 300);
     assert_eq!(record["tags"], serde_json::json!(["research"]));
     assert_eq!(
-        record["links"],
-        serde_json::json!([{"relation": "supports", "target_key": "target"}])
+        record["references"],
+        serde_json::json!([{"reference_type": "supports", "target_key": "target"}])
     );
     assert_eq!(record["body"], "# Prompted body\n\nExact café.\n");
     let search = run_cli(
@@ -250,8 +264,8 @@ async fn cli_roundtrips_all_metadata_and_staged_views() -> anyhow::Result<()> {
             "metadata",
             "--summary",
             "Durable knowledge summary",
-            "--claim-type",
-            "explicit user statement",
+            "--basis",
+            "stated",
             "--scope",
             "project",
             "--observed-at",
@@ -275,14 +289,14 @@ async fn cli_roundtrips_all_metadata_and_staged_views() -> anyhow::Result<()> {
             "knowledge",
             "--scope",
             "project",
-            "--claim-type",
-            "explicit user statement",
+            "--basis",
+            "stated",
         ],
     )
     .await?;
     assert_eq!(filtered["hits"][0]["key"], "metadata");
     let compact = run_cli(&socket, &editor, &["show", "metadata", "--view", "summary"]).await?;
-    assert!(compact["memories"][0].get("body").is_none());
+    assert!(compact["memories"][0].get("body").is_some());
     assert_eq!(compact["memories"][0]["review_after"], 300);
     let full = run_cli(&socket, &editor, &["show", "metadata"]).await?;
     assert_eq!(
@@ -292,13 +306,13 @@ async fn cli_roundtrips_all_metadata_and_staged_views() -> anyhow::Result<()> {
     fs::write(
         &editor,
         r#"#!/bin/sh
-sed -i -e 's/^summary: .*/summary: null/' -e 's/^claim_type: .*/claim_type: null/' -e 's/^scope: .*/scope: null/' -e 's/^observed_at: .*/observed_at: null/' -e 's/^verified_at: .*/verified_at: null/' -e 's/^review_after: .*/review_after: null/' "$1"
+sed -i -e 's/^summary: .*/summary: null/' -e 's/^basis: .*/basis: null/' -e 's/^scope: .*/scope: null/' -e 's/^observed_at: .*/observed_at: null/' -e 's/^verified_at: .*/verified_at: null/' -e 's/^review_after: .*/review_after: null/' "$1"
 "#,
     )?;
     let edited = run_cli(&socket, &editor, &["edit", "metadata"]).await?;
     for field in [
         "summary",
-        "claim_type",
+        "basis",
         "scope",
         "observed_at",
         "verified_at",
@@ -311,6 +325,94 @@ sed -i -e 's/^summary: .*/summary: null/' -e 's/^claim_type: .*/claim_type: null
     assert_eq!(old["memories"][0]["verified_at"], 200);
     let listed = run_cli(&socket, &editor, &["list", "--scope", "project"]).await?;
     assert!(listed["memories"].as_array().unwrap().is_empty());
+    server.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_author_registration_and_historical_search_preserve_complete_records()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = Service::open(root.path().join("data"))?;
+    let socket = root.path().join("service.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let server = tokio::spawn(async move { axum::serve(listener, local_router(service)).await });
+    let editor = root.path().join("editor");
+    fs::write(
+        &editor,
+        "#!/bin/sh\nprintf 'Historicalneedle café\\n\\nComplete final paragraph.\\n' > \"$1\"\n",
+    )?;
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o700))?;
+    run_cli(&socket, &editor, &["register", "author", "Ada"]).await?;
+    let created = run_cli(&socket, &editor, &["add", "history", "--author", "Ada"]).await?;
+    let initial = &created["memories"][0];
+    assert_eq!(initial["author"], "Ada");
+    assert_eq!(initial["type"], "general");
+    assert!(initial["observed_at"].is_i64());
+    assert!(initial["verified_at"].is_i64());
+    let timestamp = initial["system_updated_at"].as_i64().unwrap().to_string();
+    fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '\\nNew content.\\n' >> \"$1\"\n",
+    )?;
+    run_cli(&socket, &editor, &["edit", "history"]).await?;
+    let historical = run_cli(
+        &socket,
+        &editor,
+        &["search", "historicalneedle", "--history"],
+    )
+    .await?;
+    let hits = historical["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+
+    for hit in hits {
+        assert!(
+            hit["body"]
+                .as_str()
+                .unwrap()
+                .contains("Complete final paragraph.")
+        );
+        assert!(hit["system_created_at"].is_i64());
+        assert!(hit["system_updated_at"].is_i64());
+        assert!(hit.get("excerpt").is_none());
+    }
+
+    assert!(
+        hits.windows(2)
+            .all(|pair| pair[0]["score"].as_f64() >= pair[1]["score"].as_f64())
+    );
+    let snapshot = run_cli(
+        &socket,
+        &editor,
+        &["search", "historicalneedle", "--as-of", &timestamp],
+    )
+    .await?;
+    assert_eq!(snapshot["hits"][0]["version"], 1);
+    run_cli(
+        &socket,
+        &editor,
+        &["delete", "history", "--expected-version", "2"],
+    )
+    .await?;
+    let deleted = run_cli(
+        &socket,
+        &editor,
+        &["search", "historicalneedle", "--include-deleted"],
+    )
+    .await?;
+    assert_eq!(deleted["hits"][0]["version"], 3);
+    let rejected = Command::new(env!("CARGO_BIN_EXE_semmem"))
+        .arg("--socket")
+        .arg(&socket)
+        .args(["deregister", "author", "Ada"])
+        .output()?;
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("referenced_author"));
+    run_cli(&socket, &editor, &["register", "author", "Unused"]).await?;
+    run_cli(&socket, &editor, &["deregister", "author", "Unused"]).await?;
+    let record = run_cli(&socket, &editor, &["show", "history", "--include-deleted"]).await?;
+    assert_eq!(record["memories"][0]["author"], "Ada");
     server.abort();
 
     Ok(())

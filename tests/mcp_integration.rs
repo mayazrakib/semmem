@@ -24,10 +24,11 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         .post("http://localhost/api/create_memories")
         .json(&json!({"memories": [{
             "key": "local-api",
+            "author": "test author",
             "body": "# Shared registry\n\nunixregistryneedle exact Markdown.\n",
             "summary": "Shared local registry summary",
             "scope": "unix socket",
-            "claim_type": "verified observation",
+            "basis": "observed",
             "observed_at": 100,
             "verified_at": 200,
             "review_after": 300
@@ -37,7 +38,7 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(created["memories"][0]["actor"], "human");
+    assert_eq!(created["memories"][0]["system_updated_by"], "human");
     let transport = StreamableHttpClientTransport::with_client(
         http.clone(),
         StreamableHttpClientTransportConfig::with_uri("http://localhost/mcp"),
@@ -79,13 +80,13 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
     let compact = &compact.structured_content.as_ref().unwrap()["memories"][0];
     assert_eq!(compact["summary"], "Shared local registry summary");
     assert_eq!(compact["review_after"], 300);
-    assert!(compact.get("body").is_none());
+    assert!(compact.get("body").is_some());
     let full = invoke("get_memories", json!({"keys": ["local-api"]})).await?;
     assert_eq!(
         full.structured_content.as_ref().unwrap()["memories"][0]["body"],
         "# Shared registry\n\nunixregistryneedle exact Markdown.\n"
     );
-    let created = invoke("create_memories", json!({"memories": [{"key": "mcp-created", "body": "Written through private MCP.", "actor": "untrusted"}]})).await?;
+    let created = invoke("create_memories", json!({"memories": [{"key": "mcp-created", "body": "Written through private MCP.", "author": "test author"}]})).await?;
     assert_ne!(created.is_error, Some(true));
     let full: Value = http
         .post("http://localhost/api/get_memories")
@@ -96,7 +97,7 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         .json()
         .await?;
     assert_eq!(full["memories"][0]["body"], "Written through private MCP.");
-    assert_eq!(full["memories"][0]["actor"], "ai client");
+    assert_eq!(full["memories"][0]["system_updated_by"], "ai client");
     assert_eq!(
         http.get("http://localhost/health").send().await?.status(),
         200
@@ -144,9 +145,12 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
         "restore_memories",
         "purge_memories",
         "list_memory_revisions",
-        "create_kind",
+        "create_type",
         "update_tag",
-        "delete_relation_type",
+        "delete_reference_type",
+        "list_authors",
+        "register_author",
+        "deregister_author",
     ] {
         assert!(
             tools.iter().any(|tool| tool.name == name),
@@ -165,10 +169,10 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
             .await
         }
     };
-    let created = invoke("create_memories", json!({"memories": [{"key": "reading", "title": "Reading", "body": "Remember the beautiful library.", "summary": "Library knowledge", "scope": "personal", "claim_type": "verified observation", "observed_at": 100, "verified_at": 200, "review_after": 300, "actor": "untrusted-actor"}]})).await?;
+    let created = invoke("create_memories", json!({"memories": [{"key": "reading", "title": "Reading", "body": "Remember the beautiful library.", "summary": "Library knowledge", "scope": "personal", "basis": "observed", "observed_at": 100, "verified_at": 200, "review_after": 300, "author": "test author"}]})).await?;
     assert_ne!(created.is_error, Some(true));
     assert_eq!(
-        created.structured_content.as_ref().unwrap()["memories"][0]["actor"],
+        created.structured_content.as_ref().unwrap()["memories"][0]["system_updated_by"],
         "mcp-test"
     );
     let found = invoke(
@@ -187,7 +191,7 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
     )
     .await?;
     let compact_record = &compact.structured_content.as_ref().unwrap()["memories"][0];
-    assert!(compact_record.get("body").is_none());
+    assert!(compact_record.get("body").is_some());
     assert_eq!(compact_record["summary"], "Library knowledge");
     assert_eq!(compact_record["review_after"], 300);
     let full = invoke("get_memories", json!({"keys": ["reading"]})).await?;
@@ -197,7 +201,7 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
     );
     let scoped = invoke(
         "search_memories",
-        json!({"query": "knowledge", "scope": "personal", "claim_type": "verified observation"}),
+        json!({"query": "knowledge", "scope": "personal", "basis": "observed"}),
     )
     .await?;
     assert_eq!(
@@ -229,6 +233,64 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
             .len(),
         2
     );
+    let registered = invoke("register_author", json!({"author": "Ada"})).await?;
+    assert_ne!(registered.is_error, Some(true));
+    let authors = invoke("list_authors", json!({})).await?;
+    assert!(
+        authors.structured_content.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|author| author["author"] == "Ada")
+    );
+    let historical = invoke(
+        "search_memories",
+        json!({"query": "library", "history": true}),
+    )
+    .await?;
+    let hits = historical.structured_content.as_ref().unwrap()["hits"]
+        .as_array()
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+
+    for hit in hits {
+        assert!(hit["body"].as_str().unwrap().contains("library"));
+        assert!(hit["system_created_at"].is_i64());
+        assert!(hit["system_updated_at"].is_i64());
+        assert!(hit.get("excerpt").is_none());
+    }
+
+    assert!(
+        hits.windows(2)
+            .all(|pair| pair[0]["score"].as_f64() >= pair[1]["score"].as_f64())
+    );
+    let deregistered = invoke("deregister_author", json!({"author": "Ada"})).await?;
+    assert_ne!(deregistered.is_error, Some(true));
+    let assumed = invoke("create_memories", json!({"memories": [{"key": "assumption", "body": "Assumptionneedle complete body.", "basis": "assumed", "author": "Ada"}]})).await?;
+    assert_ne!(assumed.is_error, Some(true));
+    let assumed = invoke(
+        "search_memories",
+        json!({"query": "assumptionneedle", "basis": "assumed"}),
+    )
+    .await?;
+    let hit = &assumed.structured_content.as_ref().unwrap()["hits"][0];
+    assert_eq!(hit["author"], "Ada");
+    assert_eq!(hit["system_created_by"], "mcp-test");
+    assert_eq!(hit["body"], "Assumptionneedle complete body.");
+
+    for legacy in ["actor", "kind", "claim_type", "links"] {
+        let mut memory = json!({"key": "legacy", "body": "Body", "author": "Ada"});
+        memory[legacy] = json!("legacy");
+        let rejected = invoke("create_memories", json!({"memories": [memory]})).await;
+        assert!(
+            rejected.is_err()
+                || rejected
+                    .as_ref()
+                    .is_ok_and(|result| result.is_error == Some(true)),
+            "Accepted retired field {legacy}"
+        );
+    }
+
     let malformed = invoke("create_memories", json!({"memories": [{"key": "broken"}]})).await;
     assert!(
         malformed.is_err()

@@ -126,12 +126,12 @@ async fn assert_recovers_after_crash(fault: &str) {
     let input = json!({
         "key": "crash-recovery",
         "title": "Durable memory",
-        "body": markdown,
-        "kind": "note",
+        "author":"test author", "body": markdown,
+        "type": "note",
         "tags": ["recovery"],
-        "links": [],
+        "references": [],
         "summary": "Durable manual summary",
-        "claim_type": "verified observation",
+        "basis": "observed",
         "scope": "crash recovery",
         "observed_at": 1000,
         "verified_at": 2000,
@@ -238,7 +238,13 @@ async fn assert_rebuilds_search_index(is_corrupted: bool) {
     invoke(
         &client,
         "create_memories",
-        json!({"memories": [{"key": "rebuild", "body": "rebuildneedle café 日本語\n"}]}),
+        json!({"memories": [{"key": "rebuild", "author":"test author", "body": "rebuildneedle café 日本語\n"}]}),
+    )
+    .await;
+    invoke(
+        &client,
+        "update_memories",
+        json!({"memories": [{"key": "rebuild", "expected_version": 1, "body": "rebuildcurrent replacement"}]}),
     )
     .await;
     drop(client);
@@ -256,13 +262,18 @@ async fn assert_rebuilds_search_index(is_corrupted: bool) {
     let found = invoke(
         &client,
         "search_memories",
-        json!({"query": "rebuildneedle", "fuzzy": false}),
+        json!({"query": "rebuildneedle", "history": true, "fuzzy": false}),
     )
     .await;
     assert_eq!(found["total"], 1);
     assert_eq!(found["hits"][0]["key"], "rebuild");
     assert_eq!(found["hits"][0]["version"], 1);
-    let fetched = invoke(&client, "get_memories", json!({"keys": ["rebuild"]})).await;
+    let fetched = invoke(
+        &client,
+        "get_memories",
+        json!({"keys": ["rebuild"], "version": 1}),
+    )
+    .await;
     assert_eq!(
         fetched["memories"][0]["body"],
         "rebuildneedle café 日本語\n"

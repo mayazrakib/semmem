@@ -27,7 +27,7 @@ Select the socket with `--socket` or `SEMMEM_SOCKET`. Without OAuth configuratio
 
 ## Private ChatGPT tunnel
 
-The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and attributes MCP writes to `ai client`. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
+The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and uses the trusted private MCP identity for system audit attribution. Content author is supplied separately. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
 
 For OpenAI Secure MCP Tunnel, create a dedicated tunnel associated with the intended ChatGPT workspace. Store the runtime key in a private file outside this repository and use a file reference. An example foreground launch is:
 
@@ -102,10 +102,16 @@ Remote writes are attributed to `ai client`; local writes are attributed to `hum
 
 ## Editing and recovery
 
-`add` opens a private Markdown body draft using `VISUAL`, then `EDITOR`, then `vim`. `edit KEY` opens the complete memory object as YAML frontmatter followed by its Markdown body. Editor command arguments and quoted executable paths are supported. The frontmatter exposes title, kind, tags, links, and all six revision metadata fields. Internal IDs, the key, the actor, and system metadata are read-only; changing them rejects the save. Optional fields can be cleared with YAML `null`. The body after the closing frontmatter delimiter is preserved exactly. The database transaction starts after the editor exits.
+`add` opens a private Markdown body draft using `VISUAL`, then `EDITOR`, then `vim`. `edit KEY` opens the complete memory object as YAML frontmatter followed by its Markdown body. Editor command arguments and quoted executable paths are supported. The frontmatter exposes title, type, tags, references, and all six revision metadata fields. Content author is editable. Internal IDs, the key, and system metadata are read-only; changing them rejects the save. Optional fields can be cleared with YAML `null`. The body after the closing frontmatter delimiter is preserved exactly. The database transaction starts after the editor exits.
 
 Editor errors, invalid UTF-8, version conflicts, and service errors preserve the draft and print its path. Successful saves remove the temporary draft. Search produces structured JSON by default, and `--json` selects structured output for other commands. An unchanged edit creates no revision. When a write error reports that the write was committed, read the current memory before retrying.
 
 SQLite is authoritative. The search directory is derived, and the service replays pending index events or rebuilds unusable indexes during startup. A successful write response follows search-index publication. Stop the service before making a simple filesystem copy of its data directory for backup; copying a live SQLite file alone is not a consistent backup procedure.
 
 These instructions describe the delivered configuration. They do not establish a live public deployment or compatibility with a particular OAuth provider or AI client.
+
+## Schema Reset Deployment
+
+The current initializer defines the new schema v1. Existing incompatible databases, including legacy v1 databases, are rejected without migration. Build and verify the default-feature release before deployment.
+
+For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v1 and integrity, and register the desired authors. Verify actual MCP calls separately from tunnel health.

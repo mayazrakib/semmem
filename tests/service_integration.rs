@@ -11,7 +11,7 @@ fn concurrent_clients_conflict_without_overwriting_and_publish_immediately() -> 
     let service = Service::open(directory.path())?;
     service.dispatch(
         "create_memories",
-        json!({"memories": [{"key":"shared", "body":"Original memory"}]}),
+        json!({"memories": [{"key":"shared", "author":"test author", "body":"Original memory"}]}),
         "human",
     )?;
     let barrier = Arc::new(Barrier::new(16));
@@ -20,7 +20,7 @@ fn concurrent_clients_conflict_without_overwriting_and_publish_immediately() -> 
         let barrier = Arc::clone(&barrier);
         std::thread::spawn(move || {
             barrier.wait();
-            service.dispatch("update_memories", json!({"memories": [{"key":"shared", "expected_version":1,"body":format!("winner{index} publication")}]}), "ai client")
+            service.dispatch("update_memories", json!({"memories": [{"key":"shared", "expected_version":1,"author":"test author", "body":format!("winner{index} publication")}]}), "ai client")
         })
     }).collect::<Vec<_>>();
     let results = workers
@@ -46,16 +46,19 @@ fn startup_rebuilds_index_and_replays_unpublished_sqlite_commits() -> anyhow::Re
     let database = directory.path().join("memory.sqlite3");
     {
         let mut store = Store::open(&database)?;
-        store.create_memories(&[CreateMemory {
-            key: "recovered".into(),
-            title: "Recovery".into(),
-            body: "durability recovery words".into(),
-            kind: "note".into(),
-            tags: vec![],
-            links: vec![],
-            actor: "human".into(),
-            metadata: Default::default(),
-        }])?;
+        store.create_memories(
+            &[CreateMemory {
+                key: "recovered".into(),
+                title: "Recovery".into(),
+                body: "durability recovery words".into(),
+                r#type: "general".into(),
+                tags: vec![],
+                references: vec![],
+                author: "test author".into(),
+                metadata: Default::default(),
+            }],
+            "human",
+        )?;
     }
     let service = Service::open(directory.path())?;
     let found = service.dispatch("search_memories", json!({"query":"recovery"}), "human")?;
@@ -90,13 +93,14 @@ fn startup_rebuilds_index_and_replays_unpublished_sqlite_commits() -> anyhow::Re
 fn create_retry_is_idempotent_and_multiwrite_failure_is_atomic() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let service = Service::open(directory.path())?;
-    let request = json!({"memories":[{"key":"repeat","body":"exact bytes\n"}]});
+    let request =
+        json!({"memories":[{"key":"repeat","author":"test author", "body":"exact bytes\n"}]});
     let first = service.dispatch("create_memories", request.clone(), "human")?;
     let second = service.dispatch("create_memories", request, "human")?;
     assert_eq!(first, second);
     let result = service.dispatch(
         "create_memories",
-        json!({"memories":[{"key":"new","body":"new"},{"key":"repeat","body":"different"}]}),
+        json!({"memories":[{"key":"new","author":"test author", "body":"new"},{"key":"repeat","author":"test author", "body":"different"}]}),
         "human",
     );
     assert!(result.is_err());
@@ -110,12 +114,11 @@ fn create_retry_is_idempotent_and_multiwrite_failure_is_atomic() -> anyhow::Resu
 }
 
 #[test]
-fn service_accepts_large_batches_and_returns_summaries_until_full_content_is_requested()
--> anyhow::Result<()> {
+fn service_accepts_large_batches_and_always_returns_full_content() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let service = Service::open(directory.path())?;
     let memories = (0..1001)
-        .map(|index| json!({"key":format!("record{index}"),"body":"preserved Markdown"}))
+        .map(|index| json!({"key":format!("record{index}"),"author":"test author", "body":"preserved Markdown"}))
         .collect::<Vec<_>>();
     let created = service.dispatch("create_memories", json!({"memories":memories}), "human")?;
     assert_eq!(created["memories"].as_array().unwrap().len(), 1001);
@@ -128,17 +131,17 @@ fn service_accepts_large_batches_and_returns_summaries_until_full_content_is_req
         "human",
     )?;
     assert_eq!(summaries["memories"].as_array().unwrap().len(), 1001);
-    assert!(summaries["memories"][0].get("body").is_none());
-    let arbitrary = service.dispatch("create_memories", json!({"memories":[{"key":"arbitrary","body":"text","metadata":{"freeform":"unsupported"}}]}), "human").unwrap_err();
+    assert!(summaries["memories"][0].get("body").is_some());
+    let arbitrary = service.dispatch("create_memories", json!({"memories":[{"key":"arbitrary","author":"test author", "body":"text","metadata":{"freeform":"unsupported"}}]}), "human").unwrap_err();
     assert_eq!(arbitrary.code, "invalid_input");
     let created = service.dispatch(
         "create_memories",
-        json!({"memories":[{"key":"summary","body":"# Preserved Markdown\n"}]}),
+        json!({"memories":[{"key":"summary","author":"test author", "body":"# Preserved Markdown\n"}]}),
         "human",
     )?;
-    assert!(created["memories"][0].get("body").is_none());
+    assert!(created["memories"][0].get("body").is_some());
     let listed = service.dispatch("list_memories", json!({}), "human")?;
-    assert!(listed["memories"][0].get("body").is_none());
+    assert!(listed["memories"][0].get("body").is_some());
     let complete = service.dispatch("get_memories", json!({"keys":["summary"]}), "human")?;
     assert_eq!(complete["memories"][0]["body"], "# Preserved Markdown\n");
     assert_eq!(
@@ -158,9 +161,9 @@ fn metadata_survives_staged_reads_updates_and_historical_restoration() -> anyhow
     let service = Service::open(directory.path())?;
     let metadata = json!({
         "key": "metadata",
-        "body": "# Full record\n\nExact original Markdown.\n",
+        "author":"test author", "body": "# Full record\n\nExact original Markdown.\n",
         "summary": "Manually supplied retrieval summary.",
-        "claim_type": "verified observation",
+        "basis": "observed",
         "scope": "project semantic memory",
         "observed_at": 1000,
         "verified_at": 2000,
@@ -172,7 +175,7 @@ fn metadata_survives_staged_reads_updates_and_historical_restoration() -> anyhow
         json!({"keys": ["metadata"], "view": "summary"}),
         "human",
     )?;
-    assert!(compact["memories"][0].get("body").is_none());
+    assert!(compact["memories"][0].get("body").is_some());
     assert_eq!(compact["memories"][0]["summary"], metadata["summary"]);
     assert_eq!(compact["memories"][0]["scope"], metadata["scope"]);
     let full = service.dispatch("get_memories", json!({"keys": ["metadata"]}), "human")?;
@@ -195,7 +198,7 @@ fn metadata_survives_staged_reads_updates_and_historical_restoration() -> anyhow
     for field in [
         "body",
         "summary",
-        "claim_type",
+        "basis",
         "scope",
         "observed_at",
         "verified_at",
@@ -220,9 +223,9 @@ async fn local_transport_accepts_requests_and_full_responses_above_former_body_c
     let body = format!("largepayloadneedle\n\n{}", " ".repeat(5 * 1024 * 1024));
     let response: serde_json::Value = client
         .post(format!("{address}/api/create_memories"))
-        .json(&json!({"memories": [{"key": "large", "body": body, "summary": "Small manual summary"}]}))
+        .json(&json!({"memories": [{"key": "large", "author":"test author", "body": body, "summary": "Small manual summary"}]}))
         .send().await?.error_for_status()?.json().await?;
-    assert!(response["memories"][0].get("body").is_none());
+    assert!(response["memories"][0].get("body").is_some());
     let compact: serde_json::Value = client
         .post(format!("{address}/api/get_memories"))
         .json(&json!({"keys": ["large"], "view": "summary"}))
@@ -232,7 +235,7 @@ async fn local_transport_accepts_requests_and_full_responses_above_former_body_c
         .json()
         .await?;
     assert_eq!(compact["memories"][0]["summary"], "Small manual summary");
-    assert!(compact["memories"][0].get("body").is_none());
+    assert!(compact["memories"][0].get("body").is_some());
     let complete: serde_json::Value = client
         .post(format!("{address}/api/get_memories"))
         .json(&json!({"keys": ["large"]}))
@@ -243,6 +246,99 @@ async fn local_transport_accepts_requests_and_full_responses_above_former_body_c
         .await?;
     assert_eq!(complete["memories"][0]["body"], body);
     server.abort();
+
+    Ok(())
+}
+
+#[test]
+fn historical_search_preserves_full_revisions_and_trusted_attribution() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let service = Service::open(directory.path())?;
+    let original = "# Original café 東京\n\nchronicleold original body\n";
+    let created = service.dispatch(
+        "create_memories",
+        json!({"memories": [{"key": "chronicle", "body": original, "author": "mayaz rakib", "basis": "stated", "summary": "Short summary"}]}),
+        "trusted writer",
+    )?;
+    let first = &created["memories"][0];
+    assert_eq!(first["author"], "mayaz rakib");
+    assert_eq!(first["system_created_by"], "trusted writer");
+    assert_eq!(first["body"], original);
+    let created_at = first["system_updated_at"].as_i64().unwrap();
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64
+        <= created_at
+    {
+        std::thread::yield_now();
+    }
+    service.dispatch(
+        "update_memories",
+        json!({"memories": [{"key": "chronicle", "expected_version": 1, "body": "chroniclenew replacement", "basis": "inferred"}]}),
+        "second writer",
+    )?;
+    let current = service.dispatch(
+        "search_memories",
+        json!({"query": "chronicleold", "fuzzy": false}),
+        "reader",
+    )?;
+    assert_eq!(current["total"], 0);
+    let historical = service.dispatch(
+        "search_memories",
+        json!({"query": "chronicleold", "history": true, "basis": "stated", "fuzzy": false}),
+        "reader",
+    )?;
+    assert_eq!(historical["hits"][0]["body"], original);
+    assert_eq!(historical["hits"][0]["version"], 1);
+    assert_eq!(
+        historical["hits"][0]["system_created_at"],
+        first["system_created_at"]
+    );
+    assert_eq!(
+        historical["hits"][0]["system_updated_at"],
+        first["system_updated_at"]
+    );
+    let as_of = service.dispatch(
+        "search_memories",
+        json!({"query": "chronicleold", "as_of": created_at, "fuzzy": false}),
+        "reader",
+    )?;
+    assert_eq!(as_of["hits"][0]["version"], 1);
+    service.dispatch(
+        "delete_memories",
+        json!({"memories": [{"key": "chronicle", "expected_version": 2}]}),
+        "deleter",
+    )?;
+    assert_eq!(
+        service.dispatch(
+            "search_memories",
+            json!({"query": "chroniclenew", "fuzzy": false}),
+            "reader"
+        )?["total"],
+        0
+    );
+    assert_eq!(
+        service.dispatch(
+            "search_memories",
+            json!({"query": "chroniclenew", "history": true, "fuzzy": false}),
+            "reader"
+        )?["total"],
+        1
+    );
+    let deleted = service.dispatch(
+        "search_memories",
+        json!({"query": "chroniclenew", "include_deleted": true, "fuzzy": false}),
+        "reader",
+    )?;
+    assert_eq!(deleted["hits"][0]["version"], 3);
+    assert_eq!(deleted["hits"][0]["author"], "mayaz rakib");
+    assert_eq!(deleted["hits"][0]["system_deleted_by"], "deleter");
+    service.dispatch(
+        "purge_memories",
+        json!({"memories": [{"key": "chronicle", "expected_version": 3}]}),
+        "purger",
+    )?;
+    assert_eq!(service.dispatch("search_memories", json!({"query": "chronicleold", "history": true, "include_deleted": true, "fuzzy": false}), "reader")?["total"], 0);
 
     Ok(())
 }

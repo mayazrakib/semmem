@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ClaimType, MemoryLink, MemoryRecord, MetadataPatch, UpdateMemory};
+use crate::models::{Basis, MemoryRecord, MemoryReference, MetadataPatch, UpdateMemory};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +16,7 @@ struct Frontmatter {
     #[serde(deserialize_with = "deserialize_strict")]
     summary: Option<String>,
     #[serde(deserialize_with = "deserialize_strict")]
-    claim_type: Option<ClaimType>,
+    basis: Option<Basis>,
     #[serde(deserialize_with = "deserialize_strict")]
     scope: Option<String>,
     #[serde(deserialize_with = "deserialize_strict")]
@@ -26,13 +26,19 @@ struct Frontmatter {
     #[serde(deserialize_with = "deserialize_strict")]
     review_after: Option<i64>,
     #[serde(deserialize_with = "deserialize_strict")]
-    kind: String,
+    r#type: String,
     #[serde(deserialize_with = "deserialize_strict")]
     tags: Vec<String>,
     #[serde(deserialize_with = "deserialize_strict")]
-    links: Vec<MemoryLink>,
+    references: Vec<MemoryReference>,
     #[serde(deserialize_with = "deserialize_strict")]
-    actor: String,
+    author: String,
+    #[serde(deserialize_with = "deserialize_strict")]
+    system_created_by: String,
+    #[serde(deserialize_with = "deserialize_strict")]
+    system_updated_by: String,
+    #[serde(deserialize_with = "deserialize_strict")]
+    system_deleted_by: Option<String>,
     #[serde(deserialize_with = "deserialize_strict")]
     system_version: i64,
     #[serde(deserialize_with = "deserialize_strict")]
@@ -77,15 +83,18 @@ pub fn encode_memory(memory: &MemoryRecord) -> Result<String> {
         key: memory.key.clone(),
         title: memory.title.clone(),
         summary: memory.metadata.summary.clone(),
-        claim_type: memory.metadata.claim_type,
+        basis: memory.metadata.basis,
         scope: memory.metadata.scope.clone(),
         observed_at: memory.metadata.observed_at,
         verified_at: memory.metadata.verified_at,
         review_after: memory.metadata.review_after,
-        kind: memory.kind.clone(),
+        r#type: memory.r#type.clone(),
         tags: memory.tags.clone(),
-        links: memory.links.clone(),
-        actor: memory.actor.clone(),
+        references: memory.references.clone(),
+        author: memory.author.clone(),
+        system_created_by: memory.system_created_by.clone(),
+        system_updated_by: memory.system_updated_by.clone(),
+        system_deleted_by: memory.system_deleted_by.clone(),
         system_version: memory.system_version,
         system_created_at: memory.system_created_at,
         system_updated_at: memory.system_updated_at,
@@ -110,8 +119,8 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         "The frontmatter field 'key' is read-only."
     );
     ensure!(
-        fields.actor == original.actor,
-        "The frontmatter field 'actor' is read-only."
+        !fields.author.trim().is_empty(),
+        "The author must be nonempty."
     );
     ensure!(
         fields.system_version == original.system_version,
@@ -130,6 +139,21 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         "The frontmatter field 'system_deleted_at' is read-only."
     );
 
+    ensure!(
+        fields.system_created_by == original.system_created_by,
+        "The frontmatter field 'system_created_by' is read-only."
+    );
+
+    ensure!(
+        fields.system_updated_by == original.system_updated_by,
+        "The frontmatter field 'system_updated_by' is read-only."
+    );
+
+    ensure!(
+        fields.system_deleted_by == original.system_deleted_by,
+        "The frontmatter field 'system_deleted_by' is read-only."
+    );
+
     Ok(UpdateMemory {
         key: original.key.clone(),
         expected_version: original.system_version,
@@ -137,16 +161,16 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         body: Some(body.to_owned()),
         metadata: MetadataPatch {
             summary: Some(fields.summary),
-            claim_type: Some(fields.claim_type),
+            basis: Some(fields.basis),
             scope: Some(fields.scope),
             observed_at: Some(fields.observed_at),
             verified_at: Some(fields.verified_at),
             review_after: Some(fields.review_after),
         },
-        kind: Some(fields.kind),
+        r#type: Some(fields.r#type),
         tags: Some(fields.tags),
-        links: Some(fields.links),
-        actor: original.actor.clone(),
+        references: Some(fields.references),
+        author: Some(fields.author),
     })
 }
 
@@ -181,9 +205,9 @@ fn split_document(document: &str) -> Result<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{decode_memory, encode_memory};
-    use crate::models::{ClaimType, MemoryLink, MemoryMetadata, MemoryRecord};
+    use crate::models::{Basis, MemoryMetadata, MemoryRecord, MemoryReference};
 
-    fn memory() -> MemoryRecord {
+    pub(super) fn memory() -> MemoryRecord {
         MemoryRecord {
             id: 7,
             key: "decision".into(),
@@ -191,19 +215,22 @@ mod tests {
             body: "\n# Decision café 東京 🦀\r\n\r\nLiteral --- content.\n\n".into(),
             metadata: MemoryMetadata {
                 summary: Some("Original summary".into()),
-                claim_type: Some(ClaimType::EXPLICIT_USER_STATEMENT),
+                basis: Some(Basis::STATED),
                 scope: Some("project/environment".into()),
                 observed_at: Some(10),
                 verified_at: None,
                 review_after: Some(500),
             },
-            kind: "decision".into(),
+            r#type: "decision".into(),
             tags: vec!["café".into(), "東京".into()],
-            links: vec![MemoryLink {
+            references: vec![MemoryReference {
                 target_key: "related".into(),
-                relation: "related to".into(),
+                reference_type: "related to".into(),
             }],
-            actor: "human".into(),
+            author: "human".into(),
+            system_created_by: "human".into(),
+            system_updated_by: "human".into(),
+            system_deleted_by: None,
             system_version: 3,
             system_created_at: 100,
             system_updated_at: 200,
@@ -220,9 +247,9 @@ mod tests {
         assert_eq!(update.expected_version, original.system_version);
         assert_eq!(update.title.as_ref(), Some(&original.title));
         assert_eq!(update.body.as_ref(), Some(&original.body));
-        assert_eq!(update.kind.as_ref(), Some(&original.kind));
+        assert_eq!(update.r#type.as_ref(), Some(&original.r#type));
         assert_eq!(update.tags.as_ref(), Some(&original.tags));
-        assert_eq!(update.links.as_ref(), Some(&original.links));
+        assert_eq!(update.references.as_ref(), Some(&original.references));
         assert_eq!(
             update.metadata.apply(&MemoryMetadata::default()),
             original.metadata
@@ -276,7 +303,9 @@ mod tests {
         for (before, after) in [
             ("id: 7", "id: 8"),
             ("key: decision", "key: changed"),
-            ("actor: human", "actor: robot"),
+            ("system_created_by: human", "system_created_by: robot"),
+            ("system_updated_by: human", "system_updated_by: robot"),
+            ("system_deleted_by: null", "system_deleted_by: robot"),
             ("system_version: 3", "system_version: 4"),
             ("system_created_at: 100", "system_created_at: 101"),
             ("system_updated_at: 200", "system_updated_at: 201"),
@@ -295,14 +324,14 @@ mod tests {
 
         for field in [
             "summary",
-            "claim_type",
+            "basis",
             "scope",
             "observed_at",
             "verified_at",
             "review_after",
             "title",
             "tags",
-            "links",
+            "references",
             "system_deleted_at",
         ] {
             let marker = format!("{field}:");
@@ -321,10 +350,7 @@ mod tests {
             ("title: Unicode decision", "title: 42"),
             ("summary: Original summary", "summary: false"),
             ("verified_at: null", "verified_at: 'yesterday'"),
-            (
-                "claim_type: explicit user statement",
-                "claim_type: unsupported",
-            ),
+            ("basis: stated", "basis: unsupported"),
             ("tags:\n- café\n- 東京", "tags: [17]"),
             (
                 "target_key: related",
@@ -356,7 +382,7 @@ mod tests {
 
         for (field, value) in [
             ("summary", "Original summary"),
-            ("claim_type", "explicit user statement"),
+            ("basis", "stated"),
             ("scope", "project/environment"),
             ("observed_at", "10"),
             ("verified_at", "null"),
@@ -374,5 +400,22 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod author_tests {
+    #[test]
+    fn author_is_editable_while_audit_fields_remain_readonly() {
+        let original = super::tests::memory();
+        let document = super::encode_memory(&original)
+            .unwrap()
+            .replace("author: human", "author: Ada");
+        let update = super::decode_memory(&document, &original).unwrap();
+        assert_eq!(update.author.as_deref(), Some("Ada"));
+        assert!(
+            super::decode_memory(&document.replace("author: Ada", "author: ''"), &original)
+                .is_err()
+        );
     }
 }
