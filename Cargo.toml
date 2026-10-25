@@ -46,4 +46,5 @@ codegen-units = 1
 
 [[bench]]
 name = "search"
+path = "tests/perf/search.rs"
 harness = false

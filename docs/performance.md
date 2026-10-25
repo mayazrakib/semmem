@@ -47,7 +47,7 @@ The batch-window experiment retained identical queries and the same million-memo
 | 5 ms | 120.23 ms | 339.28 ms | Pass |
 | 10 ms | 236.26 ms | 1,143.27 ms | Fail |
 
-The 2 ms default is retained. The small 1 versus 2 ms difference does not establish a reliable winner from one run, and longer windows did not improve this workload. Raw measurements, including the earlier phrase failures and the 10 ms write failure, are preserved in [benchmark evidence](benchmarks/). [The final default-window report](benchmarks/benchmark-million-window-2.json) contains every percentile and the workload counters. [Source checksums](benchmarks/source.sha256) identify the final implementation and benchmark source tree.
+The 2 ms default is retained. The small 1 versus 2 ms difference does not establish a reliable winner from one run, and longer windows did not improve this workload. Raw measurements, including the earlier phrase failures and the 10 ms write failure, are preserved in [benchmark evidence](../benchmark/). [The final default-window report](../benchmark/benchmark-million-window-2.json) contains every percentile and the workload counters. [Source checksums](../benchmark/source.sha256) identify the final implementation and benchmark source tree.
 
 ## Reproduction
 

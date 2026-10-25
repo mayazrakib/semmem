@@ -75,4 +75,4 @@ cargo bench --locked --bench search -- --memories 1000000 --clients 16 --iterati
 
 The benchmark reports isolated and concurrent latency measurements, throughput, startup time, memory use, and storage size. See [performance](docs/performance.md) for the measured results, workload, and limits. These timings exclude HTTP, OAuth, MCP transport, and model generation.
 
-The Rust library separates domain contracts, SQLite storage, search, write coordination, authentication, server transport, MCP tools, and terminal interaction under `src/`. Schema migrations live in `migrations/`, integration tests in `tests/`, and the benchmark in `benches/`.
+The Rust library separates domain contracts, SQLite storage, search, write coordination, authentication, server transport, MCP tools, and terminal interaction under `src/`. Schema migrations live in `migrations/`, integration tests in `tests/`, benchmark code in `tests/perf/`, and benchmark results in `benchmark/`.
