@@ -1,0 +1,95 @@
+{
+    "clients": 16,
+    "data_directory_bytes": 1649030138,
+    "fixture_seed_seconds": 182.296537708,
+    "fixture_version": 1,
+    "iterations_per_client": 100,
+    "measurements": [
+        {
+            "meets_target": true,
+            "p50_ms": 0.069081,
+            "p95_ms": 0.09961199999999999,
+            "p99_ms": 0.15665199999999999,
+            "samples": 100,
+            "scenario": "warm_exact_rare",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 7.997623000000001,
+            "p95_ms": 8.426091,
+            "p99_ms": 8.625334,
+            "samples": 100,
+            "scenario": "warm_exact_common",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 0.57415,
+            "p95_ms": 0.625641,
+            "p99_ms": 0.713112,
+            "samples": 100,
+            "scenario": "warm_fuzzy_rare",
+            "target_p95_ms": 100
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 12.256405999999998,
+            "p95_ms": 13.263937,
+            "p99_ms": 14.552634,
+            "samples": 100,
+            "scenario": "warm_fuzzy_common",
+            "target_p95_ms": 100
+        },
+        {
+            "meets_target": false,
+            "p50_ms": 38.919252,
+            "p95_ms": 40.696875,
+            "p99_ms": 43.443812,
+            "samples": 100,
+            "scenario": "warm_phrase",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 16.540174,
+            "p95_ms": 17.315178,
+            "p99_ms": 18.674422,
+            "samples": 100,
+            "scenario": "warm_prefix",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 95.536088,
+            "p95_ms": 128.068663,
+            "p99_ms": 150.68194400000002,
+            "samples": 100,
+            "scenario": "isolated_durable_visible_writes",
+            "target_p95_ms": 200
+        },
+        {
+            "meets_target": null,
+            "p50_ms": 1.511486,
+            "p95_ms": 3.331319,
+            "p99_ms": 4.1472430000000005,
+            "samples": 1440,
+            "scenario": "concurrent_reads",
+            "target_p95_ms": null
+        },
+        {
+            "meets_target": false,
+            "p50_ms": 250.576819,
+            "p95_ms": 285.30618200000004,
+            "p99_ms": 317.972553,
+            "samples": 160,
+            "scenario": "concurrent_durable_visible_writes",
+            "target_p95_ms": 200
+        }
+    ],
+    "memories": 1000000,
+    "mixed_operations_per_second": 591.6541325016035,
+    "mixed_seconds": 2.704282641,
+    "peak_process_rss_kib": 1465800,
+    "service_startup_seconds": 169.352075136
+}

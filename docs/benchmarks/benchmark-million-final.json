@@ -1,0 +1,100 @@
+{
+    "architecture": "x86_64",
+    "clients": 16,
+    "data_directory_bytes": 1648931934,
+    "fixture_created": false,
+    "fixture_seed_seconds": 0.000050761,
+    "fixture_version": 1,
+    "index_existed_before_open": true,
+    "iterations_per_client": 100,
+    "logical_cpus": 24,
+    "measurements": [
+        {
+            "meets_target": true,
+            "p50_ms": 0.31578599999999996,
+            "p95_ms": 0.375237,
+            "p99_ms": 0.474508,
+            "samples": 100,
+            "scenario": "warm_exact_rare",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 8.380429999999999,
+            "p95_ms": 8.93235,
+            "p99_ms": 9.577594999999999,
+            "samples": 100,
+            "scenario": "warm_exact_common",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 1.303008,
+            "p95_ms": 1.477221,
+            "p99_ms": 1.610814,
+            "samples": 100,
+            "scenario": "warm_fuzzy_rare",
+            "target_p95_ms": 100
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 11.924186,
+            "p95_ms": 12.499317,
+            "p99_ms": 15.021464,
+            "samples": 100,
+            "scenario": "warm_fuzzy_common",
+            "target_p95_ms": 100
+        },
+        {
+            "meets_target": false,
+            "p50_ms": 26.039845999999997,
+            "p95_ms": 26.961057,
+            "p99_ms": 28.462345,
+            "samples": 100,
+            "scenario": "warm_phrase",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 15.935118000000001,
+            "p95_ms": 16.763001,
+            "p99_ms": 17.092016,
+            "samples": 100,
+            "scenario": "warm_prefix",
+            "target_p95_ms": 20
+        },
+        {
+            "meets_target": true,
+            "p50_ms": 93.65308399999999,
+            "p95_ms": 130.402254,
+            "p99_ms": 167.788409,
+            "samples": 100,
+            "scenario": "isolated_durable_visible_writes",
+            "target_p95_ms": 200
+        },
+        {
+            "meets_target": null,
+            "p50_ms": 0.436773,
+            "p95_ms": 9.313265,
+            "p99_ms": 11.106335999999999,
+            "samples": 1440,
+            "scenario": "concurrent_reads",
+            "target_p95_ms": null
+        },
+        {
+            "meets_target": false,
+            "p50_ms": 219.44016,
+            "p95_ms": 263.193034,
+            "p99_ms": 269.120908,
+            "samples": 160,
+            "scenario": "concurrent_durable_visible_writes",
+            "target_p95_ms": 200
+        }
+    ],
+    "memories": 1000000,
+    "mixed_operations_per_second": 628.8065899968162,
+    "mixed_seconds": 2.544502595,
+    "operating_system": "linux",
+    "peak_process_rss_kib": 137208,
+    "service_startup_seconds": 0.004853367
+}
