@@ -99,10 +99,21 @@ pub async fn run(
 }
 
 pub fn local_router(service: Arc<Service>) -> Router {
+    let mcp_service = Arc::clone(&service);
+    let mcp = StreamableHttpService::new(
+        move || Ok(MemoryMcp::new(Arc::clone(&mcp_service), "ai client")),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_legacy_session_mode(false)
+            .with_max_request_body_bytes(usize::MAX),
+    );
+
     Router::new()
         .route("/api/{operation}", post(local_operation))
+        .nest_service("/mcp", mcp)
         .route("/health", get(|| async { Json(json!({"ready": true})) }))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(DefaultBodyLimit::disable())
         .with_state(service)
 }
 
@@ -124,6 +135,7 @@ pub fn remote_router(
     let config = StreamableHttpServerConfig::default()
         .with_json_response(true)
         .with_legacy_session_mode(false)
+        .with_max_request_body_bytes(usize::MAX)
         .with_allowed_hosts(vec![authority, "localhost".into(), "127.0.0.1".into()])
         .with_allowed_origins(vec![public_url.trim_end_matches('/').to_owned()])
         .with_cancellation_token(cancellation);
@@ -181,8 +193,7 @@ fn error_response(error: AppError) -> Response {
         "version_conflict" | "already_exists" | "referenced" | "referenced_taxonomy" => {
             StatusCode::CONFLICT
         }
-        "overloaded" | "database_busy" => StatusCode::SERVICE_UNAVAILABLE,
-        "resource_limit" | "response_limit" => StatusCode::PAYLOAD_TOO_LARGE,
+        "database_busy" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 

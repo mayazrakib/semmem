@@ -60,6 +60,12 @@ CREATE TABLE memory_revisions (
     memory_id INTEGER NOT NULL REFERENCES memories (id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL CHECK (length(body) > 0),
+    summary TEXT,
+    claim_type TEXT CHECK (claim_type IN ('explicit user statement', 'verified observation', 'inference')),
+    scope TEXT,
+    observed_at INTEGER,
+    verified_at INTEGER,
+    review_after INTEGER,
     kind_id INTEGER NOT NULL REFERENCES memory_kinds (id),
     actor_id INTEGER NOT NULL REFERENCES actors (id),
 
@@ -68,6 +74,7 @@ CREATE TABLE memory_revisions (
         CHECK (system_operation IN ('create', 'update', 'delete', 'restore')),
     system_created_at INTEGER NOT NULL,
     system_updated_at INTEGER NOT NULL,
+    system_deleted_at INTEGER,
 
     UNIQUE (memory_id, system_version)
 ) STRICT;
@@ -110,6 +117,12 @@ CREATE INDEX memories_recent
 CREATE INDEX memory_revisions_kind
     ON memory_revisions (kind_id, memory_id, system_version);
 
+CREATE INDEX memory_revisions_scope
+    ON memory_revisions (scope, memory_id, system_version);
+
+CREATE INDEX memory_revisions_claim_type
+    ON memory_revisions (claim_type, memory_id, system_version);
+
 CREATE INDEX memory_revisions_actor ON memory_revisions (actor_id);
 
 CREATE INDEX memory_revision_tags_tag
@@ -128,6 +141,12 @@ SELECT
     memory_revisions.id AS revision_id,
     memory_revisions.title,
     memory_revisions.body,
+    memory_revisions.summary,
+    memory_revisions.claim_type,
+    memory_revisions.scope,
+    memory_revisions.observed_at,
+    memory_revisions.verified_at,
+    memory_revisions.review_after,
     memory_kinds.key AS kind,
     actors.name AS actor,
     memories.system_created_at,
@@ -141,4 +160,4 @@ INNER JOIN memory_revisions
 INNER JOIN memory_kinds ON memory_kinds.id = memory_revisions.kind_id
 INNER JOIN actors ON actors.id = memory_revisions.actor_id;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;

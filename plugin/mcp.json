@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "semmem": {
+      "type": "streamable-http",
+      "extensions": {
+        "com.openai": {
+          "tunnelId": "tunnel_6ade1338a5ac81918154b79897066700",
+          "auth": {
+            "type": "none"
+          }
+        }
+      }
+    }
+  }
+}

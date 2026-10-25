@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, params_from_iter,
@@ -8,12 +8,12 @@ use rusqlite::{
 
 use crate::models::{
     AppError, AppResult, CreateMemory, GetMemories, HistoryRequest, IndexEvent, ListMemories,
-    MemoryLink, MemoryRecord, MemoryVersion, RestoreMemory, TaxonomyInput, TaxonomyRecord,
-    UpdateMemory,
+    MemoryLink, MemoryMetadata, MemoryRecord, MemoryVersion, RestoreMemory, TaxonomyInput,
+    TaxonomyRecord, UpdateMemory,
 };
 
-const MEMORY_COLUMNS: &str = "id, key, title, body, kind, actor, system_version, system_created_at, system_updated_at, system_deleted_at";
-const REVISION_SELECT: &str = "SELECT memories.id, memories.key, revisions.title, revisions.body, kinds.key, actors.name, revisions.system_version, memories.system_created_at, revisions.system_updated_at, revisions.system_deleted_at FROM memory_revisions AS revisions INNER JOIN memories ON memories.id = revisions.memory_id INNER JOIN memory_kinds AS kinds ON kinds.id = revisions.kind_id INNER JOIN actors ON actors.id = revisions.actor_id";
+const MEMORY_COLUMNS: &str = "id, key, title, body, kind, actor, system_version, system_created_at, system_updated_at, system_deleted_at, summary, claim_type, scope, observed_at, verified_at, review_after";
+const REVISION_SELECT: &str = "SELECT memories.id, memories.key, revisions.title, revisions.body, kinds.key, actors.name, revisions.system_version, memories.system_created_at, revisions.system_updated_at, revisions.system_deleted_at, revisions.summary, revisions.claim_type, revisions.scope, revisions.observed_at, revisions.verified_at, revisions.review_after FROM memory_revisions AS revisions INNER JOIN memories ON memories.id = revisions.memory_id INNER JOIN memory_kinds AS kinds ON kinds.id = revisions.kind_id INNER JOIN actors ON actors.id = revisions.actor_id";
 
 pub struct Store {
     connection: Connection,
@@ -22,39 +22,31 @@ pub struct Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> AppResult<Self> {
         let mut connection = Connection::open(path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA temp_store = MEMORY;")?;
-        connection.set_prepared_statement_cache_capacity(64);
+        connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        validate_schema_version(version)?;
+        if version == 0 && connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get::<_, bool>(0))? {
+            return Err(unsupported_schema(version));
+        }
+        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA temp_store = MEMORY;")?;
 
-        if version == 0 || version == 1 {
+        if version == 0 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let locked_version: i64 =
                 transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            validate_schema_version(locked_version)?;
 
             if locked_version == 0 {
-                transaction.execute_batch(include_str!("../migrations/0001_initial.sql"))?;
+                transaction.execute_batch(include_str!("../initialize.sql"))?;
                 let now = current_time()?;
                 transaction.execute("INSERT INTO database_identity (id, key, system_created_at, system_updated_at) VALUES (1, ?1, ?2, ?2)", params![uuid::Uuid::now_v7().to_string(), now])?;
             }
 
-            let migrated_version: i64 =
-                transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-            if migrated_version == 1 {
-                transaction.execute_batch(include_str!(
-                    "../migrations/0002_revision_deleted_state.sql"
-                ))?;
-            }
-
             transaction.commit()?;
-        } else if version != 2 {
-            return Err(AppError::new(
-                "unsupported_schema",
-                format!("Unsupported database schema version {version}."),
-            ));
         }
+
+        register_text_functions(&connection)?;
 
         Ok(Self { connection })
     }
@@ -64,18 +56,17 @@ impl Store {
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> AppResult<Self> {
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY;")?;
-        connection.set_prepared_statement_cache_capacity(64);
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
-        if version != 2 {
-            return Err(AppError::new(
-                "unsupported_schema",
-                format!("Unsupported database schema version {version}."),
-            ));
+        if version != 3 {
+            return Err(unsupported_schema(version));
         }
+
+        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY;")?;
+
+        register_text_functions(&connection)?;
 
         Ok(Self { connection })
     }
@@ -107,38 +98,48 @@ impl Store {
     }
 
     pub fn get_memories(&self, request: &GetMemories) -> AppResult<Vec<MemoryRecord>> {
-        if request.keys.is_empty() || request.keys.len() > 64 {
-            return Err(AppError::invalid("Get requires between 1 and 64 keys."));
+        self.read_memories(request, false)
+    }
+
+    pub fn get_memory_summaries(&self, request: &GetMemories) -> AppResult<Vec<serde_json::Value>> {
+        compact_records(self.read_memories(request, true)?)
+    }
+
+    fn read_memories(
+        &self,
+        request: &GetMemories,
+        is_summary: bool,
+    ) -> AppResult<Vec<MemoryRecord>> {
+        if request.keys.is_empty() {
+            return Err(AppError::invalid("Get requires at least one key."));
         }
 
         let snapshot = self.connection.unchecked_transaction()?;
-        let placeholders = std::iter::repeat_n("?", request.keys.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut values = request
-            .keys
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::from)
-            .collect::<Vec<_>>();
+        let mut values = vec![rusqlite::types::Value::from(serde_json::to_string(
+            &request.keys,
+        )?)];
+        let columns = memory_columns(is_summary);
+        let revision_select = revision_select(is_summary);
         let sql = if let Some(version) = request.version {
             values.push(version.into());
 
             format!(
-                "{REVISION_SELECT} WHERE memories.key IN ({placeholders}) AND revisions.system_version = ?"
+                "{revision_select} WHERE memories.key IN (SELECT value FROM json_each(?)) AND revisions.system_version = ?"
             )
         } else {
             values.push(i64::from(request.include_deleted).into());
 
             format!(
-                "SELECT {MEMORY_COLUMNS} FROM current_memories WHERE key IN ({placeholders}) AND (? OR system_deleted_at IS NULL)"
+                "SELECT {columns} FROM current_memories WHERE key IN (SELECT value FROM json_each(?)) AND (? OR system_deleted_at IS NULL)"
             )
         };
         let mut statement = snapshot.prepare_cached(&sql)?;
         let mut selected = statement
             .query_map(params_from_iter(values), read_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut selected)?;
+        if !is_summary {
+            read_record_attachments(&snapshot, &mut selected)?;
+        }
         let by_key: BTreeMap<&str, &MemoryRecord> = selected
             .iter()
             .map(|record| (record.key.as_str(), record))
@@ -207,6 +208,7 @@ impl Store {
                     1,
                     &input.title,
                     &input.body,
+                    &input.metadata,
                     &input.kind,
                     &input.tags,
                     &input.links,
@@ -247,12 +249,14 @@ impl Store {
             let links = input.links.as_deref().unwrap_or(&current.links);
             validate_body(body)?;
             let version = next_version(current.system_version)?;
+            let metadata = input.metadata.apply(&current.metadata);
             insert_revision(
                 &transaction,
                 current.id,
                 version,
                 title,
                 body,
+                &metadata,
                 kind,
                 tags,
                 links,
@@ -294,6 +298,7 @@ impl Store {
                 version,
                 &current.title,
                 &current.body,
+                &current.metadata,
                 &current.kind,
                 &current.tags,
                 &current.links,
@@ -340,6 +345,7 @@ impl Store {
                 version,
                 &selected.title,
                 &selected.body,
+                &selected.metadata,
                 &selected.kind,
                 &selected.tags,
                 &selected.links,
@@ -420,6 +426,7 @@ impl Store {
                 version,
                 &current.title,
                 &current.body,
+                &current.metadata,
                 &current.kind,
                 &current.tags,
                 &current.links,
@@ -449,12 +456,24 @@ impl Store {
     }
 
     pub fn list_memories(&self, request: &ListMemories) -> AppResult<Vec<MemoryRecord>> {
-        if request.limit == 0 || request.limit > 1000 {
-            return Err(AppError::invalid("Limit must be between 1 and 1000."));
+        self.read_list(request, false)
+    }
+
+    pub fn list_memory_summaries(
+        &self,
+        request: &ListMemories,
+    ) -> AppResult<Vec<serde_json::Value>> {
+        compact_records(self.read_list(request, true)?)
+    }
+
+    fn read_list(&self, request: &ListMemories, is_summary: bool) -> AppResult<Vec<MemoryRecord>> {
+        if request.limit == 0 {
+            return Err(AppError::invalid("Limit must be positive."));
         }
 
         let snapshot = self.connection.unchecked_transaction()?;
-        let mut sql = format!("SELECT {MEMORY_COLUMNS} FROM current_memories WHERE 1 = 1");
+        let columns = memory_columns(is_summary);
+        let mut sql = format!("SELECT {columns} FROM current_memories WHERE 1 = 1");
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
 
         if !request.include_deleted {
@@ -466,9 +485,26 @@ impl Store {
             values.push(kind.clone().into());
         }
 
-        for tag in &request.tags {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM memory_revision_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id WHERE membership.revision_id = current_memories.revision_id AND tags.key = ?)");
-            values.push(tag.clone().into());
+        if !request.tags.is_empty() {
+            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(?) AS requested WHERE NOT EXISTS (SELECT 1 FROM memory_revision_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id WHERE membership.revision_id = current_memories.revision_id AND tags.key = requested.value))");
+            values.push(serde_json::to_string(&request.tags)?.into());
+        }
+
+        if let Some(scope) = &request.scope {
+            sql.push_str(" AND scope = ?");
+            values.push(scope.clone().into());
+        }
+
+        if let Some(claim_type) = request.claim_type {
+            sql.push_str(" AND claim_type = ?");
+            let value = serde_json::to_value(claim_type)?;
+            values.push(
+                value
+                    .as_str()
+                    .expect("Claim types serialize as text")
+                    .to_owned()
+                    .into(),
+            );
         }
 
         if let Some(target) = &request.linked_to {
@@ -489,12 +525,14 @@ impl Store {
         }
 
         sql.push_str(" ORDER BY system_updated_at DESC, id DESC LIMIT ?");
-        values.push((request.limit as i64).into());
+        values.push((sqlite_limit(request.limit)?).into());
         let mut statement = snapshot.prepare_cached(&sql)?;
         let mut records = statement
             .query_map(params_from_iter(values), read_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
+        if !is_summary {
+            read_record_attachments(&snapshot, &mut records)?;
+        }
         drop(statement);
         snapshot.commit()?;
 
@@ -502,8 +540,23 @@ impl Store {
     }
 
     pub fn list_revisions(&self, request: &HistoryRequest) -> AppResult<Vec<MemoryRecord>> {
-        if request.limit == 0 || request.limit > 1000 {
-            return Err(AppError::invalid("Limit must be between 1 and 1000."));
+        self.read_revisions(request, false)
+    }
+
+    pub fn list_revision_summaries(
+        &self,
+        request: &HistoryRequest,
+    ) -> AppResult<Vec<serde_json::Value>> {
+        compact_records(self.read_revisions(request, true)?)
+    }
+
+    fn read_revisions(
+        &self,
+        request: &HistoryRequest,
+        is_summary: bool,
+    ) -> AppResult<Vec<MemoryRecord>> {
+        if request.limit == 0 {
+            return Err(AppError::invalid("Limit must be positive."));
         }
 
         let snapshot = self.connection.unchecked_transaction()?;
@@ -518,17 +571,24 @@ impl Store {
             ));
         }
 
+        let revision_select = revision_select(is_summary);
         let sql = format!(
-            "{REVISION_SELECT} WHERE memories.key = ?1 AND (?2 IS NULL OR revisions.system_version < ?2) ORDER BY revisions.system_version DESC LIMIT ?3"
+            "{revision_select} WHERE memories.key = ?1 AND (?2 IS NULL OR revisions.system_version < ?2) ORDER BY revisions.system_version DESC LIMIT ?3"
         );
         let mut statement = snapshot.prepare_cached(&sql)?;
         let mut records = statement
             .query_map(
-                params![request.key, request.before_version, request.limit as i64],
+                params![
+                    request.key,
+                    request.before_version,
+                    sqlite_limit(request.limit)?
+                ],
                 read_record,
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
+        if !is_summary {
+            read_record_attachments(&snapshot, &mut records)?;
+        }
         drop(statement);
         snapshot.commit()?;
 
@@ -542,7 +602,7 @@ impl Store {
         );
         let mut statement = snapshot.prepare_cached(&sql)?;
         let mut records = statement
-            .query_map(params![after_id, limit.min(1000) as i64], read_record)?
+            .query_map(params![after_id, sqlite_limit(limit)?], read_record)?
             .collect::<Result<Vec<_>, _>>()?;
         read_record_attachments(&snapshot, &mut records)?;
         drop(statement);
@@ -556,7 +616,7 @@ impl Store {
             "SELECT id, memory_key FROM index_events WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
         let events = statement
-            .query_map(params![after, limit.min(10000) as i64], |row| {
+            .query_map(params![after, sqlite_limit(limit)?], |row| {
                 Ok(IndexEvent {
                     sequence: row.get(0)?,
                     memory_key: row.get(1)?,
@@ -662,6 +722,24 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<MemoryRecord> {
         system_created_at: row.get(7)?,
         system_updated_at: row.get(8)?,
         system_deleted_at: row.get(9)?,
+        metadata: MemoryMetadata {
+            summary: row.get(10)?,
+            claim_type: row
+                .get::<_, Option<String>>(11)?
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            scope: row.get(12)?,
+            observed_at: row.get(13)?,
+            verified_at: row.get(14)?,
+            review_after: row.get(15)?,
+        },
     })
 }
 
@@ -729,20 +807,17 @@ fn read_record_attachments(connection: &Connection, records: &mut [MemoryRecord]
         .enumerate()
         .map(|(index, record)| ((record.id, record.system_version), index))
         .collect();
-    let values = records
+    let identities = records
         .iter()
-        .flat_map(|record| [record.id, record.system_version])
+        .map(|record| [record.id, record.system_version])
         .collect::<Vec<_>>();
-    let placeholders = std::iter::repeat_n("(?, ?)", records.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let requested =
-        format!("WITH requested (memory_id, system_version) AS (VALUES {placeholders}) ");
+    let values = serde_json::to_string(&identities)?;
+    let requested = "WITH requested (memory_id, system_version) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?1)) ";
     let tags_sql = format!(
         "{requested} SELECT requested.memory_id, requested.system_version, tags.key FROM requested INNER JOIN memory_revisions AS revisions ON revisions.memory_id = requested.memory_id AND revisions.system_version = requested.system_version INNER JOIN memory_revision_tags AS membership ON membership.revision_id = revisions.id INNER JOIN tags ON tags.id = membership.tag_id ORDER BY requested.memory_id, requested.system_version, tags.key"
     );
     let mut tags = connection.prepare_cached(&tags_sql)?;
-    let mut rows = tags.query(params_from_iter(values.iter()))?;
+    let mut rows = tags.query([&values])?;
 
     while let Some(row) = rows.next()? {
         let identity = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
@@ -753,7 +828,7 @@ fn read_record_attachments(connection: &Connection, records: &mut [MemoryRecord]
         "{requested} SELECT requested.memory_id, requested.system_version, target.key, relations.key FROM requested INNER JOIN memory_revisions AS revisions ON revisions.memory_id = requested.memory_id AND revisions.system_version = requested.system_version INNER JOIN memory_revision_links AS links ON links.revision_id = revisions.id INNER JOIN memories AS target ON target.id = links.target_memory_id INNER JOIN relation_types AS relations ON relations.id = links.relation_type_id ORDER BY requested.memory_id, requested.system_version, relations.key, target.key"
     );
     let mut links = connection.prepare_cached(&links_sql)?;
-    let mut rows = links.query(params_from_iter(values.iter()))?;
+    let mut rows = links.query([&values])?;
 
     while let Some(row) = rows.next()? {
         let identity = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
@@ -773,6 +848,7 @@ fn insert_revision(
     version: i64,
     title: &str,
     body: &str,
+    metadata: &MemoryMetadata,
     kind: &str,
     tags: &[String],
     links: &[MemoryLink],
@@ -787,7 +863,12 @@ fn insert_revision(
     let actor_id: i64 = connection
         .prepare_cached("SELECT id FROM actors WHERE name = ?1")?
         .query_row([actor], |row| row.get(0))?;
-    connection.prepare_cached("INSERT INTO memory_revisions (memory_id, title, body, kind_id, actor_id, system_version, system_operation, system_created_at, system_updated_at, system_deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)")?.execute(params![memory_id, title, body, kind_id, actor_id, version, operation, now, deleted_at])?;
+    let claim_type = metadata
+        .claim_type
+        .map(serde_json::to_value)
+        .transpose()?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    connection.prepare_cached("INSERT INTO memory_revisions (memory_id, title, body, kind_id, actor_id, summary, claim_type, scope, observed_at, verified_at, review_after, system_version, system_operation, system_created_at, system_updated_at, system_deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)")?.execute(params![memory_id, title, body, kind_id, actor_id, metadata.summary, claim_type, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, version, operation, now, deleted_at])?;
     let revision_id = connection.last_insert_rowid();
 
     for tag in tags.iter().collect::<BTreeSet<_>>() {
@@ -901,6 +982,7 @@ fn matches_create(record: &MemoryRecord, input: &CreateMemory) -> bool {
     record.system_deleted_at.is_none()
         && record.title == input.title
         && record.body == input.body
+        && record.metadata == input.metadata
         && record.kind == input.kind
         && record.actor == input.actor
         && tags == requested_tags
@@ -908,10 +990,8 @@ fn matches_create(record: &MemoryRecord, input: &CreateMemory) -> bool {
 }
 
 fn validate_batch(length: usize) -> AppResult<()> {
-    if length == 0 || length > 1000 {
-        return Err(AppError::invalid(
-            "A batch must contain between 1 and 1000 items.",
-        ));
+    if length == 0 {
+        return Err(AppError::invalid("A batch must contain at least one item."));
     }
 
     Ok(())
@@ -1000,4 +1080,117 @@ fn next_version(version: i64) -> AppResult<i64> {
     version
         .checked_add(1)
         .ok_or_else(|| AppError::new("version_exhausted", "Memory version limit was reached."))
+}
+
+fn wait_for_database(_: i32) -> bool {
+    std::thread::yield_now();
+
+    true
+}
+
+fn unsupported_schema(version: i64) -> AppError {
+    AppError::new(
+        "unsupported_schema",
+        format!(
+            "Database schema version {version} is unsupported. This build requires a fresh database initialized at version 3."
+        ),
+    )
+}
+
+fn validate_schema_version(version: i64) -> AppResult<()> {
+    if version != 0 && version != 3 {
+        return Err(unsupported_schema(version));
+    }
+
+    Ok(())
+}
+
+fn sqlite_limit(limit: usize) -> AppResult<i64> {
+    i64::try_from(limit)
+        .map_err(|_| AppError::invalid("The requested count cannot be represented by SQLite."))
+}
+
+fn register_text_functions(connection: &Connection) -> AppResult<()> {
+    connection.create_scalar_function(
+        "memory_excerpt",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let summary: Option<String> = context.get(1)?;
+
+            if summary
+                .as_deref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+            {
+                return Ok(String::new());
+            }
+
+            let body = context.get_raw(0).as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+
+            Ok(crate::models::markdown_paragraphs(body)
+                .next()
+                .unwrap_or("")
+                .to_owned())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn excerpt_expression(body: &str, summary: &str) -> String {
+    format!("memory_excerpt({body}, {summary})")
+}
+
+fn memory_columns(is_summary: bool) -> String {
+    if is_summary {
+        return MEMORY_COLUMNS.replacen("body", &excerpt_expression("body", "summary"), 1);
+    }
+
+    MEMORY_COLUMNS.to_owned()
+}
+
+fn revision_select(is_summary: bool) -> String {
+    if is_summary {
+        return REVISION_SELECT.replacen(
+            "revisions.body",
+            &excerpt_expression("revisions.body", "revisions.summary"),
+            1,
+        );
+    }
+
+    REVISION_SELECT.to_owned()
+}
+
+fn compact_records(records: Vec<MemoryRecord>) -> AppResult<Vec<serde_json::Value>> {
+    records
+        .into_iter()
+        .map(|mut record| {
+            let excerpt = std::mem::take(&mut record.body);
+            let has_summary = record
+                .metadata
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty());
+            let mut value = serde_json::to_value(record)?;
+            let fields = value
+                .as_object_mut()
+                .expect("A memory serializes as an object");
+            fields.remove("body");
+            fields.remove("tags");
+            fields.remove("links");
+
+            if !has_summary {
+                fields.insert("excerpt".into(), excerpt.into());
+            }
+
+            Ok(value)
+        })
+        .collect()
 }

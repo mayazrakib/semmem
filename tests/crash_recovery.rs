@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 #[cfg(feature = "fault-injection")]
-use semantic_memory::storage::Store;
+use semmem::storage::Store;
 use serde_json::{Value, json};
 
 struct ServerProcess {
@@ -20,20 +20,20 @@ impl ServerProcess {
     fn start(directory: &Path, socket: &Path, fault: Option<&str>, label: &str) -> Self {
         let log = directory.join(format!("{label}.log"));
         let output = File::create(&log).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_semantic-memory"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_semmem"));
         command
             .arg("--socket")
             .arg(socket)
-            .arg("serve")
+            .arg("run")
             .arg("--data-dir")
             .arg(directory)
-            .env_remove("SEMANTIC_MEMORY_FAILPOINT")
+            .env_remove("SEMMEM_FAILPOINT")
             .stdin(Stdio::null())
             .stdout(output.try_clone().unwrap())
             .stderr(output);
 
         if let Some(fault) = fault {
-            command.env("SEMANTIC_MEMORY_FAILPOINT", fault);
+            command.env("SEMMEM_FAILPOINT", fault);
         }
 
         Self {
@@ -129,7 +129,13 @@ async fn assert_recovers_after_crash(fault: &str) {
         "body": markdown,
         "kind": "note",
         "tags": ["recovery"],
-        "links": []
+        "links": [],
+        "summary": "Durable manual summary",
+        "claim_type": "verified observation",
+        "scope": "crash recovery",
+        "observed_at": 1000,
+        "verified_at": 2000,
+        "review_after": 3000
     });
     let arguments = json!({"memories": [input]});
     let response = client
@@ -137,10 +143,11 @@ async fn assert_recovers_after_crash(fault: &str) {
         .json(&arguments)
         .send()
         .await;
-    assert!(
-        response.is_err(),
-        "{fault} unexpectedly acknowledged the write."
-    );
+    if let Ok(response) = response {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        panic!("{fault} unexpectedly returned {status}: {body}");
+    }
     assert_eq!(
         interrupted.wait_exit().await.code(),
         Some(86),
@@ -157,6 +164,10 @@ async fn assert_recovers_after_crash(fault: &str) {
         "SQLite lost committed text at {fault}."
     );
     assert_eq!(committed.system_version, 1);
+    assert_eq!(
+        committed.metadata.summary.as_deref(),
+        Some("Durable manual summary")
+    );
     let integrity: String = persisted
         .connection()
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -170,6 +181,10 @@ async fn assert_recovers_after_crash(fault: &str) {
     assert_eq!(fetched["memories"][0]["body"], markdown);
     assert_eq!(fetched["memories"][0]["system_version"], 1);
     assert_eq!(fetched["memories"][0]["tags"], json!(["recovery"]));
+    assert_eq!(fetched["memories"][0]["summary"], "Durable manual summary");
+    assert_eq!(fetched["memories"][0]["observed_at"], 1000);
+    assert_eq!(fetched["memories"][0]["verified_at"], 2000);
+    assert_eq!(fetched["memories"][0]["review_after"], 3000);
 
     let search = invoke(
         &client,

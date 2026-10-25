@@ -1,6 +1,6 @@
 # Database schema
 
-SQLite stores the canonical UTF-8 Markdown bodies and all authoritative fields. Search uses a separate, rebuildable Tantivy index. The schema has no arbitrary metadata column, entity-attribute-value table, or JSON revision snapshot. The initial migration is [0001_initial.sql](../migrations/0001_initial.sql). [0002_revision_deleted_state.sql](../migrations/0002_revision_deleted_state.sql) adds explicit per-revision deletion state.
+SQLite stores the canonical UTF-8 Markdown bodies and all authoritative fields. Search uses a separate, rebuildable Tantivy index. The schema has no arbitrary metadata column, entity-attribute-value table, or JSON revision snapshot. The sole initializer is [initialize.sql](../initialize.sql), which includes per-revision deletion state and metadata. It creates schema version three for fresh databases. Existing incompatible schemas are rejected without conversion.
 
 ## Tables and relationships
 
@@ -8,7 +8,7 @@ SQLite stores the canonical UTF-8 Markdown bodies and all authoritative fields. 
 |---|---|
 | `database_identity` | Identifies this database so a search index from another database is not reused |
 | `memories` | Stable identity, current revision number, and lifecycle fields |
-| `memory_revisions` | Complete title, Markdown body, kind, actor, operation, and version for each edit |
+| `memory_revisions` | Complete title, Markdown body, metadata, kind, actor, operation, and version for each edit |
 | `memory_kinds` | Stable kind keys and readable names |
 | `tags` | Stable tag keys and readable names |
 | `relation_types` | Stable relationship keys and readable names |
@@ -22,6 +22,21 @@ Each memory has an integer internal `id` and a unique public `key`. Content belo
 Kinds, tags, actors, and relationship names occur in their own tables. Revision associations reference integer keys instead of repeating names. Junction tables have composite primary keys and use `WITHOUT ROWID`. Foreign keys are enabled on service connections. The application uses parameterized SQL, and the migration defines strict tables.
 
 Memory writes create missing kind, tag, and relationship-type rows using the supplied key as their initial name. The default kind is `note`. Explicit taxonomy operations can create entries in advance or change their readable names. Link targets must identify existing memories or memories created in the same batch. Taxonomy deletion rejects entries still referenced by current or historical revisions.
+
+## Revision metadata
+
+The following nullable fields belong to every revision and survive history, deletion, and restoration:
+
+| Field | Meaning |
+|---|---|
+| `summary` | Manually supplied retrieval summary, returned in full |
+| `claim_type` | `explicit user statement`, `verified observation`, or `inference` |
+| `scope` | Project or environment label, with exact-match filtering |
+| `observed_at` | When the fact was observed or stated |
+| `verified_at` | When the fact was last checked |
+| `review_after` | When the fact should be reconsidered |
+
+Metadata timestamps are signed integer UTC milliseconds since Unix epoch. Unknown values remain `NULL`; the service does not infer provenance, verification, or expiration. On updates, omission preserves a value, explicit JSON `null` clears it, and a supplied value replaces it. Editing a record does not update `verified_at` automatically.
 
 ## Revisions and lifecycle
 
@@ -37,12 +52,14 @@ Purge removes logical database records. It does not promise forensic erasure fro
 
 The schema indexes active memories by descending update time and ID, revision lookup by memory and version, revision kinds and actors, tag-to-revision membership, and incoming relationships. Primary keys cover identity, public-key, and association lookups. Browse pagination uses the last update timestamp and ID; revision pagination uses the last version. Taxonomy lists use key-based pagination.
 
-Browse, history, and memory mutation responses contain summaries without Markdown bodies. Use `get_memories` with the desired key and optional version to read full content. Reads have a 4 MiB response limit; request fewer records if a response exceeds it. Search returns bounded excerpts. Service mutation batches contain at most 64 memories and 1 MiB of JSON. The writer queue admits at most 256 requests and 16 MiB of queued payloads.
+Search, browse, history, and memory mutation responses omit full Markdown bodies. Search returns a complete manual summary or a matching paragraph excerpt. `get_memories` defaults to `view: full`, returning exact content and associations; `view: summary` selects compact metadata with a manual summary or the first nonempty paragraph. Pagination is caller controlled, with no application maximum page size. The service imposes no token budget, payload ceiling, query-expansion ceiling, or batch-count ceiling.
 
-SQLite runs in write-ahead logging mode with `synchronous=FULL`, cached prepared statements, four read connections, and a bounded writer queue. The writer groups pending requests before publishing the search index. Each memory batch has its own transaction.
+SQLite runs in write-ahead logging mode with `synchronous=FULL`, cached prepared statements, a reusable dynamically growing read pool, and an unbounded writer queue. The writer groups pending requests before publishing the search index. Each memory batch has its own transaction.
 
 Index events are written in the same transaction as memory changes. Their textual memory keys deliberately survive memory deletion, allowing search tombstones to be published after a purge. The service advances the search watermark and acknowledges processed events after committing the index. Startup replays pending events; an index with an incompatible database identity or an unreadable index is replaced and rebuilt from current records.
 
 Successful writes are acknowledged after search publication. If SQLite commits but publication fails, the response identifies the committed state and leaves events available for recovery. Search candidates are checked against current SQLite state before they are returned.
 
-Use the CLI and MCP interfaces for mutations so versioning, revisions, and search publication remain coordinated. Schema versions zero and one migrate transactionally to version two; newer, unsupported versions fail explicitly. Search schema generations are tracked independently and can trigger a rebuild without changing canonical memories.
+Use the CLI and MCP interfaces for mutations so versioning, revisions, and search publication remain coordinated. New databases initialize transactionally at schema version three. Existing incompatible schemas fail explicitly before database settings or content are modified. Search schema generations are tracked independently and can trigger a rebuild without changing canonical memories.
+
+The runtime has no application request or busy-wait deadline. SQLite contention yields and retries; cancellation and authorization validation remain in effect. Machine address space, SQLite representations, and Tantivy-required writer arena configuration remain library constraints. Index maintenance batches process all pending work; their size does not reject caller input. All retrieval uses readable text and ordinary lexical ranking, without embeddings or model inference.

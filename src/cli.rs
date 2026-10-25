@@ -1,10 +1,9 @@
 use std::env;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -12,16 +11,16 @@ use comfy_table::{ContentArrangement, Table};
 use serde_json::{Value, json};
 
 use crate::models::{
-    CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryLink, MemoryRecord,
-    MemoryVersion, RestoreMemory, SearchRequest, UpdateMemory,
+    ClaimType, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryLink, MemoryMetadata,
+    MemoryRecord, MemoryVersion, MemoryView, RestoreMemory, SearchRequest,
 };
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(name = "semmem", version, about)]
 pub struct Cli {
-    #[arg(long, global = true, env = "SEMANTIC_MEMORY_SOCKET", default_value_os_t = default_socket_path())]
+    #[arg(long, global = true, env = "SEMMEM_SOCKET", default_value_os_t = default_socket_path())]
     pub socket: PathBuf,
-    #[arg(long, global = true)]
+    #[arg(short = 'j', long, global = true)]
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
@@ -31,27 +30,38 @@ pub struct Cli {
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum Command {
     #[command(
-        name = "serve",
-        about = "Run the local memory service and authenticated MCP endpoint"
+        name = "run",
+        hide = true,
+        about = "Run the local memory service and authenticated MCP endpoint."
     )]
-    SERVE {
+    RUN {
         #[arg(long, default_value_os_t = default_data_dir())]
         data_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8765")]
         listen: SocketAddr,
-        #[arg(long)]
+        #[arg(long, env = "SEMMEM_ISSUER")]
         issuer: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "SEMMEM_AUDIENCE")]
         audience: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "SEMMEM_PUBLIC_URL")]
         public_url: Option<String>,
     },
+    #[command(name = "start", about = "Start the semmem systemd user service.")]
+    START,
+    #[command(name = "stop", about = "Stop the semmem systemd user service.")]
+    STOP,
+    #[command(name = "status", about = "Show structured service status.")]
+    STATUS,
     #[command(
         name = "search",
-        about = "Search memory text, tolerating spelling mistakes by default"
+        about = "Search memory text, tolerating spelling mistakes by default."
     )]
     SEARCH {
         query: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, value_enum)]
+        claim_type: Option<ClaimType>,
         #[arg(long)]
         kind: Option<String>,
         #[arg(long = "tag")]
@@ -60,14 +70,16 @@ pub enum Command {
         exact: bool,
         #[arg(long)]
         prefix: bool,
-        #[arg(long, default_value_t = 20)]
+        #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
-    #[command(name = "list", about = "Browse memories by kind, tag, or relationship")]
+    #[command(name = "list", about = "Browse memories by kind, tag, or relationship.")]
     LIST(BrowseArguments),
-    #[command(name = "show", about = "Read complete memories or historical versions")]
+    #[command(name = "show", about = "Read complete memories or historical versions.")]
     SHOW {
         keys: Vec<String>,
+        #[arg(long, value_enum, default_value = "full")]
+        view: MemoryView,
         #[arg(long)]
         include_deleted: bool,
         #[arg(long)]
@@ -75,14 +87,21 @@ pub enum Command {
     },
     #[command(
         name = "add",
-        about = "Write a new Markdown memory in VISUAL, EDITOR, or Vim"
+        about = "Prompt for metadata, then write Markdown in VISUAL, EDITOR, or Vim."
     )]
     ADD {
-        key: String,
-        #[arg(long, default_value = "")]
-        title: String,
-        #[arg(long, default_value = "note")]
-        kind: String,
+        key: Option<String>,
+        #[arg(
+            long,
+            help = "Use supplied flags and defaults without prompting. This requires KEY."
+        )]
+        no_input: bool,
+        #[command(flatten)]
+        metadata: MetadataArguments,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
         #[arg(long = "tag")]
         tags: Vec<String>,
         #[arg(long = "link", value_parser = parse_link)]
@@ -90,31 +109,17 @@ pub enum Command {
     },
     #[command(
         name = "edit",
-        about = "Edit Markdown and update explicit fields without overwriting concurrent changes"
+        about = "Edit a memory as Markdown with YAML frontmatter."
     )]
-    EDIT {
-        key: String,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long = "tag", conflicts_with = "clear_tags")]
-        tags: Option<Vec<String>>,
-        #[arg(long)]
-        clear_tags: bool,
-        #[arg(long = "link", value_parser = parse_link, conflicts_with = "clear_links")]
-        links: Option<Vec<MemoryLink>>,
-        #[arg(long)]
-        clear_links: bool,
-    },
+    EDIT { key: String },
     #[command(
         name = "delete",
-        about = "Move a memory to the recoverable deleted state"
+        about = "Move a memory to the recoverable deleted state."
     )]
     DELETE(VersionArguments),
     #[command(
         name = "purge",
-        about = "Permanently remove a memory and its history; requires --confirm"
+        about = "Permanently remove a memory and its history. This requires --confirm."
     )]
     PURGE {
         #[command(flatten)]
@@ -124,7 +129,7 @@ pub enum Command {
     },
     #[command(
         name = "restore",
-        about = "Restore a deleted memory or an earlier revision"
+        about = "Restore a deleted memory or an earlier revision."
     )]
     RESTORE {
         #[command(flatten)]
@@ -132,7 +137,7 @@ pub enum Command {
         #[arg(long)]
         revision: Option<i64>,
     },
-    #[command(name = "history", about = "Inspect a memory's revision history")]
+    #[command(name = "history", about = "Inspect a memory's revision history.")]
     HISTORY {
         key: String,
         #[arg(long, default_value_t = 20)]
@@ -142,7 +147,7 @@ pub enum Command {
     },
     #[command(
         name = "taxonomy",
-        about = "List, create, rename, or delete kinds, tags, and relationship types"
+        about = "List, create, rename, or delete kinds, tags, and relationship types."
     )]
     TAXONOMY {
         #[arg(value_enum)]
@@ -153,7 +158,52 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
+pub struct MetadataArguments {
+    #[arg(long)]
+    summary: Option<String>,
+    #[arg(long, value_enum)]
+    claim_type: Option<ClaimType>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Specify UTC milliseconds since Unix epoch."
+    )]
+    observed_at: Option<i64>,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Specify UTC milliseconds since Unix epoch."
+    )]
+    verified_at: Option<i64>,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Specify UTC milliseconds since Unix epoch."
+    )]
+    review_after: Option<i64>,
+}
+
+impl From<MetadataArguments> for MemoryMetadata {
+    fn from(arguments: MetadataArguments) -> Self {
+        Self {
+            summary: arguments.summary,
+            claim_type: arguments.claim_type,
+            scope: arguments.scope,
+            observed_at: arguments.observed_at,
+            verified_at: arguments.verified_at,
+            review_after: arguments.review_after,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct BrowseArguments {
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long, value_enum)]
+    claim_type: Option<ClaimType>,
     #[arg(long)]
     kind: Option<String>,
     #[arg(long = "tag")]
@@ -206,6 +256,23 @@ pub enum TaxonomyAction {
     DELETE { key: String },
 }
 
+pub fn parse_cli() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let text = crate::output::format_help(&error.render().to_string());
+
+            if error.use_stderr() {
+                eprint!("{text}");
+            } else {
+                print!("{text}");
+            }
+
+            process::exit(error.exit_code());
+        }
+    }
+}
+
 pub fn default_data_dir() -> PathBuf {
     let root = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -213,7 +280,7 @@ pub fn default_data_dir() -> PathBuf {
             PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".local/share")
         });
 
-    root.join("semantic-memory")
+    root.join("semmem")
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -244,19 +311,21 @@ impl LocalClient {
         let client = reqwest::Client::builder()
             .unix_socket(socket)
             .no_proxy()
-            .timeout(Duration::from_secs(30))
             .build()?;
 
         Ok(Self { client })
     }
 
     pub async fn request(&self, operation: &str, arguments: Value) -> Result<Value> {
-        let response = self.client
+        let response = self
+            .client
             .post(format!("http://localhost/api/{operation}"))
             .json(&arguments)
             .send()
             .await
-            .context("Could not connect to the memory service. Start semantic-memory serve or select --socket.")?;
+            .context(
+                "Could not connect to the memory service. Run semmem start or select --socket.",
+            )?;
         let status = response.status();
         let value: Value = response
             .json()
@@ -293,14 +362,20 @@ impl LocalClient {
 
 pub async fn execute(cli: Cli) -> Result<()> {
     let client = LocalClient::connect(&cli.socket)?;
+    let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS);
     let output = match cli.command {
-        Command::SERVE { .. } => bail!("The serve command must be dispatched by the application entry point."),
-        Command::SEARCH { query, kind, tags, exact, prefix, limit } => {
-            let request = SearchRequest { query, kind, tags, prefix, fuzzy: !exact, limit };
+        Command::RUN { .. } => bail!("The run command must be dispatched by the application entry point."),
+        Command::START => crate::lifecycle::execute("start").await?,
+        Command::STOP => crate::lifecycle::execute("stop").await?,
+        Command::STATUS => crate::lifecycle::execute("status").await?,
+        Command::SEARCH { query, scope, claim_type, kind, tags, exact, prefix, limit } => {
+            let request = SearchRequest { query, scope, claim_type, kind, tags, prefix, fuzzy: !exact, limit };
             client.request("search_memories", serde_json::to_value(request)?).await?
         },
         Command::LIST(arguments) => {
             let request = ListMemories {
+                scope: arguments.scope,
+                claim_type: arguments.claim_type,
                 kind: arguments.kind,
                 tags: arguments.tags,
                 linked_to: arguments.linked_to,
@@ -311,45 +386,65 @@ pub async fn execute(cli: Cli) -> Result<()> {
             };
             client.request("list_memories", serde_json::to_value(request)?).await?
         },
-        Command::SHOW { keys, include_deleted, version } => {
-            client.request("get_memories", serde_json::to_value(GetMemories { keys, include_deleted, version })?).await?
+        Command::SHOW { keys, view, include_deleted, version } => {
+            client.request("get_memories", serde_json::to_value(GetMemories { keys, view, include_deleted, version })?).await?
         },
-        Command::ADD { key, title, kind, tags, links } => {
+        Command::ADD { key, no_input, metadata, title, kind, tags, links } => {
+            let mut fields = NewMemoryFields { key, title, kind, metadata: metadata.into(), tags, links };
+
+            if !no_input {
+                prompt_missing_metadata(&mut std::io::stdin().lock(), &mut std::io::stderr().lock(), &mut fields)?;
+            }
+
+            let key = fields.key.context("A key is required with --no-input.")?;
+            let title = fields.title.unwrap_or_default();
+            let kind = fields.kind.unwrap_or_else(|| "note".into());
             let draft = Draft::open("")?;
             let body = draft.read()?;
 
             if body.is_empty() {
-                eprintln!("Empty draft; no memory created.");
+                eprintln!("The draft is empty. No memory was created.");
                 draft.discard()?;
 
                 return Ok(());
             }
 
-            let memory = CreateMemory { key, title, body, kind, tags, links, actor: "human".into() };
+            let memory = CreateMemory { key, title, body, metadata: fields.metadata, kind, tags: fields.tags, links: fields.links, actor: "human".into() };
             let result = client.request("create_memories", json!({"memories": [memory]})).await;
             finish_draft(draft, result)?
         },
-        Command::EDIT { key, title, kind, tags, clear_tags, links, clear_links } => {
-            let value = client.request("get_memories", json!({"keys": [&key], "include_deleted": false})).await?;
+        Command::EDIT { key } => {
+            let value = client.request("get_memories", json!({"keys": [&key]})).await?;
             let memory = decode_memory(&value)?;
-            let draft = Draft::open(&memory.body)?;
-            let body = draft.read()?;
-            let tags = if clear_tags { Some(Vec::new()) } else { tags };
-            let links = if clear_links { Some(Vec::new()) } else { links };
-            let has_changes = body != memory.body || title.as_ref().is_some_and(|value| value != &memory.title)
-                || kind.as_ref().is_some_and(|value| value != &memory.kind)
-                || tags.as_ref().is_some_and(|value| value != &memory.tags)
-                || links.as_ref().is_some_and(|value| value != &memory.links);
+            let original = crate::document::encode_memory(&memory)?;
+            let draft = Draft::open(&original)?;
+            let edited = draft.read()?;
 
-            if !has_changes {
-                eprintln!("No changes; no revision created.");
+            if edited == original {
+                eprintln!("No changes were made. No revision was created.");
                 draft.discard()?;
 
                 return Ok(());
             }
 
-            let request = UpdateMemory { key, expected_version: memory.system_version, title, body: Some(body), kind, tags, links, actor: "human".into() };
-            let result = client.request("update_memory", serde_json::to_value(request)?).await;
+            let request = crate::document::decode_memory(&edited, &memory).with_context(|| {
+                format!("The memory document is invalid. The draft was preserved at {}.", draft.path.display())
+            })?;
+            let has_changes = request.body.as_ref().is_some_and(|body| body != &memory.body)
+                || request.metadata.apply(&memory.metadata) != memory.metadata
+                || request.title.as_ref().is_some_and(|title| title != &memory.title)
+                || request.kind.as_ref().is_some_and(|kind| kind != &memory.kind)
+                || request.tags.as_ref().is_some_and(|tags| tags != &memory.tags)
+                || request.links.as_ref().is_some_and(|links| links != &memory.links);
+
+            if !has_changes {
+                eprintln!("No changes were made. No revision was created.");
+                draft.discard()?;
+
+                return Ok(());
+            }
+
+            let result = client.request("update_memories", json!({"memories": [request]})).await;
             finish_draft(draft, result)?
         },
         Command::DELETE(arguments) => {
@@ -381,7 +476,202 @@ pub async fn execute(cli: Cli) -> Result<()> {
         },
     };
 
-    print_output(&output, cli.json)?;
+    print_output(&output, cli.json || is_structured)?;
+
+    Ok(())
+}
+
+struct NewMemoryFields {
+    key: Option<String>,
+    title: Option<String>,
+    kind: Option<String>,
+    metadata: MemoryMetadata,
+    tags: Vec<String>,
+    links: Vec<MemoryLink>,
+}
+
+fn prompt_line(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
+    write!(output, "{label}: ")?;
+    output.flush()?;
+    let mut value = String::new();
+
+    if input.read_line(&mut value)? == 0 {
+        bail!("Input ended before metadata was completed. No memory was created.");
+    }
+
+    if value.ends_with('\n') {
+        value.pop();
+
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+
+    Ok(value)
+}
+
+fn prompt_timestamp(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+) -> Result<Option<i64>> {
+    loop {
+        let value = prompt_line(input, output, label)?;
+
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+
+        match value.trim().parse() {
+            Ok(timestamp) => return Ok(Some(timestamp)),
+            Err(_) => writeln!(
+                output,
+                "Enter integer UTC milliseconds since Unix epoch, or leave blank for unknown."
+            )?,
+        }
+    }
+}
+
+fn prompt_optional_text(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+) -> Result<Option<String>> {
+    let value = prompt_line(input, output, label)?;
+
+    Ok((!value.trim().is_empty()).then_some(value))
+}
+
+fn prompt_missing_metadata(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    fields: &mut NewMemoryFields,
+) -> Result<()> {
+    while fields.key.is_none() {
+        let key = prompt_line(input, output, "Key (required)")?;
+
+        if key.trim().is_empty() || key.trim() != key || key.chars().any(char::is_control) {
+            writeln!(
+                output,
+                "Enter a nonempty key without surrounding whitespace or control characters."
+            )?;
+        } else {
+            fields.key = Some(key);
+        }
+    }
+
+    if fields.title.is_none() {
+        let default = fields.key.as_deref().expect("The key has been collected.");
+        let value = prompt_line(input, output, &format!("Title [{default}]"))?;
+        fields.title = Some(if value.trim().is_empty() {
+            default.into()
+        } else {
+            value
+        });
+    }
+
+    if fields.kind.is_none() {
+        let value = prompt_line(input, output, "Kind [note]")?;
+        fields.kind = Some(if value.trim().is_empty() {
+            "note".into()
+        } else {
+            value
+        });
+    }
+
+    if fields.metadata.summary.is_none() {
+        fields.metadata.summary = prompt_optional_text(input, output, "Summary (optional)")?;
+    }
+
+    if fields.metadata.claim_type.is_none() {
+        loop {
+            let value = prompt_line(
+                input,
+                output,
+                "Claim type (1 explicit user statement, 2 verified observation, 3 inference; blank for unknown)",
+            )?;
+            let value = value.trim();
+
+            if value.is_empty() {
+                break;
+            }
+
+            let claim_type = match value {
+                "1" => Ok(ClaimType::EXPLICIT_USER_STATEMENT),
+                "2" => Ok(ClaimType::VERIFIED_OBSERVATION),
+                "3" => Ok(ClaimType::INFERENCE),
+                _ => ClaimType::from_str(value, false),
+            };
+
+            match claim_type {
+                Ok(claim_type) => {
+                    fields.metadata.claim_type = Some(claim_type);
+
+                    break;
+                }
+                Err(_) => writeln!(
+                    output,
+                    "Choose 1, 2, 3, a listed claim type, or leave blank for unknown."
+                )?,
+            }
+        }
+    }
+
+    if fields.metadata.scope.is_none() {
+        fields.metadata.scope = prompt_optional_text(input, output, "Scope (optional)")?;
+    }
+
+    if fields.metadata.observed_at.is_none() {
+        fields.metadata.observed_at = prompt_timestamp(
+            input,
+            output,
+            "Observed at (UTC Unix milliseconds; blank for unknown)",
+        )?;
+    }
+
+    if fields.metadata.verified_at.is_none() {
+        fields.metadata.verified_at = prompt_timestamp(
+            input,
+            output,
+            "Verified at (UTC Unix milliseconds; blank for unknown)",
+        )?;
+    }
+
+    if fields.metadata.review_after.is_none() {
+        fields.metadata.review_after = prompt_timestamp(
+            input,
+            output,
+            "Review after (UTC Unix milliseconds; blank for none)",
+        )?;
+    }
+
+    if fields.tags.is_empty() {
+        while let Some(tag) = prompt_optional_text(input, output, "Tag (blank to finish)")? {
+            if tag.trim() != tag || tag.chars().any(char::is_control) {
+                writeln!(
+                    output,
+                    "Enter a tag without surrounding whitespace or control characters."
+                )?;
+            } else {
+                fields.tags.push(tag);
+            }
+        }
+    }
+
+    if fields.links.is_empty() {
+        loop {
+            let value = prompt_line(input, output, "Link (relation=target_key; blank to finish)")?;
+
+            if value.trim().is_empty() {
+                break;
+            }
+
+            match parse_link(&value) {
+                Ok(link) => fields.links.push(link),
+                Err(message) => writeln!(output, "{message}")?,
+            }
+        }
+    }
 
     Ok(())
 }
@@ -407,7 +697,7 @@ struct Draft {
 impl Draft {
     fn open(body: &str) -> Result<Self> {
         let mut file = tempfile::Builder::new()
-            .prefix("semantic-memory-")
+            .prefix("semmem-")
             .suffix(".md")
             .tempfile()?;
         file.write_all(body.as_bytes())?;
@@ -425,7 +715,7 @@ impl Draft {
             .unwrap_or_else(|| "vim".into());
         let arguments = shell_words::split(&editor).with_context(|| {
             format!(
-                "Invalid editor command. Draft preserved at {}.",
+                "The editor command is invalid. The draft was preserved at {}.",
                 draft.path.display()
             )
         })?;
@@ -440,11 +730,11 @@ impl Draft {
         match result {
             Ok(status) if status.success() => Ok(draft),
             Ok(status) => bail!(
-                "Editor exited with {status}. Draft preserved at {}.",
+                "The editor exited with {status}. The draft was preserved at {}.",
                 draft.path.display()
             ),
             Err(error) => bail!(
-                "Could not open editor: {error}. Draft preserved at {}.",
+                "The editor could not be opened: {error}. The draft was preserved at {}.",
                 draft.path.display()
             ),
         }
@@ -453,14 +743,14 @@ impl Draft {
     fn read(&self) -> Result<String> {
         fs::read_to_string(&self.path).with_context(|| {
             format!(
-                "Could not read UTF-8 draft. Draft preserved at {}.",
+                "The UTF-8 draft could not be read. The draft was preserved at {}.",
                 self.path.display()
             )
         })
     }
 
     fn discard(self) -> Result<()> {
-        fs::remove_file(self.path).context("Could not remove the completed editor draft.")
+        fs::remove_file(self.path).context("The completed editor draft could not be removed.")
     }
 }
 
@@ -471,13 +761,13 @@ fn finish_draft(draft: Draft, result: Result<Value>) -> Result<Value> {
 
             Ok(value)
         }
-        Err(error) => bail!("{error}\nDraft preserved at {}.", draft.path.display()),
+        Err(error) => bail!("{error}\nThe draft was preserved at {}.", draft.path.display()),
     }
 }
 
 fn print_output(value: &Value, is_json: bool) -> Result<()> {
     if is_json || !std::io::stdout().is_terminal() {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        crate::output::print_json(value)?;
 
         return Ok(());
     }
@@ -493,14 +783,24 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
         let mut table = Table::new();
         table.set_content_arrangement(ContentArrangement::Dynamic);
         table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
-        table.set_header(["Key", "Title / Excerpt", "Kind", "Version"]);
+        table.set_header([
+            "Key",
+            "Title / Summary / Excerpt",
+            "Kind",
+            "Scope",
+            "Claim",
+            "Version",
+        ]);
 
         for record in records {
-            let text = record
-                .get("excerpt")
-                .or_else(|| record.get("title"))
-                .or_else(|| record.get("name"))
-                .and_then(Value::as_str)
+            let text = ["summary", "excerpt", "title", "name"]
+                .into_iter()
+                .find_map(|field| {
+                    record
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                })
                 .unwrap_or("");
             let version = record
                 .get("system_version")
@@ -519,11 +819,32 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                clean_terminal_text(record.get("scope").and_then(Value::as_str).unwrap_or("")),
+                record
+                    .get("claim_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 version,
             ]);
         }
 
+        for column in table.column_iter_mut() {
+            column.set_padding((4, 4));
+        }
+
         println!("{table}");
+
+        for record in records {
+            for field in ["observed_at", "verified_at", "review_after"] {
+                if let Some(timestamp) = record.get(field).and_then(Value::as_i64) {
+                    let key = clean_terminal_text(
+                        record.get("key").and_then(Value::as_str).unwrap_or(""),
+                    );
+                    println!("{key} {field}: {timestamp} UTC milliseconds since Unix epoch");
+                }
+            }
+        }
 
         if records.len() == 1
             && let Some(body) = records[0].get("body").and_then(Value::as_str)
@@ -537,7 +858,7 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
     } else if let Some(body) = value.get("body").and_then(Value::as_str) {
         termimad::print_text(&clean_terminal_text(body));
     } else {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        crate::output::print_json(value)?;
     }
 
     Ok(())

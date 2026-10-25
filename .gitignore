@@ -102,7 +102,7 @@ Cargo.lock.local
 *.sqlite3-shm
 *.sqlite3-wal
 *.dump
-/.semantic-memory/
+/.semmem/
 
 # AI
 .dmux/

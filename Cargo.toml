@@ -1,24 +1,30 @@
 [package]
-name = "semantic-memory"
+name = "semmem"
 version = "0.1.0"
 edition = "2024"
-description = "Semantic, human-readable, persistent memory and retrieval system for AI."
-repository = "https://github.com/mayazrakib/semantic-memory"
+description = "Persistent human-readable memory, revision history, and retrieval for AI."
+repository = "https://github.com/mayazrakib/semmem"
+
+[[bin]]
+name = "semmem"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+colored_json = "5"
 comfy-table = "7"
 fs2 = "0.4"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 parking_lot = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.7", features = ["server", "macros", "transport-streamable-http-server"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 shell-words = "1"
 tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
 tempfile = "3"

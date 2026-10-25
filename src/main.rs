@@ -1,6 +1,4 @@
-use clap::Parser;
-
-use semantic_memory::cli::{Cli, Command};
+use semmem::cli::Command;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,19 +6,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
+    let cli = semmem::cli::parse_cli();
 
     match cli.command {
-        Command::SERVE {
+        Command::RUN {
             data_dir,
             listen,
             issuer,
             audience,
             public_url,
-        } => {
-            semantic_memory::server::run(data_dir, cli.socket, listen, issuer, audience, public_url)
-                .await
-        }
-        _ => semantic_memory::cli::execute(cli).await,
+        } => semmem::server::run(data_dir, cli.socket, listen, issuer, audience, public_url).await,
+        _ => semmem::cli::execute(cli).await,
     }
 }

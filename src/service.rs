@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -13,21 +14,15 @@ use serde_json::{Value, json};
 
 use crate::models::{
     AppError, AppResult, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryVersion,
-    RestoreMemory, SearchRequest, TaxonomyInput, UpdateMemory,
+    MemoryView, RestoreMemory, SearchRequest, TaxonomyInput, UpdateMemory,
 };
 use crate::search::{SearchIndex, SearchReader};
 use crate::storage::Store;
 
-const MAX_BATCH: usize = 64;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-const MAX_QUEUED_BYTES: usize = 16 * MAX_BODY_BYTES;
-
 pub struct Service {
-    readers: Vec<Mutex<Store>>,
-    next_reader: AtomicUsize,
+    readers: ReadPool,
     search: SearchReader,
-    writes: mpsc::SyncSender<WriteRequest>,
-    queued_bytes: Arc<AtomicUsize>,
+    writes: mpsc::Sender<WriteRequest>,
     metrics: Arc<WriteMetrics>,
     _lock: File,
 }
@@ -36,8 +31,7 @@ struct WriteRequest {
     operation: String,
     arguments: Value,
     actor: String,
-    result: mpsc::SyncSender<AppResult<Value>>,
-    _reservation: QueueReservation,
+    result: mpsc::Sender<AppResult<Value>>,
     enqueued_at: Instant,
 }
 
@@ -50,35 +44,63 @@ struct WriteMetrics {
     publication_nanoseconds: AtomicU64,
 }
 
-struct QueueReservation {
-    bytes: usize,
-    counter: Arc<AtomicUsize>,
+struct ReadPool {
+    database: PathBuf,
+    idle: Mutex<Vec<Store>>,
+    opened: AtomicUsize,
 }
 
-impl Drop for QueueReservation {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+impl ReadPool {
+    fn open(database: PathBuf) -> AppResult<Self> {
+        let connection = Store::open_read_only(&database)?;
+
+        Ok(Self {
+            database,
+            idle: Mutex::new(vec![connection]),
+            opened: AtomicUsize::new(1),
+        })
+    }
+
+    fn acquire(&self) -> AppResult<ReadConnection<'_>> {
+        let available = self.idle.lock().pop();
+        let connection = match available {
+            Some(connection) => connection,
+            None => {
+                let connection = Store::open_read_only(&self.database)?;
+                self.opened.fetch_add(1, Ordering::Relaxed);
+
+                connection
+            }
+        };
+
+        Ok(ReadConnection {
+            connection: Some(connection),
+            pool: self,
+        })
     }
 }
 
-fn reserve_queue(counter: &Arc<AtomicUsize>, bytes: usize) -> AppResult<QueueReservation> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current
-                .checked_add(bytes)
-                .filter(|total| *total <= MAX_QUEUED_BYTES)
-        })
-        .map_err(|_| {
-            AppError::new(
-                "overloaded",
-                "The queued write payload limit has been reached.",
-            )
-        })?;
+struct ReadConnection<'a> {
+    connection: Option<Store>,
+    pool: &'a ReadPool,
+}
 
-    Ok(QueueReservation {
-        bytes,
-        counter: Arc::clone(counter),
-    })
+impl Deref for ReadConnection<'_> {
+    type Target = Store;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("Checked-out connection is present")
+    }
+}
+
+impl Drop for ReadConnection<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            self.pool.idle.lock().push(connection);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -114,10 +136,6 @@ impl Service {
         directory: impl AsRef<Path>,
         batch_window: Duration,
     ) -> anyhow::Result<Arc<Self>> {
-        anyhow::ensure!(
-            (Duration::from_millis(1)..=Duration::from_millis(20)).contains(&batch_window),
-            "The batch collection window must be between 1 and 20 ms."
-        );
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)?;
         let lock = OpenOptions::new()
@@ -133,7 +151,7 @@ impl Service {
         let identity = store.database_key()?;
         let index_path = directory.join("search");
         let marker = directory.join("search.identity");
-        let expected_identity = format!("{identity}:search-v2");
+        let expected_identity = format!("{identity}:search-v3");
         let matches = index_path.join("meta.json").is_file()
             && std::fs::read_to_string(&marker).ok().as_deref() == Some(expected_identity.as_str());
 
@@ -185,10 +203,8 @@ impl Service {
 
         publish_events(&mut store, &mut index)?;
         let search = index.reader();
-        let readers = (0..4)
-            .map(|_| Store::open_read_only(&database).map(Mutex::new))
-            .collect::<AppResult<Vec<_>>>()?;
-        let (sender, receiver) = mpsc::sync_channel(256);
+        let readers = ReadPool::open(database)?;
+        let (sender, receiver) = mpsc::channel();
         let metrics = Arc::new(WriteMetrics::default());
         let writer_metrics = Arc::clone(&metrics);
         let worker_lock = lock.try_clone()?;
@@ -201,10 +217,8 @@ impl Service {
 
         Ok(Arc::new(Self {
             readers,
-            next_reader: AtomicUsize::new(0),
             search,
             writes: sender,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
             metrics,
             _lock: lock,
         }))
@@ -212,43 +226,22 @@ impl Service {
 
     pub fn dispatch(&self, operation: &str, arguments: Value, actor: &str) -> AppResult<Value> {
         if is_read_operation(operation) {
-            let response = self.read(operation, arguments)?;
-            if serde_json::to_vec(&response)?.len() > 4 * MAX_BODY_BYTES {
-                return Err(AppError::new(
-                    "response_limit",
-                    "The response exceeds 4 MiB. Retrieve fewer memories per request.",
-                ));
-            }
-
-            return Ok(response);
+            return self.read(operation, arguments);
         }
 
-        let encoded_size = serde_json::to_vec(&arguments)?.len();
-        if arguments
-            .get("memories")
-            .and_then(Value::as_array)
-            .is_some_and(|memories| memories.len() > MAX_BATCH)
-        {
-            return Err(AppError::invalid(
-                "A service mutation batch may contain at most 64 memories.",
-            ));
-        }
-        if encoded_size > MAX_BODY_BYTES {
-            return Err(AppError::invalid(
-                "A write request may contain at most 1 MiB of JSON.",
-            ));
-        }
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::channel();
         let request = WriteRequest {
             operation: operation.into(),
             arguments,
             actor: actor.into(),
             result: sender,
-            _reservation: reserve_queue(&self.queued_bytes, encoded_size)?,
             enqueued_at: Instant::now(),
         };
-        self.writes.try_send(request).map_err(|error| {
-            AppError::new("overloaded", format!("Write queue is unavailable: {error}"))
+        self.writes.send(request).map_err(|_| {
+            AppError::new(
+                "internal_failure",
+                "The write worker stopped before accepting the request.",
+            )
         })?;
 
         receiver.recv().map_err(|_| {
@@ -267,7 +260,8 @@ impl Service {
             "queue_wait_max_ms": self.metrics.maximum_queue_nanoseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             "sqlite_transaction_total_ms": self.metrics.sqlite_nanoseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             "search_publication_total_ms": self.metrics.publication_nanoseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            "queued_payload_bytes": self.queued_bytes.load(Ordering::Relaxed),
+            "read_connections_opened": self.readers.opened.load(Ordering::Relaxed),
+            "read_connections_idle": self.readers.idle.lock().len(),
         })
     }
 
@@ -280,19 +274,13 @@ impl Service {
                     .is_some()
                 {
                     "invalid_input"
-                } else if error
-                    .downcast_ref::<crate::search::SearchBudgetExceeded>()
-                    .is_some()
-                {
-                    "resource_limit"
                 } else {
                     "search_failure"
                 };
 
                 AppError::new(code, error.to_string())
             })?;
-            let lane = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-            let store = self.readers[lane].lock();
+            let store = self.readers.acquire()?;
             let mut statement = store.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM memories WHERE key = ?1 AND system_version = ?2 AND system_deleted_at IS NULL)")?;
             let mut valid = Vec::with_capacity(response.hits.len());
             for hit in response.hits {
@@ -306,13 +294,12 @@ impl Service {
 
             return Ok(serde_json::to_value(response)?);
         }
-        let lane = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let store = self.readers[lane].lock();
+        let store = self.readers.acquire()?;
         match operation {
             "get_memories" => {
                 let request: GetMemories = serde_json::from_value(arguments)?;
-                if request.keys.is_empty() || request.keys.len() > 64 {
-                    return Err(AppError::invalid("Get requires between 1 and 64 keys."));
+                if matches!(request.view, MemoryView::SUMMARY) {
+                    return Ok(json!({"memories": store.get_memory_summaries(&request)?}));
                 }
                 let records = store.get_memories(&request)?;
 
@@ -320,27 +307,29 @@ impl Service {
             }
             "list_memories" => {
                 let request: ListMemories = serde_json::from_value(arguments)?;
-                let records = store.list_memories(&request)?;
+                let records = store.list_memory_summaries(&request)?;
                 let cursor = if records.len() == request.limit {
                     records
                         .last()
-                        .map(|record| format!("{}:{}", record.system_updated_at, record.id))
+                        .map(|record| format!("{}:{}", record["system_updated_at"], record["id"]))
                 } else {
                     None
                 };
 
-                Ok(json!({"memories": summaries(records)?, "next_cursor": cursor}))
+                Ok(json!({"memories": records, "next_cursor": cursor}))
             }
             "list_memory_revisions" => {
                 let request: HistoryRequest = serde_json::from_value(arguments)?;
-                let records = store.list_revisions(&request)?;
+                let records = store.list_revision_summaries(&request)?;
                 let cursor = if records.len() == request.limit {
-                    records.last().map(|record| record.system_version)
+                    records
+                        .last()
+                        .map(|record| record["system_version"].clone())
                 } else {
                     None
                 };
 
-                Ok(json!({"memories": summaries(records)?, "before_version": cursor}))
+                Ok(json!({"memories": records, "before_version": cursor}))
             }
             "list_kinds" => taxonomy_page(&store, "memory_kinds", arguments),
             "list_tags" => taxonomy_page(&store, "tags", arguments),
@@ -373,21 +362,16 @@ fn run_writer(
     while let Ok(first) = receiver.recv() {
         let started = Instant::now();
         let mut requests = vec![first];
-        let mut bytes = requests[0].arguments.to_string().len();
-        while requests.len() < MAX_BATCH && bytes < MAX_BODY_BYTES {
-            let Some(remaining) = batch_window.checked_sub(started.elapsed()) else {
-                break;
-            };
+        while let Some(remaining) = batch_window.checked_sub(started.elapsed()) {
             match receiver.recv_timeout(remaining) {
                 Ok(request) => {
-                    bytes += request.arguments.to_string().len();
                     requests.push(request);
                 }
                 Err(_) => break,
             }
         }
         let mut results = Vec::with_capacity(requests.len());
-        for request in &requests {
+        for request in &mut requests {
             let queued = request
                 .enqueued_at
                 .elapsed()
@@ -404,7 +388,7 @@ fn run_writer(
             results.push(apply_write(
                 &mut store,
                 &request.operation,
-                request.arguments.clone(),
+                std::mem::take(&mut request.arguments),
                 &request.actor,
             ));
             metrics.sqlite_nanoseconds.fetch_add(
@@ -465,13 +449,29 @@ fn run_writer(
 fn summaries(records: Vec<crate::models::MemoryRecord>) -> AppResult<Vec<Value>> {
     records
         .into_iter()
-        .map(|mut record| {
-            record.body.clear();
-            let mut value = serde_json::to_value(record)?;
+        .map(|record| {
+            let mut value = serde_json::to_value(&record.metadata)?;
             value
                 .as_object_mut()
-                .expect("Memory record is an object")
-                .remove("body");
+                .expect("Metadata is an object")
+                .extend(
+                    json!({
+                        "id": record.id,
+                        "key": record.key,
+                        "title": record.title,
+                        "kind": record.kind,
+                        "tags": record.tags,
+                        "links": record.links,
+                        "actor": record.actor,
+                        "system_version": record.system_version,
+                        "system_created_at": record.system_created_at,
+                        "system_updated_at": record.system_updated_at,
+                        "system_deleted_at": record.system_deleted_at,
+                    })
+                    .as_object()
+                    .expect("Record summary is an object")
+                    .clone(),
+                );
 
             Ok(value)
         })
@@ -480,7 +480,7 @@ fn summaries(records: Vec<crate::models::MemoryRecord>) -> AppResult<Vec<Value>>
 
 fn fault_point(name: &str) {
     #[cfg(feature = "fault-injection")]
-    if std::env::var("SEMANTIC_MEMORY_FAILPOINT").ok().as_deref() == Some(name) {
+    if std::env::var("SEMMEM_FAILPOINT").ok().as_deref() == Some(name) {
         std::process::exit(86);
     }
     #[cfg(not(feature = "fault-injection"))]
@@ -571,18 +571,18 @@ fn apply_write(
 
 fn taxonomy_page(store: &Store, table: &str, arguments: Value) -> AppResult<Value> {
     let page: TaxonomyPage = serde_json::from_value(arguments)?;
-    if page.limit == 0 || page.limit > 500 {
-        return Err(AppError::invalid(
-            "Taxonomy limit must be between 1 and 500.",
-        ));
+    if page.limit == 0 {
+        return Err(AppError::invalid("Taxonomy page size must be positive."));
     }
+    let requested = page
+        .limit
+        .checked_add(1)
+        .and_then(|limit| i64::try_from(limit).ok())
+        .ok_or_else(|| AppError::invalid("Taxonomy page size exceeds SQLite's integer range."))?;
     let mut statement = store.connection().prepare_cached(&format!("SELECT id, key, name, system_created_at, system_updated_at FROM {table} WHERE key > ?1 ORDER BY key LIMIT ?2"))?;
     let mut items = statement
         .query_map(
-            rusqlite::params![
-                page.cursor.as_deref().unwrap_or(""),
-                (page.limit + 1) as i64
-            ],
+            rusqlite::params![page.cursor.as_deref().unwrap_or(""), requested],
             |row| {
                 Ok(crate::models::TaxonomyRecord {
                     id: row.get(0)?,
@@ -636,19 +636,23 @@ fn publish_events(store: &mut Store, index: &mut SearchIndex) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUEUED_BYTES, reserve_queue};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::ReadPool;
+    use crate::storage::Store;
+    use std::sync::atomic::Ordering;
 
     #[test]
-    fn should_bound_queued_payloads_and_release_cancelled_reservations() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let reservation = reserve_queue(&counter, MAX_QUEUED_BYTES).unwrap();
-        assert_eq!(reserve_queue(&counter, 1).err().unwrap().code, "overloaded");
-        drop(reservation);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
-        let reservation = reserve_queue(&counter, 1).unwrap();
-        drop(reservation);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
+    fn grows_read_pool_on_demand_and_reuses_returned_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("pool.sqlite3");
+        let _store = Store::open(&database).unwrap();
+        let pool = ReadPool::open(database).unwrap();
+        let held = (0..8).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
+        assert_eq!(pool.opened.load(Ordering::Relaxed), 8);
+        assert!(pool.idle.lock().is_empty());
+        drop(held);
+        assert_eq!(pool.idle.lock().len(), 8);
+        let again = pool.acquire().unwrap();
+        assert_eq!(pool.opened.load(Ordering::Relaxed), 8);
+        assert!(!again.database_key().unwrap().is_empty());
     }
 }

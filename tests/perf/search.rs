@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use semantic_memory::models::{CreateMemory, MemoryLink, UpdateMemory};
-use semantic_memory::service::Service;
-use semantic_memory::storage::Store;
+use semmem::models::{
+    ClaimType, CreateMemory, MemoryLink, MemoryMetadata, MetadataPatch, UpdateMemory,
+};
+use semmem::service::Service;
+use semmem::storage::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,7 +26,9 @@ struct Arguments {
     iterations: usize,
     #[arg(long, default_value_t = 16)]
     clients: usize,
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=20))]
+    #[arg(long, hide = true)]
+    startup_probe: bool,
+    #[arg(long, default_value_t = 2)]
     batch_window_ms: u64,
 }
 
@@ -47,6 +52,10 @@ struct Measurement {
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
 
+    if arguments.startup_probe {
+        return run_startup_probe(&arguments);
+    }
+
     if arguments.memories == 0
         || arguments.iterations == 0
         || arguments.clients == 0
@@ -62,9 +71,13 @@ fn main() -> Result<()> {
     let seed_started = Instant::now();
     let fixture_created = prepare_fixture(directory, arguments.memories)?;
     let seed_seconds = seed_started.elapsed().as_secs_f64();
+    let index_existed_before_open = directory.join("search/meta.json").exists();
+    let initial_process =
+        measure_startup_process(directory, arguments.memories, arguments.batch_window_ms)?;
+    let reopened_process =
+        measure_startup_process(directory, arguments.memories, arguments.batch_window_ms)?;
     let opening = Instant::now();
     eprintln!("Opening service and publishing the initial search index");
-    let index_existed_before_open = directory.join("search/meta.json").exists();
     let service = Service::open_with_batch_window(
         directory,
         Duration::from_millis(arguments.batch_window_ms),
@@ -160,7 +173,13 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "fixture_version": 1,
+            "fixture_version": 3,
+            "startup_processes": {
+                "initial": initial_process,
+                "reopened": reopened_process,
+                "os_caches_flushed": false,
+                "transport_included": false
+            },
             "fixture_created": fixture_created,
             "index_existed_before_open": index_existed_before_open,
             "architecture": std::env::consts::ARCH,
@@ -172,6 +191,7 @@ fn main() -> Result<()> {
             "iterations_per_client": arguments.iterations,
             "fixture_seed_seconds": seed_seconds,
             "service_startup_seconds": startup_seconds,
+            "service_open_context": "same process after independent startup probes",
             "mixed_seconds": mixed_seconds,
             "mixed_operations_per_second": (arguments.clients * arguments.iterations) as f64 / mixed_seconds,
             "data_directory_bytes": disk_bytes,
@@ -199,7 +219,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 .context("Existing data directory is not a completed benchmark fixture")?,
         )?;
 
-        if identity.version != 1 || identity.memories != memories {
+        if identity.version != 3 || identity.memories != memories {
             bail!("Existing benchmark fixture differs; choose another data directory");
         }
 
@@ -227,6 +247,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 expected_version: 1,
                 title: Some(format!("Revised observation {index}")),
                 body: None,
+                metadata: MetadataPatch::default(),
                 kind: None,
                 tags: None,
                 links: None,
@@ -239,7 +260,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     std::fs::write(
         identity_path,
         serde_json::to_vec(&FixtureIdentity {
-            version: 1,
+            version: 3,
             memories,
         })?,
     )?;
@@ -282,6 +303,23 @@ fn create_fixture_memory(index: usize) -> CreateMemory {
         key: format!("bench-record-{index:07}"),
         title: format!("{} observation {index}", topics[index % topics.len()]),
         body,
+        metadata: MemoryMetadata {
+            summary: index.is_multiple_of(3).then(|| {
+                format!(
+                    "Manually supplied {} observation {index}",
+                    topics[index % topics.len()]
+                )
+            }),
+            claim_type: Some(if index.is_multiple_of(2) {
+                ClaimType::VERIFIED_OBSERVATION
+            } else {
+                ClaimType::EXPLICIT_USER_STATEMENT
+            }),
+            scope: Some(format!("project/{}", topics[index % topics.len()])),
+            observed_at: Some(1_700_000_000_000 + index as i64),
+            verified_at: None,
+            review_after: index.is_multiple_of(5).then_some(1_800_000_000_000),
+        },
         kind: kinds[index % kinds.len()].into(),
         tags: vec![
             topics[index % topics.len()].into(),
@@ -429,4 +467,72 @@ fn active_directory_size(directory: &Path) -> Result<u64> {
     }
 
     Ok(bytes)
+}
+
+fn measure_startup_process(
+    directory: &Path,
+    memories: usize,
+    batch_window_ms: u64,
+) -> Result<Value> {
+    let started = Instant::now();
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--startup-probe")
+        .arg("--data-dir")
+        .arg(directory)
+        .arg("--memories")
+        .arg(memories.to_string())
+        .arg("--batch-window-ms")
+        .arg(batch_window_ms.to_string())
+        .output()?;
+
+    if !output.status.success() {
+        bail!(
+            "Startup probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut report: Value = serde_json::from_slice(&output.stdout)?;
+    report["launch_to_exit_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+
+    Ok(report)
+}
+
+fn run_startup_probe(arguments: &Arguments) -> Result<()> {
+    let directory = arguments
+        .data_dir
+        .as_deref()
+        .context("Startup probe requires --data-dir")?;
+    let index_existed = directory.join("search/meta.json").exists();
+    let started = Instant::now();
+    let service = Service::open_with_batch_window(
+        directory,
+        Duration::from_millis(arguments.batch_window_ms),
+    )?;
+    let initialize_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let first_request = Instant::now();
+    let response = service.dispatch(
+        "search_memories",
+        json!({"query": format!("marker{:07}", arguments.memories / 2), "fuzzy": false}),
+        "benchmark",
+    )?;
+    let first_request_ms = first_request.elapsed().as_secs_f64() * 1000.0;
+
+    if response["hits"].as_array().is_none_or(Vec::is_empty) {
+        bail!("Startup probe query returned no records");
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "index_existed_before_open": index_existed,
+            "service_initialize_ms": initialize_ms,
+            "first_request_ms": first_request_ms,
+            "initialize_and_first_request_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "peak_process_rss_kib": read_peak_rss(),
+            "process_reused": false
+        }))?
+    );
+
+    Ok(())
 }

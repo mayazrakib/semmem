@@ -12,7 +12,6 @@ use tantivy::query::{
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
 };
-use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
     AsciiFoldingFilter, LowerCaser, SimpleTokenizer, TextAnalyzer, TokenStream,
 };
@@ -20,15 +19,8 @@ use tantivy::{
     DocId, Index, IndexReader, IndexWriter, ReloadPolicy, SegmentReader, TantivyDocument, Term,
 };
 
-use crate::models::{MemoryRecord, SearchHit, SearchRequest, SearchResponse};
+use crate::models::{MemoryMetadata, MemoryRecord, SearchHit, SearchRequest, SearchResponse};
 
-const MAX_QUERY_BYTES: usize = 4096;
-const MAX_QUERY_TERMS: usize = 16;
-const MAX_TERM_CHARACTERS: usize = 128;
-const MAX_RESULTS: usize = 100;
-const MAX_EXPANSIONS_PER_TERM: usize = 2048;
-const MAX_EXPANSIONS_PER_QUERY: usize = 8192;
-const EXCERPT_CHARACTERS: usize = 240;
 const INDEX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const MIN_MERGE_SEGMENTS: usize = 4;
 const MAX_MERGE_INPUT_DOCUMENTS: usize = 50_000;
@@ -40,15 +32,9 @@ const TITLE_BOOST: f32 = 4.0;
 #[error("{0}")]
 pub struct InvalidSearchQuery(pub String);
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct SearchBudgetExceeded(pub String);
-
 #[derive(Default)]
-struct ExpansionBudget {
-    candidates: BTreeMap<String, BTreeSet<String>>,
+struct ExpansionCache {
     cached: BTreeMap<(String, u8, bool), Arc<Vec<String>>>,
-    total: usize,
 }
 
 #[derive(Clone)]
@@ -57,6 +43,10 @@ struct SearchFields {
     key: Field,
     version: Field,
     title: Field,
+    summary: Field,
+    scope: Field,
+    claim_type: Field,
+    metadata: Field,
     body: Field,
     kind: Field,
     tags: Field,
@@ -97,8 +87,7 @@ impl SearchIndex {
         };
         let executor_threads = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(1)
-            .min(4);
+            .unwrap_or(1);
         index.set_multithread_executor(executor_threads)?;
 
         index
@@ -159,6 +148,25 @@ impl SearchIndex {
         document.add_text(fields.key, &memory.key);
         document.add_i64(fields.version, memory.system_version);
         document.add_text(fields.title, &memory.title);
+        document.add_text(fields.metadata, serde_json::to_string(&memory.metadata)?);
+
+        if let Some(summary) = &memory.metadata.summary {
+            document.add_text(fields.summary, summary);
+        }
+
+        if let Some(scope) = &memory.metadata.scope {
+            document.add_text(fields.scope, scope);
+        }
+
+        if let Some(claim_type) = memory.metadata.claim_type {
+            document.add_text(
+                fields.claim_type,
+                serde_json::to_value(claim_type)?
+                    .as_str()
+                    .context("Claim type must be text")?,
+            );
+        }
+
         document.add_text(fields.body, &memory.body);
         document.add_text(fields.kind, &memory.kind);
 
@@ -188,7 +196,7 @@ impl SearchIndex {
         prepared_commit.commit()?;
 
         #[cfg(feature = "fault-injection")]
-        if std::env::var("SEMANTIC_MEMORY_FAILPOINT").as_deref() == Ok("after_index_commit") {
+        if std::env::var("SEMMEM_FAILPOINT").as_deref() == Ok("after_index_commit") {
             std::process::exit(86);
         }
 
@@ -205,25 +213,16 @@ impl SearchIndex {
 
 impl SearchReader {
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
-        if request.limit == 0 || request.limit > MAX_RESULTS {
-            return Err(InvalidSearchQuery(format!(
-                "Search limit must be between 1 and {MAX_RESULTS}."
-            ))
-            .into());
-        }
-
-        if request.tags.len() > 32 {
-            return Err(
-                InvalidSearchQuery("Search supports at most 32 tag filters.".into()).into(),
-            );
+        if request.limit == 0 {
+            return Err(InvalidSearchQuery("Search limit must be positive.".into()).into());
         }
 
         let parts = parse_query(&request.query)?;
         let searcher = self.reader.searcher();
-        let mut budget = ExpansionBudget::default();
-        let exact = self.build_query(&parts, request, false, &searcher, &mut budget)?;
+        let mut cache = ExpansionCache::default();
+        let exact = self.build_query(&parts, request, false, &searcher, &mut cache)?;
         let (mut hits, exact_total) =
-            self.collect_hits(&searcher, exact.as_ref(), request.limit)?;
+            self.collect_hits(&searcher, exact.as_ref(), request.limit, &parts, &cache)?;
         let has_fuzzy_terms = request.fuzzy
             && parts.iter().any(|part| {
                 !part.is_phrase && part.terms.iter().any(|term| term.chars().count() >= 4)
@@ -231,7 +230,7 @@ impl SearchReader {
         let mut fuzzy_total = 0;
 
         if has_fuzzy_terms {
-            let expanded = self.build_query(&parts, request, true, &searcher, &mut budget)?;
+            let expanded = self.build_query(&parts, request, true, &searcher, &mut cache)?;
             let approximate =
                 BooleanQuery::new(vec![(Occur::Must, expanded), (Occur::MustNot, exact)]);
             let remaining = request.limit - hits.len();
@@ -240,7 +239,7 @@ impl SearchReader {
                 fuzzy_total = searcher.search(&approximate, &Count)? as u64;
             } else {
                 let (approximate_hits, count) =
-                    self.collect_hits(&searcher, &approximate, remaining)?;
+                    self.collect_hits(&searcher, &approximate, remaining, &parts, &cache)?;
                 hits.extend(approximate_hits);
                 fuzzy_total = count;
             }
@@ -263,7 +262,7 @@ impl SearchReader {
         request: &SearchRequest,
         is_fuzzy: bool,
         searcher: &tantivy::Searcher,
-        budget: &mut ExpansionBudget,
+        cache: &mut ExpansionCache,
     ) -> Result<Box<dyn Query>> {
         let mut clauses = Vec::with_capacity(parts.len() + request.tags.len() + 1);
 
@@ -271,7 +270,7 @@ impl SearchReader {
             let is_last_part = part_index + 1 == parts.len();
 
             if part.is_phrase {
-                let phrase_queries = [self.fields.title, self.fields.body]
+                let phrase_queries = [self.fields.title, self.fields.summary, self.fields.body]
                     .into_iter()
                     .map(|field| {
                         let terms = part
@@ -309,11 +308,11 @@ impl SearchReader {
                         0
                     };
                     let expanded = if is_prefix || distance > 0 {
-                        Some(self.expand_terms(searcher, term, distance, is_prefix, budget)?)
+                        Some(self.expand_terms(searcher, term, distance, is_prefix, cache)?)
                     } else {
                         None
                     };
-                    let term_queries = [self.fields.title, self.fields.body]
+                    let term_queries = [self.fields.title, self.fields.summary, self.fields.body]
                         .into_iter()
                         .map(|field| {
                             let query: Box<dyn Query> = if let Some(expanded) = &expanded {
@@ -350,6 +349,30 @@ impl SearchReader {
             ));
         }
 
+        if let Some(scope) = &request.scope {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.scope, scope),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
+        if let Some(claim_type) = request.claim_type {
+            let value = serde_json::to_value(claim_type)?;
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(
+                        self.fields.claim_type,
+                        value.as_str().context("Claim type must be text")?,
+                    ),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
         for tag in &request.tags {
             clauses.push((
                 Occur::Must,
@@ -369,11 +392,11 @@ impl SearchReader {
         term: &str,
         distance: u8,
         is_prefix: bool,
-        budget: &mut ExpansionBudget,
+        cache: &mut ExpansionCache,
     ) -> Result<Arc<Vec<String>>> {
         let cache_key = (term.to_owned(), distance, is_prefix);
 
-        if let Some(cached) = budget.cached.get(&cache_key) {
+        if let Some(cached) = cache.cached.get(&cache_key) {
             return Ok(Arc::clone(cached));
         }
 
@@ -391,30 +414,16 @@ impl SearchReader {
             )
         };
         let automaton = query.automaton()?;
-        let known = budget.candidates.entry(term.to_owned()).or_default();
         let mut expanded = BTreeSet::new();
 
         for segment in searcher.segment_readers() {
-            for field in [self.fields.title, self.fields.body] {
+            for field in [self.fields.title, self.fields.summary, self.fields.body] {
                 let inverted = segment.inverted_index(field)?;
                 let mut stream = inverted.terms().search(&automaton).into_stream()?;
 
                 while stream.advance() {
                     let candidate = std::str::from_utf8(stream.key())
                         .context("Indexed text term is not valid UTF-8")?;
-
-                    if !known.contains(candidate) {
-                        if known.len() >= MAX_EXPANSIONS_PER_TERM {
-                            return Err(SearchBudgetExceeded(format!("Search expands one term beyond {MAX_EXPANSIONS_PER_TERM} vocabulary candidates. Use a longer term or disable fuzzy matching.")).into());
-                        }
-
-                        if budget.total >= MAX_EXPANSIONS_PER_QUERY {
-                            return Err(SearchBudgetExceeded(format!("Search expands beyond {MAX_EXPANSIONS_PER_QUERY} vocabulary candidates across the query. Use more specific terms.")).into());
-                        }
-
-                        known.insert(candidate.to_owned());
-                        budget.total += 1;
-                    }
 
                     if !expanded.contains(candidate) {
                         expanded.insert(candidate.to_owned());
@@ -424,7 +433,7 @@ impl SearchReader {
         }
 
         let expanded = Arc::new(expanded.into_iter().collect::<Vec<_>>());
-        budget.cached.insert(cache_key, Arc::clone(&expanded));
+        cache.cached.insert(cache_key, Arc::clone(&expanded));
 
         Ok(expanded)
     }
@@ -442,6 +451,8 @@ impl SearchReader {
         searcher: &tantivy::Searcher,
         query: &dyn Query,
         limit: usize,
+        parts: &[QueryPart],
+        cache: &ExpansionCache,
     ) -> Result<(Vec<SearchHit>, u64)> {
         let collector = TopDocs::with_limit(limit).tweak_score(|segment: &SegmentReader| {
             let identities = segment
@@ -453,8 +464,16 @@ impl SearchReader {
             move |document: DocId, score: f32| (score, Reverse(identities.get_val(document)))
         });
         let (documents, total) = searcher.search(query, &(collector, Count))?;
-        let mut snippet_generator = SnippetGenerator::create(searcher, query, self.fields.body)?;
-        snippet_generator.set_max_num_chars(EXCERPT_CHARACTERS);
+        let preview_terms = parts
+            .iter()
+            .flat_map(|part| part.terms.iter().cloned())
+            .chain(
+                cache
+                    .cached
+                    .values()
+                    .flat_map(|terms| terms.iter().cloned()),
+            )
+            .collect::<BTreeSet<_>>();
         let mut hits = Vec::with_capacity(documents.len());
 
         for ((score, _), address) in documents {
@@ -477,17 +496,23 @@ impl SearchReader {
                 .get_first(self.fields.body)
                 .and_then(|value| value.as_str())
                 .context("Indexed memory has no body")?;
-            let snippet = snippet_generator.snippet(body);
-            let excerpt = if snippet.fragment().is_empty() {
-                body.chars().take(EXCERPT_CHARACTERS).collect()
-            } else {
-                snippet.fragment().to_owned()
-            };
+            let metadata: MemoryMetadata = serde_json::from_str(
+                document
+                    .get_first(self.fields.metadata)
+                    .and_then(|value| value.as_str())
+                    .context("Indexed memory has no metadata")?,
+            )?;
+            let excerpt = metadata
+                .summary
+                .as_deref()
+                .is_none_or(|summary| summary.trim().is_empty())
+                .then(|| create_excerpt(body, &preview_terms, parts));
             hits.push(SearchHit {
                 key,
                 title,
                 version,
                 score,
+                metadata,
                 excerpt,
             });
         }
@@ -517,6 +542,10 @@ fn build_schema() -> (Schema, SearchFields) {
         key: builder.add_text_field("key", STRING | STORED),
         version: builder.add_i64_field("version", STORED),
         title: builder.add_text_field("title", text_options.clone()),
+        summary: builder.add_text_field("summary", text_options.clone()),
+        scope: builder.add_text_field("scope", STRING),
+        claim_type: builder.add_text_field("claim_type", STRING),
+        metadata: builder.add_text_field("metadata", STORED),
         body: builder.add_text_field("body", text_options),
         kind: builder.add_text_field("kind", STRING),
         tags: builder.add_text_field("tags", STRING),
@@ -526,18 +555,10 @@ fn build_schema() -> (Schema, SearchFields) {
 }
 
 fn parse_query(query: &str) -> Result<Vec<QueryPart>> {
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(InvalidSearchQuery(format!(
-            "Search query exceeds {MAX_QUERY_BYTES} UTF-8 bytes."
-        ))
-        .into());
-    }
-
     let mut analyzer = build_analyzer();
     let mut parts = Vec::new();
     let mut is_phrase = false;
     let mut segment = String::new();
-    let mut term_count = 0;
 
     for character in query.chars().chain(std::iter::once('"')) {
         if character != '"' {
@@ -550,22 +571,6 @@ fn parse_query(query: &str) -> Result<Vec<QueryPart>> {
 
         while stream.advance() {
             let term = &stream.token().text;
-
-            if term.chars().count() > MAX_TERM_CHARACTERS {
-                return Err(InvalidSearchQuery(format!(
-                    "Search terms exceed {MAX_TERM_CHARACTERS} characters."
-                ))
-                .into());
-            }
-
-            term_count += 1;
-
-            if term_count > MAX_QUERY_TERMS {
-                return Err(InvalidSearchQuery(format!(
-                    "Search supports at most {MAX_QUERY_TERMS} terms."
-                ))
-                .into());
-            }
 
             terms.push(term.clone());
         }
@@ -593,4 +598,48 @@ fn parse_query(query: &str) -> Result<Vec<QueryPart>> {
     }
 
     Ok(parts)
+}
+
+fn create_excerpt(body: &str, terms: &BTreeSet<String>, parts: &[QueryPart]) -> String {
+    let mut analyzer = build_analyzer();
+    let phrases = parts
+        .iter()
+        .filter(|part| part.is_phrase)
+        .collect::<Vec<_>>();
+    let mut fallback = None;
+    let mut term_match = None;
+
+    for paragraph in crate::models::markdown_paragraphs(body) {
+        fallback.get_or_insert(paragraph);
+        let mut stream = analyzer.token_stream(paragraph);
+        let mut tokens = Vec::new();
+        let mut has_term = false;
+
+        while stream.advance() {
+            let token = &stream.token().text;
+            has_term |= terms.contains(token);
+
+            if !phrases.is_empty() {
+                tokens.push(token.clone());
+            }
+        }
+
+        if phrases.iter().any(|phrase| {
+            tokens
+                .windows(phrase.terms.len())
+                .any(|window| window == phrase.terms)
+        }) {
+            return paragraph.to_owned();
+        }
+
+        if has_term {
+            if phrases.is_empty() {
+                return paragraph.to_owned();
+            }
+
+            term_match.get_or_insert(paragraph);
+        }
+    }
+
+    term_match.or(fallback).unwrap_or(body).to_owned()
 }

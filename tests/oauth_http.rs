@@ -10,9 +10,9 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
-use semantic_memory::auth::OAuth;
-use semantic_memory::server::remote_router;
-use semantic_memory::service::Service;
+use semmem::auth::OAuth;
+use semmem::server::remote_router;
+use semmem::service::Service;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -154,6 +154,34 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
         )
         .await?;
     assert_ne!(created.is_error, Some(true));
+    let large_body = format!(
+        "largeauthenticatedneedle\n\n{}",
+        " ".repeat(5 * 1024 * 1024)
+    );
+    let created_large = peer
+        .call_tool(
+            CallToolRequestParams::new("create_memories").with_arguments(
+                json!({"memories":[{"key":"network-large", "body": large_body, "summary":"Authenticated manual summary", "scope":"network"}]})
+                    .as_object().unwrap().clone(),
+            ),
+        ).await?;
+    assert_ne!(created_large.is_error, Some(true));
+    let compact = peer
+        .call_tool(
+            CallToolRequestParams::new("get_memories").with_arguments(
+                json!({"keys":["network-large"], "view":"summary"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    let compact = compact.structured_content.unwrap();
+    assert_eq!(
+        compact["memories"][0]["summary"],
+        "Authenticated manual summary"
+    );
+    assert!(compact["memories"][0].get("body").is_none());
     let found = peer
         .call_tool(
             CallToolRequestParams::new("search_memories")

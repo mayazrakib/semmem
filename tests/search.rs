@@ -1,5 +1,5 @@
-use semantic_memory::models::{MemoryRecord, SearchRequest};
-use semantic_memory::search::{InvalidSearchQuery, SearchBudgetExceeded, SearchIndex};
+use semmem::models::{ClaimType, MemoryMetadata, MemoryRecord, SearchRequest};
+use semmem::search::{InvalidSearchQuery, SearchIndex};
 
 fn create_memory(id: i64, key: &str, title: &str, body: &str) -> MemoryRecord {
     MemoryRecord {
@@ -7,6 +7,7 @@ fn create_memory(id: i64, key: &str, title: &str, body: &str) -> MemoryRecord {
         key: key.into(),
         title: title.into(),
         body: body.into(),
+        metadata: MemoryMetadata::default(),
         kind: "note".into(),
         tags: vec![],
         links: vec![],
@@ -21,6 +22,8 @@ fn create_memory(id: i64, key: &str, title: &str, body: &str) -> MemoryRecord {
 fn create_request(query: &str) -> SearchRequest {
     SearchRequest {
         query: query.into(),
+        scope: None,
+        claim_type: None,
         kind: None,
         tags: vec![],
         prefix: false,
@@ -202,7 +205,13 @@ fn should_preserve_unicode_bodies_and_fold_case_and_accents() {
     let response = index.search(&create_request("CAFE")).unwrap();
 
     assert_eq!(response.total, 1);
-    assert!(response.hits[0].excerpt.contains("Café"));
+    assert!(
+        response.hits[0]
+            .excerpt
+            .as_deref()
+            .unwrap()
+            .contains("Café")
+    );
     assert_eq!(index.search(&create_request("東京")).unwrap().total, 1);
 }
 
@@ -313,7 +322,7 @@ fn should_sort_ties_by_identity_and_report_result_truncation() {
 }
 
 #[test]
-fn should_reject_unbounded_or_malformed_queries() {
+fn should_reject_only_malformed_queries_and_zero_page_size() {
     let directory = tempfile::tempdir().unwrap();
     let index = SearchIndex::open(directory.path()).unwrap();
 
@@ -322,13 +331,15 @@ fn should_reject_unbounded_or_malformed_queries() {
         assert!(error.downcast_ref::<InvalidSearchQuery>().is_some());
     }
 
-    assert!(index.search(&create_request(&"word ".repeat(17))).is_err());
-    assert!(index.search(&create_request(&"x".repeat(4097))).is_err());
+    assert!(index.search(&create_request(&"word ".repeat(17))).is_ok());
+    let mut long_request = create_request(&"x".repeat(4097));
+    long_request.fuzzy = false;
+    assert!(index.search(&long_request).is_ok());
 
     let mut request = create_request("word");
     request.limit = 101;
 
-    assert!(index.search(&request).is_err());
+    assert!(index.search(&request).is_ok());
 
     request.limit = 0;
 
@@ -364,22 +375,20 @@ fn create_variants(source: &str, count: usize) -> Vec<String> {
 }
 
 #[test]
-fn should_reject_fuzzy_expansion_above_the_per_term_budget() {
+fn should_search_fuzzy_expansion_above_the_former_per_term_cap() {
     let directory = tempfile::tempdir().unwrap();
     let mut index = SearchIndex::open(directory.path()).unwrap();
     let body = create_variants("abcdefgh", 2049).join(" ");
     index.upsert(&create_memory(1, "broad", "", &body)).unwrap();
     index.commit(1).unwrap();
-    let error = index.search(&create_request("abcdefgh")).unwrap_err();
-    assert!(error.downcast_ref::<SearchBudgetExceeded>().is_some());
-    assert!(error.to_string().contains("2048"));
+    assert_eq!(index.search(&create_request("abcdefgh")).unwrap().total, 1);
     let mut exact = create_request("abcdefgh");
     exact.fuzzy = false;
     assert_eq!(index.search(&exact).unwrap().total, 0);
 }
 
 #[test]
-fn should_reject_prefix_expansion_above_the_per_term_budget() {
+fn should_search_prefix_expansion_above_the_former_per_term_cap() {
     let directory = tempfile::tempdir().unwrap();
     let mut index = SearchIndex::open(directory.path()).unwrap();
     let body = (0..2049)
@@ -391,12 +400,11 @@ fn should_reject_prefix_expansion_above_the_per_term_budget() {
     let mut request = create_request("prefix");
     request.prefix = true;
     request.fuzzy = false;
-    let error = index.search(&request).unwrap_err();
-    assert!(error.downcast_ref::<SearchBudgetExceeded>().is_some());
+    assert_eq!(index.search(&request).unwrap().total, 1);
 }
 
 #[test]
-fn should_reject_expansion_above_the_complete_query_budget() {
+fn should_search_expansion_above_the_former_query_cap() {
     let directory = tempfile::tempdir().unwrap();
     let mut index = SearchIndex::open(directory.path()).unwrap();
     let terms = ["abcdefgh", "ijklmnop", "qrstuvwx", "zyxwvuts", "fedcbaqr"];
@@ -407,9 +415,13 @@ fn should_reject_expansion_above_the_complete_query_budget() {
         .join(" ");
     index.upsert(&create_memory(1, "broad", "", &body)).unwrap();
     index.commit(1).unwrap();
-    let error = index.search(&create_request(&terms.join(" "))).unwrap_err();
-    assert!(error.downcast_ref::<SearchBudgetExceeded>().is_some());
-    assert!(error.to_string().contains("8192"));
+    assert_eq!(
+        index
+            .search(&create_request(&terms.join(" ")))
+            .unwrap()
+            .total,
+        1
+    );
 }
 
 #[test]
@@ -428,4 +440,179 @@ fn should_deduplicate_expansion_across_fields_and_repeated_query_terms() {
         .unwrap();
     assert_eq!(response.total, 1);
     assert_eq!(response.hits[0].key, "shared");
+}
+
+#[test]
+fn should_return_complete_manual_summary_and_filter_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let mut memory = create_memory(1, "summary", "Title", "Unrelated body");
+    memory.metadata = MemoryMetadata {
+        summary: Some(format!("Durable registry {}", "café 東京 ".repeat(100))),
+        claim_type: Some(ClaimType::VERIFIED_OBSERVATION),
+        scope: Some("project/matrix".into()),
+        observed_at: Some(100),
+        verified_at: Some(200),
+        review_after: Some(300),
+    };
+    index.upsert(&memory).unwrap();
+    index.commit(1).unwrap();
+    let mut request = create_request("\"durable registry\"");
+    request.scope = memory.metadata.scope.clone();
+    request.claim_type = memory.metadata.claim_type;
+    let response = index.search(&request).unwrap();
+    assert_eq!(response.total, 1);
+    assert_eq!(response.hits[0].metadata, memory.metadata);
+    assert_eq!(response.hits[0].excerpt, None);
+    assert_eq!(index.search(&create_request("regsitry")).unwrap().total, 1);
+    request.scope = Some("other".into());
+    assert_eq!(index.search(&request).unwrap().total, 0);
+    request.scope = memory.metadata.scope.clone();
+    request.claim_type = Some(ClaimType::INFERENCE);
+    assert_eq!(index.search(&request).unwrap().total, 0);
+}
+
+#[test]
+fn should_return_complete_matching_paragraph_without_a_character_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let paragraph = format!("The registry preserves {}", "café 東京 🦀 ".repeat(100));
+    let memory = create_memory(
+        1,
+        "paragraph",
+        "",
+        &format!("# Heading\n\n{paragraph}\n\nOther context"),
+    );
+    index.upsert(&memory).unwrap();
+    index.commit(1).unwrap();
+    let response = index.search(&create_request("regsitry")).unwrap();
+    assert_eq!(
+        response.hits[0].excerpt.as_deref(),
+        Some(paragraph.as_str())
+    );
+    assert!(response.hits[0].metadata.summary.is_none());
+}
+
+#[test]
+fn should_accept_more_results_tags_and_terms_than_the_former_caps() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let tags = (0..40)
+        .map(|number| format!("tag{number}"))
+        .collect::<Vec<_>>();
+
+    for id in 1..=125 {
+        let mut memory = create_memory(id, &format!("record{id}"), "", "shared registry");
+        memory.tags = tags.clone();
+        index.upsert(&memory).unwrap();
+    }
+
+    index.commit(1).unwrap();
+    let mut request = create_request(&"shared ".repeat(1000));
+    request.tags = tags;
+    request.limit = 125;
+    request.fuzzy = false;
+    let response = index.search(&request).unwrap();
+    assert_eq!(response.hits.len(), 125);
+    assert_eq!(response.total, 125);
+    assert!(!response.truncated);
+}
+
+#[test]
+fn should_publish_summary_only_updates_and_remove_old_scope_matches() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let reader = index.reader();
+    let mut memory = create_memory(1, "changed", "", "body");
+    memory.metadata.summary = Some("oldsummary".into());
+    memory.metadata.scope = Some("oldscope".into());
+    index.upsert(&memory).unwrap();
+    index.commit(1).unwrap();
+    memory.system_version = 2;
+    memory.metadata.summary = Some("newsummary".into());
+    memory.metadata.scope = Some("newscope".into());
+    index.upsert(&memory).unwrap();
+    index.commit(2).unwrap();
+    let mut old = create_request("oldsummary");
+    old.fuzzy = false;
+    assert_eq!(reader.search(&old).unwrap().total, 0);
+    let mut current = create_request("newsummary");
+    current.scope = Some("newscope".into());
+    assert_eq!(reader.search(&current).unwrap().hits[0].version, 2);
+    current.scope = Some("oldscope".into());
+    assert_eq!(reader.search(&current).unwrap().total, 0);
+}
+
+#[test]
+fn should_fall_back_to_excerpt_for_empty_or_whitespace_summaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+
+    for (id, summary) in [(1, ""), (2, " \n ")] {
+        let mut memory = create_memory(
+            id,
+            &format!("empty{id}"),
+            "",
+            "Readable registry paragraph.",
+        );
+        memory.metadata.summary = Some(summary.into());
+        index.upsert(&memory).unwrap();
+    }
+
+    index.commit(1).unwrap();
+    let response = index.search(&create_request("registry")).unwrap();
+    assert_eq!(response.hits.len(), 2);
+
+    for hit in response.hits {
+        assert_eq!(hit.excerpt.as_deref(), Some("Readable registry paragraph."));
+        assert!(hit.metadata.summary.is_some());
+    }
+}
+
+#[test]
+fn should_preserve_matching_paragraphs_with_crlf_and_whitespace_blank_lines() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let paragraph = format!(
+        "  Registry paragraph {}\r\nSecond line stays intact.  ",
+        "café 東京 🦀 ".repeat(100)
+    );
+    let body = format!("\r\n# Heading\r\n \t\r\n{paragraph}\r\n\u{2003}\r\nOther context");
+    index.upsert(&create_memory(1, "crlf", "", &body)).unwrap();
+    index.commit(1).unwrap();
+    let response = index.search(&create_request("regsitry")).unwrap();
+    assert_eq!(
+        response.hits[0].excerpt.as_deref(),
+        Some(paragraph.as_str())
+    );
+}
+
+#[test]
+fn should_prefer_complete_phrase_over_an_earlier_individual_term() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let paragraph = "The durable registry preserves the complete decision.";
+    let body = format!("A durable preliminary note.\n \t\n{paragraph}\n\nOther context");
+    index
+        .upsert(&create_memory(1, "phrase-preview", "", &body))
+        .unwrap();
+    index.commit(1).unwrap();
+    let response = index
+        .search(&create_request("\"durable registry\""))
+        .unwrap();
+    assert_eq!(response.hits[0].excerpt.as_deref(), Some(paragraph));
+}
+
+#[test]
+fn should_use_first_complete_paragraph_when_only_the_title_matches() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let paragraph = "  First body paragraph.\r\nContinued context.  ";
+    let body = format!(" \t\r\n{paragraph}\r\n \t\r\nSecond body paragraph.");
+    index
+        .upsert(&create_memory(1, "fallback-preview", "registry", &body))
+        .unwrap();
+    index.commit(1).unwrap();
+    let response = index.search(&create_request("registry")).unwrap();
+    assert_eq!(response.hits[0].excerpt.as_deref(), Some(paragraph));
 }

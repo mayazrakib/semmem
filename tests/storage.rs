@@ -1,16 +1,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
-use semantic_memory::models::{
-    CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryLink, MemoryVersion,
-    RestoreMemory, TaxonomyInput, UpdateMemory,
+use semmem::models::{
+    ClaimType, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryLink, MemoryMetadata,
+    MemoryVersion, RestoreMemory, TaxonomyInput, UpdateMemory,
 };
-use semantic_memory::storage::Store;
+use semmem::storage::Store;
 
 fn create_memory(key: &str) -> CreateMemory {
     CreateMemory {
         key: key.into(),
         title: format!("Title {key}"),
+        metadata: Default::default(),
         body: format!("# Memory {key}\n\nUTF-8 content: café, 日本語, 🦀.\n"),
         kind: "note".into(),
         tags: vec!["project".into()],
@@ -23,6 +24,7 @@ fn update_memory(key: &str, version: i64, body: &str) -> UpdateMemory {
     UpdateMemory {
         key: key.into(),
         expected_version: version,
+        metadata: Default::default(),
         title: None,
         body: Some(body.into()),
         kind: None,
@@ -360,42 +362,55 @@ fn purging_active_targets_revises_surviving_sources_and_rejects_stale_edits() {
 }
 
 #[test]
-fn migrates_schema_one_and_backfills_historical_deletion_state() {
+fn initializes_current_schema_and_preserves_records_on_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("legacy.sqlite3");
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+    let path = directory.path().join("initialized.sqlite3");
+    let mut store = Store::open(&path).unwrap();
+    let identity = store.database_key().unwrap();
+    let records = store
+        .create_memories(&[create_memory("initialized")])
         .unwrap();
-    connection.execute_batch("PRAGMA foreign_keys = ON;
-        BEGIN;
-        INSERT INTO database_identity (id, key, system_created_at, system_updated_at) VALUES (1, 'legacy-identity', 100, 100);
-        INSERT INTO memory_kinds (id, key, name, system_created_at, system_updated_at) VALUES (1, 'note', 'Note', 100, 100);
-        INSERT INTO actors (id, name, system_created_at, system_updated_at) VALUES (1, 'human', 100, 100);
-        INSERT INTO memories (id, key, system_created_at, system_updated_at, system_version, system_deleted_at) VALUES (1, 'legacy', 100, 200, 1, 200);
-        INSERT INTO memory_revisions (memory_id, title, body, kind_id, actor_id, system_version, system_operation, system_created_at, system_updated_at) VALUES (1, 'Legacy', 'Preserved Markdown', 1, 1, 1, 'delete', 200, 200);
-        COMMIT;").unwrap();
-    drop(connection);
-    let mut migrated = Store::open(&path).unwrap();
-    assert_eq!(migrated.database_key().unwrap(), "legacy-identity");
-    let version: i64 = migrated
+    let version: i64 = store
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
+    assert_eq!(records[0].system_deleted_at, None);
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.database_key().unwrap(), identity);
     assert_eq!(
-        migrated
-            .get_revision("legacy", 1)
-            .unwrap()
-            .system_deleted_at,
-        Some(200)
+        reopened.get_memory("initialized", false).unwrap(),
+        records[0]
     );
-    assert_eq!(
-        migrated.get_memory("legacy", true).unwrap().body,
-        "Preserved Markdown"
-    );
-    migrated.create_memories(&[create_memory("new")]).unwrap();
     assert!(Store::open_read_only(&path).is_ok());
+}
+
+#[test]
+fn rejects_existing_schemas_without_modifying_the_database() {
+    for version in [0, 1, 2, 4] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sqlite3");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE preserved (body TEXT); INSERT INTO preserved VALUES ('Original data');").unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(Store::open(&path).err().unwrap().code, "unsupported_schema");
+        assert_eq!(
+            Store::open_read_only(&path).err().unwrap().code,
+            "unsupported_schema"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let body: String = connection
+            .query_row("SELECT body FROM preserved", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "Original data");
+    }
 }
 
 #[test]
@@ -550,7 +565,7 @@ fn batch_get_uses_one_snapshot_during_atomic_concurrent_updates() {
     let writer_done = Arc::clone(&done);
     let worker = std::thread::spawn(move || {
         writer_barrier.wait();
-        let result = (|| -> semantic_memory::models::AppResult<()> {
+        let result = (|| -> semmem::models::AppResult<()> {
             for version in 1..=100 {
                 let body = format!("generation{version}");
                 writer.update_memories(&[
@@ -566,6 +581,7 @@ fn batch_get_uses_one_snapshot_during_atomic_concurrent_updates() {
         result
     });
     let request = GetMemories {
+        view: Default::default(),
         keys: (0..64)
             .map(|index| {
                 if index % 2 == 0 {
@@ -596,6 +612,7 @@ fn batch_get_uses_one_snapshot_during_atomic_concurrent_updates() {
     worker.join().unwrap().unwrap();
     let historical = reader
         .get_memories(&GetMemories {
+            view: Default::default(),
             keys: vec!["second".into(), "first".into()],
             include_deleted: false,
             version: Some(1),
@@ -603,4 +620,199 @@ fn batch_get_uses_one_snapshot_during_atomic_concurrent_updates() {
         .unwrap();
     assert_eq!(historical[0].key, "second");
     assert!(historical.iter().all(|record| record.body == "generation0"));
+}
+
+#[test]
+fn metadata_survives_revisions_deletion_restoration_and_retry_checks() {
+    let mut store = Store::open(":memory:").unwrap();
+    let mut input = create_memory("metadata");
+    input.metadata = MemoryMetadata {
+        summary: Some("A supplied summary".into()),
+        claim_type: Some(ClaimType::EXPLICIT_USER_STATEMENT),
+        scope: Some("project/environment".into()),
+        observed_at: Some(100),
+        verified_at: Some(200),
+        review_after: Some(300),
+    };
+    let created = store.create_memories(std::slice::from_ref(&input)).unwrap();
+    assert_eq!(created[0].metadata, input.metadata);
+    assert_eq!(
+        store.create_memories(std::slice::from_ref(&input)).unwrap(),
+        created
+    );
+    let mut different = input.clone();
+    different.metadata.review_after = None;
+    assert_eq!(
+        store.create_memories(&[different]).unwrap_err().code,
+        "already_exists"
+    );
+    let update: UpdateMemory = serde_json::from_value(serde_json::json!({
+        "key": "metadata", "expected_version": 1,
+        "summary": null, "claim_type": "verified observation", "verified_at": 400
+    }))
+    .unwrap();
+    let updated = store.update_memories(&[update]).unwrap();
+    assert_eq!(updated[0].metadata.summary, None);
+    assert_eq!(
+        updated[0].metadata.claim_type,
+        Some(ClaimType::VERIFIED_OBSERVATION)
+    );
+    assert_eq!(updated[0].metadata.verified_at, Some(400));
+    assert_eq!(updated[0].metadata.scope, input.metadata.scope);
+    assert_eq!(updated[0].metadata.observed_at, input.metadata.observed_at);
+    assert_eq!(
+        updated[0].metadata.review_after,
+        input.metadata.review_after
+    );
+    let deleted = store
+        .delete_memories(
+            &[MemoryVersion {
+                key: "metadata".into(),
+                expected_version: 2,
+            }],
+            "human",
+        )
+        .unwrap();
+    assert_eq!(deleted[0].metadata, updated[0].metadata);
+    let restored = store
+        .restore_memories(&[RestoreMemory {
+            key: "metadata".into(),
+            expected_version: 3,
+            revision: Some(1),
+            actor: "human".into(),
+        }])
+        .unwrap();
+    assert_eq!(restored[0].metadata, input.metadata);
+    assert_eq!(
+        store.get_revision("metadata", 2).unwrap().metadata,
+        updated[0].metadata
+    );
+    let filtered = store
+        .list_memories(&ListMemories {
+            scope: input.metadata.scope,
+            claim_type: input.metadata.claim_type,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert!(
+        store
+            .list_memories(&ListMemories {
+                scope: Some("another project".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        serde_json::from_value::<CreateMemory>(
+            serde_json::json!({"key":"invalid", "body":"Text", "claim_type":"guessed"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn compact_reads_preserve_manual_summaries_and_complete_paragraphs() {
+    let mut store = Store::open(":memory:").unwrap();
+    let paragraph = "A complete paragraph with Unicode 日本語. ".repeat(100);
+    let mut automatic = create_memory("automatic");
+    automatic.body = format!("\n\n{paragraph}\n\nAdditional full body content.");
+    let mut whitespace = create_memory("whitespace");
+    whitespace.metadata.summary = Some("\u{2003} \n".into());
+    whitespace.body = "Whitespace summary fallback\r\n\r\nFurther text".into();
+    let mut manual = create_memory("manual");
+    manual.metadata.summary = Some("Manually supplied summary".repeat(100));
+    store
+        .create_memories(&[automatic.clone(), manual.clone(), whitespace])
+        .unwrap();
+    let request = GetMemories {
+        keys: vec!["automatic".into(), "manual".into()],
+        ..Default::default()
+    };
+    let summaries = store.get_memory_summaries(&request).unwrap();
+    assert_eq!(summaries[0]["excerpt"], paragraph);
+    assert_eq!(summaries[1]["summary"], manual.metadata.summary.unwrap());
+    assert!(summaries[1].get("excerpt").is_none());
+    for summary in &summaries {
+        for absent in ["body", "tags", "links"] {
+            assert!(summary.get(absent).is_none());
+        }
+        assert!(summary.get("system_version").is_some());
+    }
+    assert_eq!(
+        store.get_memories(&request).unwrap()[0].body,
+        automatic.body
+    );
+    assert_eq!(
+        store
+            .list_memory_summaries(&ListMemories::default())
+            .unwrap()
+            .len(),
+        3
+    );
+    let whitespace = store
+        .get_memory_summaries(&GetMemories {
+            keys: vec!["whitespace".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(whitespace[0]["excerpt"], "Whitespace summary fallback");
+    let history = store
+        .list_revision_summaries(&HistoryRequest {
+            key: "automatic".into(),
+            limit: 20,
+            before_version: None,
+        })
+        .unwrap();
+    assert_eq!(history[0]["excerpt"], paragraph);
+    assert!(history[0].get("body").is_none());
+}
+
+#[test]
+fn accepts_batches_and_reads_above_previous_caps_and_bind_variable_counts() {
+    let mut store = Store::open(":memory:").unwrap();
+    let inputs = (0..1100)
+        .map(|index| create_memory(&format!("large-{index}")))
+        .collect::<Vec<_>>();
+    assert_eq!(store.create_memories(&inputs).unwrap().len(), inputs.len());
+    let records = store
+        .get_memories(&GetMemories {
+            keys: (0..33000)
+                .map(|index| format!("large-{}", index % inputs.len()))
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(records.len(), 33000);
+    assert_eq!(records.last().unwrap().key, "large-1099");
+    assert_eq!(
+        store
+            .list_memories(&ListMemories {
+                limit: 2000,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        inputs.len()
+    );
+}
+
+#[test]
+fn compact_paragraph_projection_preserves_crlf_and_indentation() {
+    let mut store = Store::open(":memory:").unwrap();
+    let mut input = create_memory("paragraph");
+    input.body =
+        "\r\n \t\r\n    First line.\r\n    日本語 second line.  \r\n \t\r\nOther paragraph.".into();
+    store.create_memories(&[input]).unwrap();
+    let summaries = store
+        .get_memory_summaries(&GetMemories {
+            keys: vec!["paragraph".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        summaries[0]["excerpt"],
+        "    First line.\r\n    日本語 second line.  "
+    );
 }

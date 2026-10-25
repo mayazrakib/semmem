@@ -61,7 +61,6 @@ impl OAuth {
             anyhow::bail!("OAuth issuer and public URL must use HTTPS.");
         }
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let discovery: Discovery = client
@@ -188,10 +187,14 @@ pub async fn authorize(State(auth): State<Arc<OAuth>>, request: Request, next: N
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned);
     let (mut parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, 4 * 1024 * 1024).await {
+    let bytes = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "Request body exceeds 4 MiB.").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "The request body could not be read.",
+            )
+                .into_response();
         }
     };
     let operation = serde_json::from_slice::<Value>(&bytes)

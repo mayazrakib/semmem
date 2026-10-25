@@ -1,8 +1,34 @@
 # Performance qualification
 
+The historical version-two section describes the earlier schema and its former application limits. They are retained as historical evidence, not measurements of the metadata update. New benchmark runs use a fresh compatible fixture and report construction, process startup, first request, and warm requests separately. A process restart reuses operating-system caches and does not establish cold-disk performance.
+
 Measurements use a release build on Linux x86-64 under a Microsoft hypervisor, with an AMD Ryzen 9 9950X3D reported by the host and 24 available logical CPUs. Rust 1.98.0 compiled the benchmark with thin LTO. SQLite uses WAL and FULL synchronization; successful writes include durable index publication. Storage and filesystem behavior affect these results.
 
-## Workload and interpretation
+## Semmem schema version three
+
+The final `semmem` run reused the compatible million-record schema-three fixture, with 16 clients and 100 iterations per client. [The final report](../benchmark/semmem-million.json) records all samples and startup probes. [The initial schema-three report](../benchmark/schema3-initial-million.json) preserves fixture creation and the first full index construction. Historical version-two reports below remain unchanged.
+
+| Scenario | Final p95 |
+|---|---:|
+| Rare full-text term | 0.84 ms |
+| Common full-text term | 2.41 ms |
+| Rare fuzzy term | 2.08 ms |
+| Common fuzzy term | 4.14 ms |
+| Exact phrase | 6.78 ms |
+| Prefix | 4.72 ms |
+| Isolated durable searchable write | 169.56 ms |
+| Concurrent reads | 6.41 ms |
+| Concurrent durable searchable writes | 347.72 ms |
+
+All isolated acceptance gates passed. The loaded write p95 exceeded the separate advisory 200 ms comparison and remains a reported failure of that comparison. Mixed throughput was 586.28 operations per second.
+
+The final restart probe opened the existing index in 4.97 ms, then served its first request in 1.16 ms. The initial schema-three process built the index in 176.06 seconds, then served its first request in 1.63 ms. Those construction and reopening workloads are distinct. Every startup probe ran in its own process; operating-system caches were not flushed. These measurements exclude HTTP, OAuth, MCP framing, and client/model latency.
+
+[Current source checksums](../benchmark/semmem-source.sha256) identify the delivered source. The initializer, revision metadata, paragraph projection, CLI lifecycle, and frontmatter editor are covered by the current tests. Tantivy retains its required finite writer arena and index-maintenance merge policy; those settings do not reject caller input. Production request counts, payloads, query expansion, pool growth, and queues have no application ceilings, and no token budgeting or embeddings are used.
+
+## Historical version-two results
+
+### Workload and interpretation
 
 The deterministic fixture contains 1,000,000 memories. Most Markdown bodies are approximately 512 bytes; every tenth body is approximately 4 KiB. Records have varied kinds, two tags, periodic links, Unicode text, and a second revision on one percent of records. The mixed workload uses 16 clients, each performing 100 operations: 70 percent search, 20 percent reads, and 10 percent writes. Every measured write is followed by a search asserting publication.
 
@@ -10,7 +36,7 @@ Latency measurements cover in-process `Service::dispatch`, including SQLite, que
 
 Each isolated query has three warmup calls followed by 100 measured calls. Results are not served from a result cache. Counts include all matches, and score ties use internal memory identity. Concurrent read and write percentiles are reported separately from isolated acceptance gates. Operating-system caches are not flushed; service startup on a reused index is not a cold-disk measurement.
 
-## Search tuning
+### Search tuning
 
 The initial million-memory run missed the broad phrase target: p95 was 40.70 ms against a 20 ms target. Bounded fuzzy expansion and a four-thread executor reduced it to 26.96 ms, which still failed. Inspection found one segment holding approximately 94 percent of the corpus, preventing useful segment-level parallelism.
 
@@ -18,7 +44,7 @@ The current implementation uses Tantivy's existing log merge policy with four-se
 
 The deletion-ratio setting applies only to segments eligible for merging. It does not establish a global tombstone-space bound. A rebuild can reclaim space retained by larger segments.
 
-## Final results
+### Final results
 
 The final schema-version-two run with the retained 2 ms batch window produced these p95 measurements:
 

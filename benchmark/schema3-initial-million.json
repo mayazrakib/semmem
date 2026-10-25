@@ -1,0 +1,138 @@
+{
+  "active_bytes_after_mixed": 1832162825,
+  "active_bytes_before_mixed": 1832154552,
+  "active_data_directory_bytes": 1832162825,
+  "architecture": "x86_64",
+  "batch_window_ms": 2,
+  "clients": 16,
+  "data_directory_bytes": 1832162825,
+  "fixture_created": true,
+  "fixture_seed_seconds": 232.160981698,
+  "fixture_version": 3,
+  "index_existed_before_open": false,
+  "iterations_per_client": 100,
+  "logical_cpus": 24,
+  "measurements": [
+    {
+      "meets_target": true,
+      "p50_ms": 0.687007,
+      "p95_ms": 0.813314,
+      "p99_ms": 0.9208620000000001,
+      "samples": 100,
+      "scenario": "warm_exact_rare",
+      "target_p95_ms": 20.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 2.27514,
+      "p95_ms": 2.5366049999999998,
+      "p99_ms": 2.606942,
+      "samples": 100,
+      "scenario": "warm_exact_common",
+      "target_p95_ms": 20.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 1.761386,
+      "p95_ms": 1.9713550000000002,
+      "p99_ms": 2.1839440000000003,
+      "samples": 100,
+      "scenario": "warm_fuzzy_rare",
+      "target_p95_ms": 100.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 3.2106869999999996,
+      "p95_ms": 3.828178,
+      "p99_ms": 3.886669,
+      "samples": 100,
+      "scenario": "warm_fuzzy_common",
+      "target_p95_ms": 100.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 6.355558,
+      "p95_ms": 7.61503,
+      "p99_ms": 7.793189,
+      "samples": 100,
+      "scenario": "warm_phrase",
+      "target_p95_ms": 20.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 3.534368,
+      "p95_ms": 4.448559,
+      "p99_ms": 4.572486,
+      "samples": 100,
+      "scenario": "warm_prefix",
+      "target_p95_ms": 20.0
+    },
+    {
+      "meets_target": true,
+      "p50_ms": 99.097966,
+      "p95_ms": 135.234467,
+      "p99_ms": 218.59399299999998,
+      "samples": 100,
+      "scenario": "isolated_durable_visible_writes",
+      "target_p95_ms": 200.0
+    },
+    {
+      "meets_target": null,
+      "p50_ms": 1.548993,
+      "p95_ms": 6.190435,
+      "p99_ms": 7.698672,
+      "samples": 1440,
+      "scenario": "concurrent_reads",
+      "target_p95_ms": null
+    },
+    {
+      "meets_target": false,
+      "p50_ms": 246.89291999999998,
+      "p95_ms": 325.14837600000004,
+      "p99_ms": 326.635762,
+      "samples": 160,
+      "scenario": "concurrent_durable_visible_writes",
+      "target_p95_ms": 200.0
+    }
+  ],
+  "memories": 1000000,
+  "mixed_disk_growth_bytes": 8273,
+  "mixed_operations_per_second": 572.5011679059608,
+  "mixed_seconds": 2.794754124,
+  "operating_system": "linux",
+  "peak_process_rss_kib": 173904,
+  "retained_index_backup_bytes": 0,
+  "service_open_context": "same process after independent startup probes",
+  "service_startup_seconds": 0.014785792,
+  "startup_processes": {
+    "initial": {
+      "first_request_ms": 1.634964,
+      "index_existed_before_open": false,
+      "initialize_and_first_request_ms": 176061.979466,
+      "launch_to_exit_ms": 176147.437865,
+      "peak_process_rss_kib": 1341084,
+      "process_reused": false,
+      "service_initialize_ms": 176060.34234200002
+    },
+    "os_caches_flushed": false,
+    "reopened": {
+      "first_request_ms": 1.13387,
+      "index_existed_before_open": true,
+      "initialize_and_first_request_ms": 19.310429,
+      "launch_to_exit_ms": 21.814602999999998,
+      "peak_process_rss_kib": 21328,
+      "process_reused": false,
+      "service_initialize_ms": 18.175209
+    },
+    "transport_included": false
+  },
+  "write_metrics": {
+    "queue_wait_max_ms": 204.427789,
+    "queue_wait_mean_ms": 81.13226701538461,
+    "read_connections_idle": 11,
+    "read_connections_opened": 11,
+    "requests": 260,
+    "search_publication_total_ms": 11631.718402,
+    "sqlite_transaction_total_ms": 1590.1257
+  }
+}
