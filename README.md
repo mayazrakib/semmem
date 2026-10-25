@@ -1,23 +1,21 @@
-# semantic-memory
+# Semantic Memory
 
-Semantic, human-readable, persistent memory and retrieval system for AI.
-
-Semantic Memory is a Linux-first Rust server with a host-terminal CLI and an OAuth-protected remote Model Context Protocol (MCP) interface. SQLite owns the readable Markdown, relational metadata, and revision history. A rebuildable Tantivy index supplies ranked full-text, phrase, prefix, and typo-tolerant search. No embedding model or external database server is required.
+`semantic-memory` is a persistent memory and retrieval system for AI. It stores human-readable Markdown, revision history, and typed relationships in SQLite, and uses Tantivy for full-text and fuzzy search. A terminal client and an OAuth-protected Model Context Protocol (MCP) server share one registry.
 
 ## Build and run
 
-Build the release binary and start the local service:
+Use Rust on Linux. Install the binary from a checkout, then start the service:
 
 ```sh
-cargo build --release --locked
-./target/release/semantic-memory serve
+cargo install --path . --locked
+semantic-memory serve
 ```
 
-The default data directory is `$XDG_DATA_HOME/semantic-memory`, or `$HOME/.local/share/semantic-memory` when `XDG_DATA_HOME` is unset. The CLI connects to the service's private Unix socket. It never opens a second database or search writer.
+The service owns the database and search index. Terminal clients connect through a private Unix socket. Data lives in `$XDG_DATA_HOME/semantic-memory`, or `$HOME/.local/share/semantic-memory` when `XDG_DATA_HOME` is unset. Use `--socket` or `SEMANTIC_MEMORY_SOCKET` for another socket; pass `--data-dir` to `serve` for another data directory.
 
-## Terminal use
+## Use
 
-Add a memory, search it, and inspect its full Markdown:
+Keep the service running in one terminal and use another to add, find, and edit memories:
 
 ```sh
 semantic-memory add reading --title "Reading preferences" --tag personal
@@ -27,46 +25,54 @@ semantic-memory edit reading
 semantic-memory history reading
 ```
 
-Add and edit open `VISUAL`, then `EDITOR`, then `vim`. Only the Markdown body goes into the editor. Use named flags for titles, kinds, tags, and links. Memory keys are stable public identifiers supplied by the caller; UUIDs and readable names are accepted. An unchanged edit creates no revision. Failed saves retain the draft and its path.
+`add` and `edit` open `VISUAL`, then `EDITOR`, then `vim`. The editor contains only the Markdown body. Set titles, kinds, tags, and links through command options. Keys are stable identifiers supplied by the caller; readable names and UUIDs are accepted. Unchanged edits create no revision, and failed saves preserve the draft.
 
-Reads return the version needed for guarded mutations. Deletion retains history; purge removes the memory, its history, and all incoming references, including historical references:
+Search supports exact phrases, prefixes, spelling mistakes, and kind or tag filters. `list` browses memories and their incoming or outgoing relationships. The `taxonomy` commands manage kinds, tags, and relation types. Add `--json` for structured output, and use `--help` for each command's options.
+
+Reads return the version required for guarded writes. For a memory at version two, deletion and restoration use:
 
 ```sh
 semantic-memory delete reading --expected-version 2
 semantic-memory restore reading --expected-version 3
-semantic-memory purge reading --expected-version 4 --confirm
 ```
 
-Browse kinds, tags, and relation types with the taxonomy commands. Search and browse support filters and bounded results. Lists and history return summaries; use `show --version` for historical Markdown. Add `--json` for machine-readable output, and use `--help` on any command for its complete options.
+`delete` retains history, and `restore` appends a new revision. `purge` requires `--confirm` and permanently removes the memory, its history, and incoming references, including historical links. Lists and history return summaries; use `show --version` to read a historical body.
+
+Writes commit to SQLite and become searchable before success is returned. Stale versions produce conflicts instead of overwriting newer edits. Startup recovers pending index changes, and identical creates with the same key are retry-safe. SQLite uses WAL with FULL synchronization; durability depends on storage honoring synchronization requests. See [the schema](docs/schema.md) for storage and lifecycle details.
 
 ## Remote MCP
 
-Remote access requires an external OAuth provider and an HTTPS reverse proxy. Without OAuth configuration, only the private host socket is enabled. The service exposes typed read and write tools, including atomic batches, taxonomy management, history, restoration, and purge. Separate scopes control reading, writing, and purging.
+The MCP interface provides search, batch reads and writes, browsing, history, restoration, purge, and taxonomy management. Responses include stable keys and versions for subsequent edits. The `memory:read`, `memory:write`, and `memory:purge` scopes control access separately.
 
-See [deployment](docs/deployment.md) for server configuration and ChatGPT connection requirements, and [schema](docs/schema.md) for the normalized storage model. Actual hosting and live ChatGPT connection verification are separate deployment steps.
+Remote connections require an external OAuth provider and an HTTPS reverse proxy. Configure the service with:
 
-## Consistency
+```sh
+semantic-memory serve \
+    --issuer https://identity.example.com \
+    --audience https://memory.example.com/mcp \
+    --public-url https://memory.example.com
+```
 
-Successful writes have committed to SQLite and have been published to search. Concurrent edits require the version that was read, so stale changes cannot overwrite a newer revision. SQLite uses WAL with FULL synchronization. Durability depends on storage honoring synchronization requests.
+The server binds to loopback by default and serves MCP at `/mcp`. Without OAuth configuration, it opens only the private host socket. See [deployment](docs/deployment.md) for provider requirements, proxy configuration, and client connection details. Hosting and live client verification are separate deployment steps.
 
-After an interrupted write, startup replays durable indexing events before accepting requests. If a write commits but search publication fails, its error identifies the committed state; inspect the returned keys and versions before retrying. Identical creates using the same key are retry-safe.
+## Develop
 
-## Verification
-
-Run the test suite, including subprocess crash recovery, and strict lint checks:
+Run the tests and checks from a checkout:
 
 ```sh
 cargo test --locked --features fault-injection --tests
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The `fault-injection` feature is for recovery tests. Release deployments should use the default features.
+The `fault-injection` feature enables subprocess crash-recovery tests. Build release deployments with the default features.
 
-Run the deterministic million-memory qualification benchmark:
+Run the deterministic million-memory benchmark with:
 
 ```sh
 cargo bench --locked --bench search -- --memories 1000000 --clients 16 --iterations 100 --data-dir ./target/benchmark-million
 ```
 
-The benchmark reports isolated and concurrent latency distributions, throughput, startup time, process memory, and data-directory size. See [performance](docs/performance.md) for measured results and limitations.
+The benchmark reports isolated and concurrent latency measurements, throughput, startup time, memory use, and storage size. See [performance](docs/performance.md) for the measured results, workload, and limits. These timings exclude HTTP, OAuth, MCP transport, and model generation.
+
+The Rust library separates domain contracts, SQLite storage, search, write coordination, authentication, server transport, MCP tools, and terminal interaction under `src/`. Schema migrations live in `migrations/`, integration tests in `tests/`, and the benchmark in `benches/`.
