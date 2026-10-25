@@ -1,0 +1,102 @@
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+*.keystore
+*.token
+*.secret
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Desktop.ini
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+.Trash-*
+.directory
+
+# Editor and IDE metadata
+.idea/
+.vscode/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*.swn
+*~
+.project
+.settings/
+.classpath
+.history/
+.tags
+.tags_sorted_by_file
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Logs
+*.log
+*.log.*
+
+# Runtime state
+*.pid
+*.sock
+*.socket
+
+# Build artefacts
+.out/
+build/
+dist/
+out/
+
+# Compiler artefacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Test artefacts
+.test_cache/
+junit.xml
+*.junit.xml
+
+# Coverage artefacts
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+lcov.info
+htmlcov/
+
+# Rust
+target/
+Cargo.lock.local
+.cargo/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.dump
+
+# AI
+.dmux/

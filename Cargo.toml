@@ -1,0 +1,8 @@
+[package]
+name = "semantic-memory"
+version = "0.1.0"
+edition = "2024"
+description = "Semantic, human-readable, persistent memory and retrieval system for AI."
+repository = "https://github.com/mayazrakib/semantic-memory"
+
+[dependencies]
