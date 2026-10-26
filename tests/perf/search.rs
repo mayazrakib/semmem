@@ -378,8 +378,8 @@ fn run_write(service: &Service, client: usize, iteration: usize) -> Result<f64> 
     body.push_str(&format!("\n\n{publication_marker}\n"));
     let started = Instant::now();
     service.dispatch(
-        "update_memory",
-        json!({"key": key, "expected_token": token, "body": body, "commit_summary": "Measure benchmark write publication"}),
+        "update_memories",
+        json!({"memories": [{"key": key, "expected_token": token, "body": body}], "commit_summary": "Measure benchmark write publication"}),
         "benchmark",
     )?;
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
