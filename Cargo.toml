@@ -29,7 +29,7 @@ serde_yaml_ng = "0.10"
 shell-words = "1"
 tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
 tempfile = "3"
-termimad = "0.34"
+termimad = "0.35"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
