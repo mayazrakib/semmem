@@ -11,13 +11,15 @@ pub struct AppError {
     pub committed: bool,
     pub searchable: bool,
     #[serde(default)]
+    pub commit_id: Option<i64>,
+    #[serde(default)]
     pub affected: Vec<MemoryReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryReceipt {
     pub key: String,
-    pub version: Option<i64>,
+    pub token: Option<String>,
 }
 
 impl AppError {
@@ -27,6 +29,7 @@ impl AppError {
             message: message.into(),
             committed: false,
             searchable: false,
+            commit_id: None,
             affected: Vec::new(),
         }
     }
@@ -207,14 +210,11 @@ pub struct MemoryRecord {
     pub r#type: String,
     pub tags: Vec<String>,
     pub references: Vec<MemoryReference>,
-    pub author: String,
-    pub system_version: i64,
+    pub system_token: String,
     pub system_created_at: i64,
     pub system_updated_at: i64,
-    pub system_deleted_at: Option<i64>,
     pub system_created_by: String,
     pub system_updated_by: String,
-    pub system_deleted_by: Option<String>,
 }
 
 fn default_type() -> String {
@@ -242,14 +242,13 @@ pub struct CreateMemory {
     pub tags: Vec<String>,
     #[serde(default)]
     pub references: Vec<MemoryReference>,
-    pub author: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateMemory {
     pub key: String,
-    pub expected_version: i64,
+    pub expected_token: String,
     pub title: Option<String>,
     pub body: Option<String>,
     #[serde(flatten)]
@@ -257,22 +256,13 @@ pub struct UpdateMemory {
     pub r#type: Option<String>,
     pub tags: Option<Vec<String>>,
     pub references: Option<Vec<MemoryReference>>,
-    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryVersion {
+pub struct MemoryToken {
     pub key: String,
-    pub expected_version: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RestoreMemory {
-    pub key: String,
-    pub expected_version: i64,
-    pub revision: Option<i64>,
+    pub expected_token: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -281,9 +271,6 @@ pub struct GetMemories {
     #[serde(default)]
     pub view: MemoryView,
     pub keys: Vec<String>,
-    #[serde(default)]
-    pub include_deleted: bool,
-    pub version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -296,8 +283,6 @@ pub struct ListMemories {
     pub tags: Vec<String>,
     pub referenced_to: Option<String>,
     pub referenced_from: Option<String>,
-    #[serde(default)]
-    pub include_deleted: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
     pub cursor: Option<String>,
@@ -312,7 +297,6 @@ impl Default for ListMemories {
             tags: vec![],
             referenced_to: None,
             referenced_from: None,
-            include_deleted: false,
             limit: 20,
             cursor: None,
         }
@@ -334,11 +318,6 @@ pub struct SearchRequest {
     pub fuzzy: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default)]
-    pub history: bool,
-    pub as_of: Option<i64>,
-    #[serde(default)]
-    pub include_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -346,20 +325,17 @@ pub struct SearchHit {
     pub key: String,
     pub title: String,
     pub body: String,
-    pub version: i64,
+    pub system_token: String,
     pub score: f32,
     #[serde(flatten)]
     pub metadata: MemoryMetadata,
     pub r#type: String,
-    pub author: String,
     pub tags: Vec<String>,
     pub references: Vec<MemoryReference>,
     pub system_created_at: i64,
     pub system_updated_at: i64,
-    pub system_deleted_at: Option<i64>,
     pub system_created_by: String,
     pub system_updated_by: String,
-    pub system_deleted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -375,7 +351,6 @@ pub struct TaxonomyRecord {
     pub id: i64,
     pub key: String,
     pub name: String,
-    pub author: String,
     pub system_created_by: String,
     pub system_updated_by: String,
     pub system_created_at: i64,
@@ -387,16 +362,6 @@ pub struct TaxonomyRecord {
 pub struct TaxonomyInput {
     pub key: String,
     pub name: String,
-    pub author: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AuthorRecord {
-    pub author: String,
-    pub system_created_at: i64,
-    pub system_updated_at: i64,
-    pub system_created_by: String,
-    pub system_updated_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,12 +371,29 @@ pub struct IndexEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HistoryRequest {
+pub struct CommitRecord {
+    pub id: i64,
     pub key: String,
+    pub summary: String,
+    pub operation: String,
+    pub actor: String,
+    pub changes: serde_json::Value,
+    pub system_created_at: i64,
+    pub system_updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListCommits {
     #[serde(default = "default_limit")]
     pub limit: usize,
-    pub before_version: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetCommits {
+    pub ids: Vec<i64>,
 }
 
 #[cfg(test)]
@@ -426,7 +408,7 @@ mod tests {
         }))
         .unwrap();
         let update: UpdateMemory = serde_json::from_value(json!({
-            "key": "example", "expected_version": 1, "summary": null, "verified_at": 123
+            "key": "example", "expected_token": "token", "summary": null, "verified_at": 123
         }))
         .unwrap();
         let metadata = update.metadata.apply(&created);
@@ -441,7 +423,7 @@ mod tests {
     #[test]
     fn reads_default_to_full_and_metadata_rejects_invalid_types() {
         let request: GetMemories = serde_json::from_value(json!({"keys": ["example"]})).unwrap();
-        assert!(!request.include_deleted);
+        assert_eq!(request.keys, vec!["example"]);
         assert!(
             serde_json::from_value::<super::CreateMemory>(json!({
                 "key": "example", "body": "Exact Markdown", "basis": "certain"

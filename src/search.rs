@@ -1,15 +1,12 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{
-    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, RangeQuery, TermQuery,
-    TermSetQuery,
+    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
@@ -23,10 +20,6 @@ use tantivy::{
 
 use crate::models::{MemoryRecord, SearchHit, SearchRequest, SearchResponse};
 
-const INDEX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-const MIN_MERGE_SEGMENTS: usize = 4;
-const MAX_MERGE_INPUT_DOCUMENTS: usize = 50_000;
-const MERGE_DELETED_DOCUMENT_RATIO: f32 = 0.2;
 const TOKENIZER_NAME: &str = "memory_text";
 const TITLE_BOOST: f32 = 4.0;
 
@@ -43,7 +36,6 @@ struct ExpansionCache {
 struct SearchFields {
     id: Field,
     key: Field,
-    version: Field,
     title: Field,
     summary: Field,
     scope: Field,
@@ -51,10 +43,6 @@ struct SearchFields {
     metadata: Field,
     body: Field,
     memory_type: Field,
-    is_current: Field,
-    is_deleted: Field,
-    valid_from: Field,
-    valid_until: Field,
     tags: Field,
 }
 
@@ -111,12 +99,27 @@ impl SearchIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
-        let writer = index.writer_with_num_threads(1, INDEX_MEMORY_BYTES)?;
-        let mut merge_policy = LogMergePolicy::default();
-        merge_policy.set_min_num_segments(MIN_MERGE_SEGMENTS);
-        merge_policy.set_max_docs_before_merge(MAX_MERGE_INPUT_DOCUMENTS);
-        merge_policy.set_del_docs_ratio_before_merge(MERGE_DELETED_DOCUMENT_RATIO);
-        writer.set_merge_policy(Box::new(merge_policy));
+        let available_threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let memory_bytes = std::env::var("SEMMEM_INDEX_MEMORY_BYTES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .context("SEMMEM_INDEX_MEMORY_BYTES must be a positive integer")?
+            .unwrap_or(64 * 1024 * 1024);
+        let threads = std::env::var("SEMMEM_INDEX_THREADS")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .context("SEMMEM_INDEX_THREADS must be a positive integer")?
+            .unwrap_or_else(|| available_threads.min((memory_bytes / 15_000_000).max(1)));
+
+        if threads == 0 || memory_bytes == 0 {
+            bail!("Search indexing threads and memory budget must be positive");
+        }
+
+        let writer = index.writer_with_num_threads(threads, memory_bytes)?;
         let reader = SearchReader {
             reader: index_reader,
             fields,
@@ -138,73 +141,43 @@ impl SearchIndex {
     }
 
     pub fn upsert(&mut self, memory: &MemoryRecord) -> Result<()> {
-        self.replace_revisions(&memory.key, std::slice::from_ref(memory))
-    }
-
-    pub fn replace_revisions(&mut self, key: &str, revisions: &[MemoryRecord]) -> Result<()> {
-        let mut ordered = revisions.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|memory| memory.system_version);
-
-        for memory in &ordered {
-            if memory.id <= 0 || memory.system_version <= 0 || memory.key != key {
-                bail!("Indexed revision identity, key, and version must be valid");
-            }
+        if memory.id <= 0 || memory.system_token.is_empty() {
+            bail!("Indexed memory identity and concurrency token must be valid");
         }
 
-        if ordered
-            .windows(2)
-            .any(|pair| pair[0].system_version == pair[1].system_version)
-        {
-            bail!("Indexed revision versions must be unique");
+        self.remove(&memory.key)?;
+        let fields = &self.reader.fields;
+        let mut document = TantivyDocument::default();
+        document.add_u64(fields.id, memory.id as u64);
+        document.add_text(fields.key, &memory.key);
+        document.add_text(fields.title, &memory.title);
+        document.add_text(fields.metadata, serde_json::to_string(memory)?);
+
+        if let Some(summary) = &memory.metadata.summary {
+            document.add_text(fields.summary, summary);
         }
 
-        self.remove(key)?;
+        if let Some(scope) = &memory.metadata.scope {
+            document.add_text(fields.scope, scope);
+        }
 
-        for (position, memory) in ordered.iter().enumerate() {
-            let fields = &self.reader.fields;
-            let mut document = TantivyDocument::default();
-            document.add_u64(fields.id, memory.id as u64);
-            document.add_text(fields.key, &memory.key);
-            document.add_i64(fields.version, memory.system_version);
-            document.add_text(fields.title, &memory.title);
-            document.add_text(fields.metadata, serde_json::to_string(memory)?);
-            document.add_u64(fields.is_current, u64::from(position + 1 == ordered.len()));
-            document.add_u64(
-                fields.is_deleted,
-                u64::from(memory.system_deleted_at.is_some()),
+        if let Some(basis) = memory.metadata.basis {
+            document.add_text(
+                fields.basis,
+                serde_json::to_value(basis)?
+                    .as_str()
+                    .context("Basis must be text")?,
             );
-            document.add_i64(fields.valid_from, memory.system_updated_at);
-
-            if let Some(next) = ordered.get(position + 1) {
-                document.add_i64(fields.valid_until, next.system_updated_at);
-            }
-
-            if let Some(summary) = &memory.metadata.summary {
-                document.add_text(fields.summary, summary);
-            }
-
-            if let Some(scope) = &memory.metadata.scope {
-                document.add_text(fields.scope, scope);
-            }
-
-            if let Some(basis) = memory.metadata.basis {
-                document.add_text(
-                    fields.basis,
-                    serde_json::to_value(basis)?
-                        .as_str()
-                        .context("Basis must be text")?,
-                );
-            }
-
-            document.add_text(fields.body, &memory.body);
-            document.add_text(fields.memory_type, &memory.r#type);
-
-            for tag in &memory.tags {
-                document.add_text(fields.tags, tag);
-            }
-
-            self.writer.add_document(document)?;
         }
+
+        document.add_text(fields.body, &memory.body);
+        document.add_text(fields.memory_type, &memory.r#type);
+
+        for tag in &memory.tags {
+            document.add_text(fields.tags, tag);
+        }
+
+        self.writer.add_document(document)?;
 
         Ok(())
     }
@@ -250,10 +223,6 @@ impl SearchReader {
         let parts = parse_query(&request.query)?;
         let searcher = self.reader.searcher();
         let mut cache = ExpansionCache::default();
-        if request.history && request.as_of.is_some() {
-            return Err(InvalidSearchQuery("History and as_of cannot be combined.".into()).into());
-        }
-
         let has_fuzzy_terms = request.fuzzy
             && parts.iter().any(|part| {
                 !part.is_phrase && part.terms.iter().any(|term| term.chars().count() >= 4)
@@ -397,41 +366,6 @@ impl SearchReader {
             ));
         }
 
-        if !request.include_deleted {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_u64(self.fields.is_deleted, 0),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(timestamp) = request.as_of {
-            clauses.push((
-                Occur::Must,
-                Box::new(RangeQuery::new(
-                    Bound::Unbounded,
-                    Bound::Included(Term::from_field_i64(self.fields.valid_from, timestamp)),
-                )),
-            ));
-            clauses.push((
-                Occur::MustNot,
-                Box::new(RangeQuery::new(
-                    Bound::Unbounded,
-                    Bound::Included(Term::from_field_i64(self.fields.valid_until, timestamp)),
-                )),
-            ));
-        } else if !request.history {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_u64(self.fields.is_current, 1),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
         Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
@@ -507,52 +441,43 @@ impl SearchReader {
                 .str("key")
                 .expect("Search schema always has a key fast field")
                 .expect("Search schema always has a key string column");
-            let versions = segment
-                .fast_fields()
-                .i64("version")
-                .expect("Search schema always has a version fast field")
-                .first_or_default_col(0);
-
             move |document: DocId, score: f32| {
                 let mut key = String::new();
                 let ordinal = keys
                     .term_ords(document)
                     .next()
-                    .expect("Indexed revision always has a key");
+                    .expect("Indexed memory always has a key");
                 keys.ord_to_str(ordinal, &mut key)
-                    .expect("Indexed revision key must be readable");
+                    .expect("Indexed memory key must be readable");
 
-                (score, Reverse(key), versions.get_val(document))
+                (score, Reverse(key))
             }
         });
         let (documents, total) = searcher.search(query, &(collector, Count))?;
         let mut hits = Vec::with_capacity(documents.len());
 
-        for ((score, _, _), address) in documents {
+        for ((score, _), address) in documents {
             let document: TantivyDocument = searcher.doc(address)?;
             let memory: MemoryRecord = serde_json::from_str(
                 document
                     .get_first(self.fields.metadata)
                     .and_then(|value| value.as_str())
-                    .context("Indexed revision has no stored record")?,
+                    .context("Indexed memory has no stored record")?,
             )?;
             hits.push(SearchHit {
                 key: memory.key,
                 title: memory.title,
                 body: memory.body,
-                version: memory.system_version,
+                system_token: memory.system_token,
                 score,
                 metadata: memory.metadata,
                 r#type: memory.r#type,
-                author: memory.author,
                 tags: memory.tags,
                 references: memory.references,
                 system_created_at: memory.system_created_at,
                 system_updated_at: memory.system_updated_at,
-                system_deleted_at: memory.system_deleted_at,
                 system_created_by: memory.system_created_by,
                 system_updated_by: memory.system_updated_by,
-                system_deleted_by: memory.system_deleted_by,
             });
         }
 
@@ -579,7 +504,6 @@ fn build_schema() -> (Schema, SearchFields) {
     let fields = SearchFields {
         id: builder.add_u64_field("id", FAST),
         key: builder.add_text_field("key", STRING | STORED | FAST),
-        version: builder.add_i64_field("version", STORED | FAST),
         title: builder.add_text_field("title", text_options.clone()),
         summary: builder.add_text_field("summary", text_options.clone()),
         scope: builder.add_text_field("scope", STRING),
@@ -587,10 +511,6 @@ fn build_schema() -> (Schema, SearchFields) {
         metadata: builder.add_text_field("metadata", STORED),
         body: builder.add_text_field("body", text_options),
         memory_type: builder.add_text_field("type", STRING),
-        is_current: builder.add_u64_field("is_current", FAST | tantivy::schema::INDEXED),
-        is_deleted: builder.add_u64_field("is_deleted", FAST | tantivy::schema::INDEXED),
-        valid_from: builder.add_i64_field("valid_from", FAST),
-        valid_until: builder.add_i64_field("valid_until", FAST),
         tags: builder.add_text_field("tags", STRING),
     };
 

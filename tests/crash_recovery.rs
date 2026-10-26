@@ -17,7 +17,12 @@ struct ServerProcess {
 }
 
 impl ServerProcess {
-    fn start(directory: &Path, socket: &Path, fault: Option<&str>, label: &str) -> Self {
+    fn start(
+        directory: &Path,
+        socket: &Path,
+        fault: Option<&str>,
+        label: &str,
+    ) -> Self {
         let log = directory.join(format!("{label}.log"));
         let output = File::create(&log).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_semmem"));
@@ -46,7 +51,10 @@ impl ServerProcess {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    async fn wait_ready(&mut self, socket: &Path) -> Client {
+    async fn wait_ready(
+        &mut self,
+        socket: &Path,
+    ) -> Client {
         let client = Client::builder()
             .unix_socket(socket)
             .no_proxy()
@@ -96,7 +104,11 @@ impl Drop for ServerProcess {
     }
 }
 
-async fn invoke(client: &Client, operation: &str, arguments: Value) -> Value {
+async fn invoke(
+    client: &Client,
+    operation: &str,
+    arguments: Value,
+) -> Value {
     let response = client
         .post(format!("http://localhost/api/{operation}"))
         .json(&arguments)
@@ -114,19 +126,29 @@ async fn invoke(client: &Client, operation: &str, arguments: Value) -> Value {
 async fn assert_recovers_after_crash(fault: &str) {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("service.sock");
-    let mut initial = ServerProcess::start(directory.path(), &socket, None, "initialize");
+    let mut initial = ServerProcess::start(
+        directory.path(),
+        &socket,
+        None,
+        "initialize",
+    );
     initial.wait_ready(&socket).await;
     drop(initial);
 
     let mut interrupted =
-        ServerProcess::start(directory.path(), &socket, Some(fault), "interrupted");
+        ServerProcess::start(
+            directory.path(),
+            &socket,
+            Some(fault),
+            "interrupted",
+        );
     let client = interrupted.wait_ready(&socket).await;
     let markdown =
         "# Durable memory\n\ncrashrecoveryneedle café 日本語 🦀\n\nExact trailing bytes.\n";
     let input = json!({
         "key": "crash-recovery",
         "title": "Durable memory",
-        "author":"test author", "body": markdown,
+        "body": markdown,
         "type": "note",
         "tags": ["recovery"],
         "references": [],
@@ -137,7 +159,7 @@ async fn assert_recovers_after_crash(fault: &str) {
         "verified_at": 2000,
         "review_after": 3000
     });
-    let arguments = json!({"memories": [input]});
+    let arguments = json!({"commit_summary":"Test change", "memories": [input]});
     let response = client
         .post("http://localhost/api/create_memories")
         .json(&arguments)
@@ -158,28 +180,38 @@ async fn assert_recovers_after_crash(fault: &str) {
     drop(client);
 
     let persisted = Store::open_read_only(directory.path().join("memory.sqlite3")).unwrap();
-    let committed = persisted.get_memory("crash-recovery", false).unwrap();
+    let committed = persisted.get_memory("crash-recovery").unwrap();
     assert_eq!(
         committed.body, markdown,
         "SQLite lost committed text at {fault}."
     );
-    assert_eq!(committed.system_version, 1);
+    assert!(!committed.system_token.is_empty());
+    let original_token = committed.system_token.clone();
     assert_eq!(
         committed.metadata.summary.as_deref(),
         Some("Durable manual summary")
     );
-    let integrity: String = persisted
-        .connection()
+    let inspection = rusqlite::Connection::open_with_flags(directory.path().join("memory.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let integrity: String = inspection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(integrity, "ok");
     drop(persisted);
 
-    let mut recovered = ServerProcess::start(directory.path(), &socket, None, "recovered");
+    let mut recovered = ServerProcess::start(
+        directory.path(),
+        &socket,
+        None,
+        "recovered",
+    );
     let client = recovered.wait_ready(&socket).await;
-    let fetched = invoke(&client, "get_memories", json!({"keys": ["crash-recovery"]})).await;
+    let fetched = invoke(
+        &client,
+        "get_memories",
+        json!({"keys": ["crash-recovery"]}),
+    ).await;
     assert_eq!(fetched["memories"][0]["body"], markdown);
-    assert_eq!(fetched["memories"][0]["system_version"], 1);
+    assert_eq!(fetched["memories"][0]["system_token"], original_token);
     assert_eq!(fetched["memories"][0]["tags"], json!(["recovery"]));
     assert_eq!(fetched["memories"][0]["summary"], "Durable manual summary");
     assert_eq!(fetched["memories"][0]["observed_at"], 1000);
@@ -197,17 +229,18 @@ async fn assert_recovers_after_crash(fault: &str) {
         "Recovery duplicated or lost an index document at {fault}."
     );
     assert_eq!(search["hits"][0]["key"], "crash-recovery");
-    assert_eq!(search["hits"][0]["version"], 1);
+    assert_eq!(search["hits"][0]["system_token"], original_token);
 
-    let retried = invoke(&client, "create_memories", arguments).await;
-    assert_eq!(retried["memories"][0]["system_version"], 1);
-    let history = invoke(
+    let retried = invoke(
         &client,
-        "list_memory_revisions",
-        json!({"key": "crash-recovery"}),
-    )
-    .await;
-    assert_eq!(history["memories"].as_array().unwrap().len(), 1);
+        "create_memories",
+        arguments,
+    ).await;
+    assert_eq!(retried["memories"][0]["system_token"], original_token);
+    let audit = invoke(&client, "list_commits", json!({})).await;
+    let domain_commits = audit["commits"].as_array().unwrap().iter().filter(|commit| commit["operation"] == "create_memories").count();
+    assert_eq!(domain_commits, 1);
+
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,18 +266,23 @@ async fn assert_rebuilds_search_index(is_corrupted: bool) {
     let data = directory.path().join("data");
     fs::create_dir(&data).unwrap();
     let socket = data.join("service.sock");
-    let mut initial = ServerProcess::start(&data, &socket, None, "initialize");
+    let mut initial = ServerProcess::start(
+        &data,
+        &socket,
+        None,
+        "initialize",
+    );
     let client = initial.wait_ready(&socket).await;
-    invoke(
+    let created = invoke(
         &client,
         "create_memories",
-        json!({"memories": [{"key": "rebuild", "author":"test author", "body": "rebuildneedle café 日本語\n"}]}),
+        json!({"commit_summary":"Test change", "memories": [{"key": "rebuild", "body": "rebuildneedle café 日本語\n"}]}),
     )
     .await;
     invoke(
         &client,
         "update_memories",
-        json!({"memories": [{"key": "rebuild", "expected_version": 1, "body": "rebuildcurrent replacement"}]}),
+        json!({"commit_summary":"Test change", "memories": [{"key": "rebuild", "expected_token": created["memories"][0]["system_token"], "body": "rebuildcurrent replacement"}]}),
     )
     .await;
     drop(client);
@@ -257,26 +295,37 @@ async fn assert_rebuilds_search_index(is_corrupted: bool) {
         fs::rename(data.join("search"), directory.path().join("search.saved")).unwrap();
     }
 
-    let mut restarted = ServerProcess::start(&data, &socket, None, "restarted");
+    let mut restarted = ServerProcess::start(
+        &data,
+        &socket,
+        None,
+        "restarted",
+    );
     let client = restarted.wait_ready(&socket).await;
     let found = invoke(
         &client,
         "search_memories",
-        json!({"query": "rebuildneedle", "history": true, "fuzzy": false}),
+        json!({"query": "rebuildcurrent", "fuzzy": false}),
     )
     .await;
     assert_eq!(found["total"], 1);
     assert_eq!(found["hits"][0]["key"], "rebuild");
-    assert_eq!(found["hits"][0]["version"], 1);
+    let old = invoke(&client, "search_memories", json!({"query": "rebuildneedle", "fuzzy": false})).await;
+    assert_eq!(old["total"], 0);
+    for entry in fs::read_dir(&data).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with("search.replaced."));
+        assert!(!name.starts_with("search.damaged."));
+    }
     let fetched = invoke(
         &client,
         "get_memories",
-        json!({"keys": ["rebuild"], "version": 1}),
+        json!({"keys": ["rebuild"]}),
     )
     .await;
     assert_eq!(
         fetched["memories"][0]["body"],
-        "rebuildneedle café 日本語\n"
+        "rebuildcurrent replacement"
     );
 }
 
@@ -296,7 +345,12 @@ async fn refuses_regular_file_socket_path_without_changing_its_contents() {
     let socket = directory.path().join("valuable.txt");
     let original = b"Existing user document.\n";
     fs::write(&socket, original).unwrap();
-    let mut process = ServerProcess::start(directory.path(), &socket, None, "invalid-socket");
+    let mut process = ServerProcess::start(
+        directory.path(),
+        &socket,
+        None,
+        "invalid-socket",
+    );
     let status = process.wait_exit().await;
     assert!(
         !status.success(),
@@ -311,7 +365,12 @@ async fn refuses_live_socket_without_displacing_its_listener() {
     let socket = directory.path().join("existing.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let original_inode = fs::metadata(&socket).unwrap().ino();
-    let mut process = ServerProcess::start(directory.path(), &socket, None, "occupied-socket");
+    let mut process = ServerProcess::start(
+        directory.path(),
+        &socket,
+        None,
+        "occupied-socket",
+    );
     let status = process.wait_exit().await;
     assert!(
         !status.success(),

@@ -11,8 +11,8 @@ use comfy_table::{ContentArrangement, Table};
 use serde_json::{Value, json};
 
 use crate::models::{
-    Basis, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryMetadata, MemoryRecord,
-    MemoryReference, MemoryVersion, MemoryView, MetadataPatch, RestoreMemory, SearchRequest,
+    Basis, CreateMemory, GetCommits, GetMemories, ListCommits, ListMemories, MemoryMetadata, MemoryRecord,
+    MemoryReference, MemoryToken, MemoryView, MetadataPatch, SearchRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -70,16 +70,6 @@ pub enum Command {
         exact: bool,
         #[arg(long)]
         prefix: bool,
-        #[arg(long, conflicts_with = "as_of")]
-        history: bool,
-        #[arg(
-            long,
-            allow_hyphen_values = true,
-            help = "Search the snapshot at UTC Unix milliseconds."
-        )]
-        as_of: Option<i64>,
-        #[arg(long)]
-        include_deleted: bool,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
@@ -90,16 +80,12 @@ pub enum Command {
     LIST(BrowseArguments),
     #[command(
         name = "show",
-        about = "Read complete memories or historical versions."
+        about = "Read complete current memories."
     )]
     SHOW {
         keys: Vec<String>,
         #[arg(long, value_enum, default_value = "full")]
         view: MemoryView,
-        #[arg(long)]
-        include_deleted: bool,
-        #[arg(long)]
-        version: Option<i64>,
     },
     #[command(
         name = "add",
@@ -117,7 +103,7 @@ pub enum Command {
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
-        author: Option<String>,
+        message: Option<String>,
         #[arg(long)]
         r#type: Option<String>,
         #[arg(long = "tag")]
@@ -129,56 +115,25 @@ pub enum Command {
         name = "edit",
         about = "Edit a memory as Markdown with YAML frontmatter."
     )]
-    EDIT { key: String },
+    EDIT {
+        key: String,
+        #[arg(long)]
+        message: Option<String>,
+    },
     #[command(
         name = "delete",
-        about = "Move a memory to the recoverable deleted state."
+        about = "Permanently delete a memory and its incoming references."
     )]
-    DELETE(VersionArguments),
-    #[command(
-        name = "purge",
-        about = "Permanently remove a memory and its history. This requires --confirm."
-    )]
-    PURGE {
-        #[command(flatten)]
-        version: VersionArguments,
-        #[arg(long, required = true)]
-        confirm: bool,
-    },
-    #[command(
-        name = "restore",
-        about = "Restore a deleted memory or an earlier revision."
-    )]
-    RESTORE {
-        #[command(flatten)]
-        version: VersionArguments,
-        #[arg(long)]
-        revision: Option<i64>,
-    },
-    #[command(name = "history", about = "Inspect a memory's revision history.")]
-    HISTORY {
-        key: String,
+    DELETE(TokenArguments),
+    #[command(name = "commits", about = "List audit commits, newest first.")]
+    COMMITS {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
-        before_version: Option<i64>,
+        cursor: Option<String>,
     },
-    #[command(
-        name = "register",
-        about = "Register an author for memory attribution."
-    )]
-    REGISTER {
-        #[command(subcommand)]
-        resource: AuthorCommand,
-    },
-    #[command(
-        name = "deregister",
-        about = "Deregister an unused author. Referenced authors cannot be deregistered."
-    )]
-    DEREGISTER {
-        #[command(subcommand)]
-        resource: AuthorCommand,
-    },
+    #[command(name = "commit", about = "Read audit commits by ID.")]
+    COMMIT { ids: Vec<i64> },
     #[command(
         name = "taxonomy",
         about = "List, create, rename, or delete types, tags, and reference types."
@@ -189,13 +144,6 @@ pub enum Command {
         #[command(subcommand)]
         action: TaxonomyAction,
     },
-}
-
-#[derive(Debug, Subcommand)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum AuthorCommand {
-    #[command(name = "author", about = "Choose the author name.")]
-    AUTHOR { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -253,8 +201,6 @@ pub struct BrowseArguments {
     referenced_to: Option<String>,
     #[arg(long)]
     referenced_from: Option<String>,
-    #[arg(long)]
-    include_deleted: bool,
     #[arg(long, default_value_t = 20)]
     limit: usize,
     #[arg(long)]
@@ -262,10 +208,12 @@ pub struct BrowseArguments {
 }
 
 #[derive(Debug, Args)]
-pub struct VersionArguments {
+pub struct TokenArguments {
     key: String,
     #[arg(long)]
-    expected_version: i64,
+    expected_token: String,
+    #[arg(long)]
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -294,17 +242,21 @@ pub enum TaxonomyAction {
         key: String,
         name: String,
         #[arg(long)]
-        author: String,
+        message: String,
     },
     #[command(name = "update")]
     UPDATE {
         key: String,
         name: String,
         #[arg(long)]
-        author: String,
+        message: String,
     },
     #[command(name = "delete")]
-    DELETE { key: String },
+    DELETE {
+        key: String,
+        #[arg(long)]
+        message: String,
+    },
 }
 
 pub fn parse_cli() -> Cli {
@@ -367,7 +319,11 @@ impl LocalClient {
         Ok(Self { client })
     }
 
-    pub async fn request(&self, operation: &str, arguments: Value) -> Result<Value> {
+    pub async fn request(
+        &self,
+        operation: &str,
+        arguments: Value,
+    ) -> Result<Value> {
         let response = self
             .client
             .post(format!("http://localhost/api/{operation}"))
@@ -419,8 +375,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::START => crate::lifecycle::execute("start").await?,
         Command::STOP => crate::lifecycle::execute("stop").await?,
         Command::STATUS => crate::lifecycle::execute("status").await?,
-        Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit, history, as_of, include_deleted } => {
-            let request = SearchRequest { query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit, history, as_of, include_deleted };
+        Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit } => {
+            let request = SearchRequest { query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit };
             client.request("search_memories", serde_json::to_value(request)?).await?
         },
         Command::LIST(arguments) => {
@@ -431,27 +387,29 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 tags: arguments.tags,
                 referenced_to: arguments.referenced_to,
                 referenced_from: arguments.referenced_from,
-                include_deleted: arguments.include_deleted,
                 limit: arguments.limit,
                 cursor: arguments.cursor,
             };
             client.request("list_memories", serde_json::to_value(request)?).await?
         },
-        Command::SHOW { keys, view, include_deleted, version } => {
-            client.request("get_memories", serde_json::to_value(GetMemories { keys, view, include_deleted, version })?).await?
+        Command::SHOW { keys, view } => {
+            client.request("get_memories", serde_json::to_value(GetMemories { keys, view })?).await?
         },
-        Command::ADD { key, no_input, metadata, title, r#type, tags, references, author } => {
+        Command::ADD { key, no_input, metadata, title, r#type, tags, references, message } => {
+            if no_input && message.as_ref().is_none_or(|message| message.trim().is_empty()) {
+                bail!("An audit message is required with --no-input. Supply --message.");
+            }
+
             let mut fields = NewMemoryFields { key, title, r#type, metadata: metadata.into(), tags, references };
 
             if !no_input {
-                prompt_missing_metadata(&mut std::io::stdin().lock(), &mut std::io::stderr().lock(), &mut fields)?;
+                prompt_missing_metadata(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stderr().lock(),
+                    &mut fields,
+                )?;
             }
 
-            let author = match author {
-                Some(author) => validate_author(author)?,
-                None if no_input => bail!("An author is required with --no-input. Supply --author."),
-                None => prompt_author(&client).await?,
-            };
             let key = fields.key.context("A key is required with --no-input.")?;
             let title = fields.title.unwrap_or_default();
             let r#type = fields.r#type.unwrap_or_else(|| "general".into());
@@ -465,11 +423,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let memory = CreateMemory { key, title, body, metadata: create_metadata(fields.metadata), r#type, tags: fields.tags, references: fields.references, author };
-            let result = client.request("create_memories", json!({"memories": [memory]})).await;
+            let memory = CreateMemory { key, title, body, metadata: create_metadata(fields.metadata), r#type, tags: fields.tags, references: fields.references };
+            let commit_summary = resolve_message(message, !no_input).with_context(|| format!("The draft was preserved at {}.", draft.path.display()))?;
+            let result = client.request("create_memories", json!({"memories": [memory], "commit_summary": commit_summary})).await;
             finish_draft(draft, result)?
         },
-        Command::EDIT { key } => {
+        Command::EDIT { key, message } => {
             let value = client.request("get_memories", json!({"keys": [&key]})).await?;
             let memory = decode_memory(&value)?;
             let original = crate::document::encode_memory(&memory)?;
@@ -477,7 +436,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let edited = draft.read()?;
 
             if edited == original {
-                eprintln!("No changes were made. No revision was created.");
+                eprintln!("No changes were made. No change was saved.");
                 draft.discard()?;
 
                 return Ok(());
@@ -491,37 +450,27 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 || request.title.as_ref().is_some_and(|title| title != &memory.title)
                 || request.r#type.as_ref().is_some_and(|r#type| r#type != &memory.r#type)
                 || request.tags.as_ref().is_some_and(|tags| tags != &memory.tags)
-                || request.references.as_ref().is_some_and(|references| references != &memory.references)
-                || request.author.as_ref().is_some_and(|author| author != &memory.author);
+                || request.references.as_ref().is_some_and(|references| references != &memory.references);
 
             if !has_changes {
-                eprintln!("No changes were made. No revision was created.");
+                eprintln!("No changes were made. No change was saved.");
                 draft.discard()?;
 
                 return Ok(());
             }
 
-            let result = client.request("update_memories", json!({"memories": [request]})).await;
+            let commit_summary = resolve_message(message, std::io::stdin().is_terminal()).with_context(|| format!("The draft was preserved at {}.", draft.path.display()))?;
+            let result = client.request("update_memories", json!({"memories": [request], "commit_summary": commit_summary})).await;
             finish_draft(draft, result)?
         },
         Command::DELETE(arguments) => {
-            client.request("delete_memories", json!({"memories": [MemoryVersion {key: arguments.key, expected_version: arguments.expected_version}]})).await?
+            client.request("delete_memories", json!({"memories": [MemoryToken {key: arguments.key, expected_token: arguments.expected_token}], "commit_summary": validate_message(arguments.message)?})).await?
         },
-        Command::PURGE { version, .. } => {
-            client.request("purge_memories", json!({"memories": [MemoryVersion {key: version.key, expected_version: version.expected_version}]})).await?
+        Command::COMMITS { limit, cursor } => {
+            client.request("list_commits", serde_json::to_value(ListCommits { limit, cursor })?).await?
         },
-        Command::RESTORE { version, revision } => {
-            let request = RestoreMemory {key: version.key, expected_version: version.expected_version, revision};
-            client.request("restore_memories", json!({"memories": [request]})).await?
-        },
-        Command::HISTORY { key, limit, before_version } => {
-            client.request("list_memory_revisions", serde_json::to_value(HistoryRequest { key, limit, before_version })?).await?
-        },
-        Command::REGISTER { resource: AuthorCommand::AUTHOR { name } } => {
-            client.request("register_author", json!({"author": validate_author(name)?})).await?
-        },
-        Command::DEREGISTER { resource: AuthorCommand::AUTHOR { name } } => {
-            client.request("deregister_author", json!({"author": validate_author(name)?})).await?
+        Command::COMMIT { ids } => {
+            client.request("get_commits", serde_json::to_value(GetCommits { ids })?).await?
         },
         Command::TAXONOMY { category, action } => {
             let (list, suffix) = match category {
@@ -532,9 +481,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
             match action {
                 TaxonomyAction::LIST { limit, cursor } => client.request(list, json!({"limit": limit, "cursor": cursor})).await?,
-                TaxonomyAction::CREATE { key, name, author } => client.request(&format!("create_{suffix}"), json!({"key": key, "name": name, "author": validate_author(author)?})).await?,
-                TaxonomyAction::UPDATE { key, name, author } => client.request(&format!("update_{suffix}"), json!({"key": key, "name": name, "author": validate_author(author)?})).await?,
-                TaxonomyAction::DELETE { key } => client.request(&format!("delete_{suffix}"), json!({"key": key})).await?,
+                TaxonomyAction::CREATE { key, name, message } => client.request(&format!("create_{suffix}"), json!({"key": key, "name": name, "commit_summary": validate_message(message)?})).await?,
+                TaxonomyAction::UPDATE { key, name, message } => client.request(&format!("update_{suffix}"), json!({"key": key, "name": name, "commit_summary": validate_message(message)?})).await?,
+                TaxonomyAction::DELETE { key, message } => client.request(&format!("delete_{suffix}"), json!({"key": key, "commit_summary": validate_message(message)?})).await?,
             }
         },
     };
@@ -555,103 +504,33 @@ fn create_metadata(metadata: MemoryMetadata) -> MetadataPatch {
     }
 }
 
-fn validate_author(author: String) -> Result<String> {
-    if author.trim().is_empty() || author.chars().any(char::is_control) {
-        bail!("The author must be nonempty and contain no control characters.");
+fn validate_message(message: String) -> Result<String> {
+    if message.trim().is_empty() {
+        bail!("An audit message is required. Supply --message with a nonblank change summary.");
     }
 
-    Ok(author.trim().to_owned())
+    Ok(message.trim().to_owned())
 }
 
-async fn prompt_author(client: &LocalClient) -> Result<String> {
-    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        let response = client.request("list_authors", json!({})).await?;
-        let authors = response
-            .get("items")
-            .and_then(Value::as_array)
-            .context("The service returned an invalid author list.")?;
-        let choices: Vec<&str> = authors
-            .iter()
-            .filter_map(|item| item.get("author").and_then(Value::as_str))
-            .collect();
+fn resolve_message(message: Option<String>, can_prompt: bool) -> Result<String> {
+    if let Some(message) = message {
+        return validate_message(message);
+    }
 
-        if let Some(author) = select_author(&choices)? {
-            return Ok(author);
-        }
+    if !can_prompt {
+        bail!("An audit message is required for noninteractive writes. Supply --message.");
     }
 
     loop {
-        let author = prompt_line(
+        let message = prompt_line(
             &mut std::io::stdin().lock(),
             &mut std::io::stderr().lock(),
-            "Author (required)",
+            "Change summary (required)",
         )?;
 
-        match validate_author(author) {
-            Ok(author) => return Ok(author),
+        match validate_message(message) {
+            Ok(message) => return Ok(message),
             Err(error) => eprintln!("{error}"),
-        }
-    }
-}
-
-fn select_author(authors: &[&str]) -> Result<Option<String>> {
-    use crossterm::cursor::MoveToColumn;
-    use crossterm::event::{Event, KeyCode, KeyEventKind, read};
-    use crossterm::execute;
-    use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
-
-    struct RawTerminal;
-
-    impl Drop for RawTerminal {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-        }
-    }
-
-    let mut output = std::io::stderr();
-    writeln!(
-        output,
-        "Author: use Up/Down and Enter; the blank option enters a new author."
-    )?;
-    enable_raw_mode()?;
-    let terminal = RawTerminal;
-    let mut selected = 0;
-
-    loop {
-        execute!(output, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        write!(output, "> {}", authors.get(selected).copied().unwrap_or(""))?;
-        output.flush()?;
-
-        if let Event::Key(key) = read()? {
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Up => {
-                    selected = if selected == 0 {
-                        authors.len()
-                    } else {
-                        selected - 1
-                    }
-                }
-                KeyCode::Down => selected = (selected + 1) % (authors.len() + 1),
-                KeyCode::Enter => {
-                    drop(terminal);
-                    writeln!(output)?;
-
-                    return Ok(authors.get(selected).map(|author| (*author).to_owned()));
-                }
-                KeyCode::Esc => bail!("Author selection was cancelled. No memory was created."),
-                KeyCode::Char('c')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    bail!("Author selection was cancelled. No memory was created.");
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -665,7 +544,11 @@ struct NewMemoryFields {
     references: Vec<MemoryReference>,
 }
 
-fn prompt_line(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
+fn prompt_line(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+) -> Result<String> {
     write!(output, "{label}: ")?;
     output.flush()?;
     let mut value = String::new();
@@ -691,7 +574,11 @@ fn prompt_timestamp(
     label: &str,
 ) -> Result<Option<i64>> {
     loop {
-        let value = prompt_line(input, output, label)?;
+        let value = prompt_line(
+            input,
+            output,
+            label,
+        )?;
 
         if value.trim().is_empty() {
             return Ok(None);
@@ -712,7 +599,11 @@ fn prompt_optional_text(
     output: &mut impl Write,
     label: &str,
 ) -> Result<Option<String>> {
-    let value = prompt_line(input, output, label)?;
+    let value = prompt_line(
+        input,
+        output,
+        label,
+    )?;
 
     Ok((!value.trim().is_empty()).then_some(value))
 }
@@ -723,7 +614,11 @@ fn prompt_missing_metadata(
     fields: &mut NewMemoryFields,
 ) -> Result<()> {
     while fields.key.is_none() {
-        let key = prompt_line(input, output, "Key (required)")?;
+        let key = prompt_line(
+            input,
+            output,
+            "Key (required)",
+        )?;
 
         if key.trim().is_empty() || key.trim() != key || key.chars().any(char::is_control) {
             writeln!(
@@ -737,7 +632,11 @@ fn prompt_missing_metadata(
 
     if fields.title.is_none() {
         let default = fields.key.as_deref().expect("The key has been collected.");
-        let value = prompt_line(input, output, &format!("Title [{default}]"))?;
+        let value = prompt_line(
+            input,
+            output,
+            &format!("Title [{default}]"),
+        )?;
         fields.title = Some(if value.trim().is_empty() {
             default.into()
         } else {
@@ -746,7 +645,11 @@ fn prompt_missing_metadata(
     }
 
     if fields.r#type.is_none() {
-        let value = prompt_line(input, output, "Type [general]")?;
+        let value = prompt_line(
+            input,
+            output,
+            "Type [general]",
+        )?;
         fields.r#type = Some(if value.trim().is_empty() {
             "general".into()
         } else {
@@ -755,7 +658,11 @@ fn prompt_missing_metadata(
     }
 
     if fields.metadata.summary.is_none() {
-        fields.metadata.summary = prompt_optional_text(input, output, "Summary (optional)")?;
+        fields.metadata.summary = prompt_optional_text(
+            input,
+            output,
+            "Summary (optional)",
+        )?;
     }
 
     if fields.metadata.basis.is_none() {
@@ -794,7 +701,11 @@ fn prompt_missing_metadata(
     }
 
     if fields.metadata.scope.is_none() {
-        fields.metadata.scope = prompt_optional_text(input, output, "Scope (optional)")?;
+        fields.metadata.scope = prompt_optional_text(
+            input,
+            output,
+            "Scope (optional)",
+        )?;
     }
 
     if fields.metadata.observed_at.is_none() {
@@ -822,7 +733,11 @@ fn prompt_missing_metadata(
     }
 
     if fields.tags.is_empty() {
-        while let Some(tag) = prompt_optional_text(input, output, "Tag (blank to finish)")? {
+        while let Some(tag) = prompt_optional_text(
+            input,
+            output,
+            "Tag (blank to finish)",
+        )? {
             if tag.trim() != tag || tag.chars().any(char::is_control) {
                 writeln!(
                     output,
@@ -934,7 +849,10 @@ impl Draft {
     }
 }
 
-fn finish_draft(draft: Draft, result: Result<Value>) -> Result<Value> {
+fn finish_draft(
+    draft: Draft,
+    result: Result<Value>,
+) -> Result<Value> {
     match result {
         Ok(value) => {
             draft.discard()?;
@@ -948,7 +866,10 @@ fn finish_draft(draft: Draft, result: Result<Value>) -> Result<Value> {
     }
 }
 
-fn print_output(value: &Value, is_json: bool) -> Result<()> {
+fn print_output(
+    value: &Value,
+    is_json: bool,
+) -> Result<()> {
     if is_json || !std::io::stdout().is_terminal() {
         crate::output::print_json(value)?;
 
@@ -959,7 +880,7 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
         .get("hits")
         .or_else(|| value.get("memories"))
         .or_else(|| value.get("items"))
-        .or_else(|| value.get("revisions"))
+        .or_else(|| value.get("commits"))
         .unwrap_or(value);
 
     if let Some(records) = records.as_array() {
@@ -972,11 +893,11 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
             "Type",
             "Scope",
             "Basis",
-            "Version",
+            "Token",
         ]);
 
         for record in records {
-            let text = ["summary", "title", "name", "author"]
+            let text = ["summary", "title", "name"]
                 .into_iter()
                 .find_map(|field| {
                     record
@@ -985,11 +906,11 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
                         .filter(|text| !text.trim().is_empty())
                 })
                 .unwrap_or("");
-            let version = record
-                .get("system_version")
-                .or_else(|| record.get("version"))
-                .map(Value::to_string)
-                .unwrap_or_default();
+            let token = record
+                .get("system_token")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             table.add_row([
                 record
                     .get("key")
@@ -1008,7 +929,7 @@ fn print_output(value: &Value, is_json: bool) -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                version,
+                token,
             ]);
         }
 

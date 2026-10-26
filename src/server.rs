@@ -61,8 +61,17 @@ pub async fn run(
 
     let remote = match (issuer, audience, public_url) {
         (Some(issuer), Some(audience), Some(public_url)) => {
-            let auth = Arc::new(OAuth::discover(issuer, audience, public_url.clone()).await?);
-            let application = remote_router(service, auth, &public_url, cancellation.clone())?;
+            let auth = Arc::new(OAuth::discover(
+                issuer,
+                audience,
+                public_url.clone(),
+            ).await?);
+            let application = remote_router(
+                service,
+                auth,
+                &public_url,
+                cancellation.clone(),
+            )?;
             let tcp = TcpListener::bind(listen).await?;
             tracing::info!(%listen, "Remote OAuth-protected MCP listener ready");
             let remote_cancel = cancellation.clone();
@@ -174,7 +183,11 @@ async fn local_operation(
     Path(operation): Path<String>,
     Json(arguments): Json<Value>,
 ) -> Response {
-    match tokio::task::spawn_blocking(move || service.dispatch(&operation, arguments, "human"))
+    match tokio::task::spawn_blocking(move || service.dispatch(
+        &operation,
+        arguments,
+        "human",
+    ))
         .await
     {
         Ok(Ok(value)) => Json(value).into_response(),
@@ -190,11 +203,10 @@ fn error_response(error: AppError) -> Response {
     let status = match error.code.as_str() {
         "invalid_input" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
-        "version_conflict"
+        "token_conflict"
         | "already_exists"
         | "referenced"
         | "referenced_taxonomy"
-        | "referenced_author"
         | "default_type" => StatusCode::CONFLICT,
         "database_busy" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

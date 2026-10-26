@@ -64,7 +64,10 @@ esac
         }
     }
 
-    fn configure(&self, command: &mut Command) {
+    fn configure(
+        &self,
+        command: &mut Command,
+    ) {
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         command
             .env("PATH", path)
@@ -78,7 +81,10 @@ esac
             .env_remove("SEMMEM_BINARY");
     }
 
-    fn cli(&self, action: &str) -> Command {
+    fn cli(
+        &self,
+        action: &str,
+    ) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_semmem"));
         self.configure(&mut command);
         command.args(["--json", action]);
@@ -95,7 +101,10 @@ esac
     }
 }
 
-fn write_executable(path: &Path, body: &str) {
+fn write_executable(
+    path: &Path,
+    body: &str,
+) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }

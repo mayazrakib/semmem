@@ -37,7 +37,10 @@ async fn systemctl(arguments: &[&str]) -> Result<Output> {
         .context("Could not execute systemctl --user. Use a Linux installation with systemd and a running user manager.")
 }
 
-fn ensure_success(output: &Output, action: &str) -> Result<()> {
+fn ensure_success(
+    output: &Output,
+    action: &str,
+) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }

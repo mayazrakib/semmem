@@ -27,7 +27,7 @@ Select the socket with `--socket` or `SEMMEM_SOCKET`. Without OAuth configuratio
 
 ## Private ChatGPT tunnel
 
-The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and uses the trusted private MCP identity for system audit attribution. Content author is supplied separately. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
+The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and uses the trusted private MCP identity for system audit attribution. Every mutation requires a nonempty `commit_summary`. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
 
 For OpenAI Secure MCP Tunnel, create a dedicated tunnel associated with the intended ChatGPT workspace. Store the runtime key in a private file outside this repository and use a file reference. An example foreground launch is:
 
@@ -92,19 +92,23 @@ Scopes are independent:
 
 | Scope | Operations |
 |---|---|
-| `memory:read` | MCP discovery and session requests, search, reads, browsing, taxonomy lists, and history |
-| `memory:write` | Memory creation, updates, soft deletion, restoration, and taxonomy writes |
-| `memory:purge` | Permanent memory purges |
+| `memory:read` | MCP discovery and session requests, search, reads, browsing, taxonomy lists, and commit audit reads |
+| `memory:write` | Memory creation, updates, and taxonomy writes |
+| `memory:purge` | Permanent memory deletion |
 
 Give a client all scopes needed by its workflow. A write-only token does not substitute for `memory:read` during MCP initialization. The local socket uses filesystem access control instead of OAuth and permits all operations. It is intended for the service account's CLI access, not exposure through the public reverse proxy.
 
 Remote writes are attributed to `ai client`; local writes are attributed to `human`. Actor labels describe the interface used and do not provide a per-user audit identity.
 
-## Editing and recovery
+## Editing and Audit
 
-`add` opens a private Markdown body draft using `VISUAL`, then `EDITOR`, then `vim`. `edit KEY` opens the complete memory object as YAML frontmatter followed by its Markdown body. Editor command arguments and quoted executable paths are supported. The frontmatter exposes title, type, tags, references, and all six revision metadata fields. Content author is editable. Internal IDs, the key, and system metadata are read-only; changing them rejects the save. Optional fields can be cleared with YAML `null`. The body after the closing frontmatter delimiter is preserved exactly. The database transaction starts after the editor exits.
+Every mutating CLI command requires `--message "Describe the change."`. MCP mutation envelopes require `commit_summary`. The optional memory `summary` remains separate. Reads return an opaque `system_token`; existing-record writes require that value as `expected_token` through MCP or `--expected-token` where exposed by the CLI. The editor reads and preserves its concurrency token automatically. Conflicts require rereading and reconciling current state.
 
-Editor errors, invalid UTF-8, version conflicts, and service errors preserve the draft and print its path. Successful saves remove the temporary draft. Search produces structured JSON by default, and `--json` selects structured output for other commands. An unchanged edit creates no revision. When a write error reports that the write was committed, read the current memory before retrying.
+`add` opens a private Markdown body draft using `VISUAL`, then `EDITOR`, then `vim`. `edit KEY` opens the complete memory object as YAML frontmatter followed by its Markdown body. Editor command arguments and quoted executable paths are supported. The frontmatter exposes title, type, tags, references, and all six memory metadata fields. Internal IDs, the key, and system metadata are read-only; changing them rejects the save. Optional fields can be cleared with YAML `null`. The body after the closing frontmatter delimiter is preserved exactly. The database transaction starts after the editor exits.
+
+Editor errors, invalid UTF-8, concurrency-token conflicts, and service errors preserve the draft and print its path. Successful saves remove the temporary draft. Search produces structured JSON by default, and `--json` selects structured output for other commands. An unchanged edit creates no audit commit. When a write error reports that the write was committed, read the current memory before retrying.
+
+`delete` permanently removes a memory and its incoming and outgoing references. There is no soft deletion, restoration, historical search, or separate purge operation. Remote deletion requires `memory:purge`; `memory:write` alone is insufficient. `commits` lists audit entries, and `commit` reads an audit entry. Audit entries describe mutations without storing previous bodies or snapshots.
 
 SQLite is authoritative. The search directory is derived, and the service replays pending index events or rebuilds unusable indexes during startup. A successful write response follows search-index publication. Stop the service before making a simple filesystem copy of its data directory for backup; copying a live SQLite file alone is not a consistent backup procedure.
 
@@ -112,6 +116,6 @@ These instructions describe the delivered configuration. They do not establish a
 
 ## Schema Reset Deployment
 
-The current initializer defines the new schema v1. Existing incompatible databases, including legacy v1 databases, are rejected without migration. Build and verify the default-feature release before deployment.
+The current initializer defines schema v2. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
 
-For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v1 and integrity, and register the desired authors. Verify actual MCP calls separately from tunnel health.
+For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v2 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.

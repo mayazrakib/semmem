@@ -32,21 +32,15 @@ struct Frontmatter {
     #[serde(deserialize_with = "deserialize_strict")]
     references: Vec<MemoryReference>,
     #[serde(deserialize_with = "deserialize_strict")]
-    author: String,
-    #[serde(deserialize_with = "deserialize_strict")]
     system_created_by: String,
     #[serde(deserialize_with = "deserialize_strict")]
     system_updated_by: String,
     #[serde(deserialize_with = "deserialize_strict")]
-    system_deleted_by: Option<String>,
-    #[serde(deserialize_with = "deserialize_strict")]
-    system_version: i64,
+    system_token: String,
     #[serde(deserialize_with = "deserialize_strict")]
     system_created_at: i64,
     #[serde(deserialize_with = "deserialize_strict")]
     system_updated_at: i64,
-    #[serde(deserialize_with = "deserialize_strict")]
-    system_deleted_at: Option<i64>,
 }
 
 fn deserialize_strict<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
@@ -91,21 +85,21 @@ pub fn encode_memory(memory: &MemoryRecord) -> Result<String> {
         r#type: memory.r#type.clone(),
         tags: memory.tags.clone(),
         references: memory.references.clone(),
-        author: memory.author.clone(),
         system_created_by: memory.system_created_by.clone(),
         system_updated_by: memory.system_updated_by.clone(),
-        system_deleted_by: memory.system_deleted_by.clone(),
-        system_version: memory.system_version,
+        system_token: memory.system_token.clone(),
         system_created_at: memory.system_created_at,
         system_updated_at: memory.system_updated_at,
-        system_deleted_at: memory.system_deleted_at,
     };
     let yaml = serde_yaml_ng::to_string(&fields).context("Could not encode memory frontmatter.")?;
 
     Ok(format!("---\n{yaml}---\n{}", memory.body))
 }
 
-pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMemory> {
+pub fn decode_memory(
+    document: &str,
+    original: &MemoryRecord,
+) -> Result<UpdateMemory> {
     let (frontmatter, body) = split_document(document)?;
     let fields: Frontmatter = serde_yaml_ng::from_str(frontmatter).context(
         "The memory frontmatter is invalid. Preserve every field and use null for unknown values.",
@@ -119,12 +113,8 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         "The frontmatter field 'key' is read-only."
     );
     ensure!(
-        !fields.author.trim().is_empty(),
-        "The author must be nonempty."
-    );
-    ensure!(
-        fields.system_version == original.system_version,
-        "The frontmatter field 'system_version' is read-only."
+        fields.system_token == original.system_token,
+        "The frontmatter field 'system_token' is read-only."
     );
     ensure!(
         fields.system_created_at == original.system_created_at,
@@ -133,10 +123,6 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
     ensure!(
         fields.system_updated_at == original.system_updated_at,
         "The frontmatter field 'system_updated_at' is read-only."
-    );
-    ensure!(
-        fields.system_deleted_at == original.system_deleted_at,
-        "The frontmatter field 'system_deleted_at' is read-only."
     );
 
     ensure!(
@@ -149,14 +135,10 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         "The frontmatter field 'system_updated_by' is read-only."
     );
 
-    ensure!(
-        fields.system_deleted_by == original.system_deleted_by,
-        "The frontmatter field 'system_deleted_by' is read-only."
-    );
 
     Ok(UpdateMemory {
         key: original.key.clone(),
-        expected_version: original.system_version,
+        expected_token: original.system_token.clone(),
         title: Some(fields.title),
         body: Some(body.to_owned()),
         metadata: MetadataPatch {
@@ -170,7 +152,6 @@ pub fn decode_memory(document: &str, original: &MemoryRecord) -> Result<UpdateMe
         r#type: Some(fields.r#type),
         tags: Some(fields.tags),
         references: Some(fields.references),
-        author: Some(fields.author),
     })
 }
 
@@ -227,15 +208,12 @@ mod tests {
                 target_key: "related".into(),
                 reference_type: "related to".into(),
             }],
-            author: "human".into(),
-            system_created_by: "human".into(),
+                system_created_by: "human".into(),
             system_updated_by: "human".into(),
-            system_deleted_by: None,
-            system_version: 3,
+                system_token: "opaque-token".into(),
             system_created_at: 100,
             system_updated_at: 200,
-            system_deleted_at: None,
-        }
+            }
     }
 
     #[test]
@@ -244,7 +222,7 @@ mod tests {
         let document = encode_memory(&original).unwrap();
         let update = decode_memory(&document, &original).unwrap();
         assert_eq!(update.key, original.key);
-        assert_eq!(update.expected_version, original.system_version);
+        assert_eq!(update.expected_token, original.system_token);
         assert_eq!(update.title.as_ref(), Some(&original.title));
         assert_eq!(update.body.as_ref(), Some(&original.body));
         assert_eq!(update.r#type.as_ref(), Some(&original.r#type));
@@ -305,11 +283,9 @@ mod tests {
             ("key: decision", "key: changed"),
             ("system_created_by: human", "system_created_by: robot"),
             ("system_updated_by: human", "system_updated_by: robot"),
-            ("system_deleted_by: null", "system_deleted_by: robot"),
-            ("system_version: 3", "system_version: 4"),
+            ("system_token: opaque-token", "system_token: another-token"),
             ("system_created_at: 100", "system_created_at: 101"),
             ("system_updated_at: 200", "system_updated_at: 201"),
-            ("system_deleted_at: null", "system_deleted_at: 9"),
         ] {
             assert!(document.contains(before));
             let error = decode_memory(&document.replace(before, after), &original).unwrap_err();
@@ -332,7 +308,7 @@ mod tests {
             "title",
             "tags",
             "references",
-            "system_deleted_at",
+            "system_token",
         ] {
             let marker = format!("{field}:");
             let edited = document
@@ -367,7 +343,11 @@ mod tests {
             "summary: Duplicate\n",
             "broken: [\n",
         ] {
-            let edited = document.replacen("---\n", &format!("---\n{prefix}"), 1);
+            let edited = document.replacen(
+                "---\n",
+                &format!("---\n{prefix}"),
+                1,
+            );
             assert!(decode_memory(&edited, &original).is_err());
         }
 
@@ -387,7 +367,6 @@ mod tests {
             ("observed_at", "10"),
             ("verified_at", "null"),
             ("review_after", "500"),
-            ("system_deleted_at", "null"),
         ] {
             let before = format!("{field}: {value}");
             assert!(document.contains(&before));
@@ -404,18 +383,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod author_tests {
+mod retired_fields_tests {
     #[test]
-    fn author_is_editable_while_audit_fields_remain_readonly() {
+    fn rejects_retired_author_frontmatter() {
         let original = super::tests::memory();
-        let document = super::encode_memory(&original)
-            .unwrap()
-            .replace("author: human", "author: Ada");
-        let update = super::decode_memory(&document, &original).unwrap();
-        assert_eq!(update.author.as_deref(), Some("Ada"));
-        assert!(
-            super::decode_memory(&document.replace("author: Ada", "author: ''"), &original)
-                .is_err()
-        );
+        let document = super::encode_memory(&original).unwrap();
+        let document = document.replacen("---\n", "---\nauthor: Ada\n", 1);
+        assert!(super::decode_memory(&document, &original).is_err());
     }
 }

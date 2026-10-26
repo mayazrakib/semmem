@@ -29,14 +29,14 @@ fn help_uses_four_space_indentation_and_complete_descriptions() {
 #[test]
 fn argument_errors_keep_their_failure_status_and_use_four_space_indentation() {
     let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
-        .args(["purge", "example"])
+        .args(["delete", "example"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("--expected-version"), "{text}");
-    assert!(text.contains("--confirm"), "{text}");
+    assert!(text.contains("--expected-token"), "{text}");
+    assert!(text.contains("--message"), "{text}");
 
     for line in text.lines() {
         let indentation = line.len() - line.trim_start_matches(' ').len();
@@ -45,7 +45,7 @@ fn argument_errors_keep_their_failure_status_and_use_four_space_indentation() {
 }
 
 #[test]
-fn search_help_exposes_new_vocabulary_and_history_options() {
+fn search_help_exposes_current_state_filters() {
     let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
         .args(["search", "--help"])
         .output()
@@ -56,25 +56,22 @@ fn search_help_exposes_new_vocabulary_and_history_options() {
     for option in [
         "--type",
         "--basis",
-        "--history",
-        "--as-of",
-        "--include-deleted",
     ] {
         assert!(text.contains(option), "{text}");
     }
 
-    for old in ["--kind", "--claim-type"] {
+    for old in ["--kind", "--claim-type", "--history", "--as-of", "--include-deleted"] {
         assert!(!text.contains(old), "{text}");
     }
 }
 
 #[test]
-fn noninteractive_add_rejects_missing_author_before_editor_or_write() {
+fn noninteractive_add_rejects_missing_message_before_editor_or_write() {
     let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
-        .args(["add", "missing-author", "--no-input"])
+        .args(["add", "missing-message", "--no-input"])
         .env("VISUAL", "/bin/false")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--author"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--message"));
 }

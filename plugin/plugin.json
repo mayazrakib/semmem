@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "semmem",
-  "version": "0.1.0",
-  "description": "Private human-readable memory with revision history and staged text retrieval.",
+  "version": "0.2.0",
+  "description": "Private current-state memory with audited writes and lexical retrieval.",
   "author": {
     "name": "mayazrakib"
   },
@@ -12,7 +12,7 @@
       "interface": {
         "displayName": "Semmem",
         "shortDescription": "Private persistent memory",
-        "longDescription": "Search and maintain human-readable memories on your WSL2 machine through a private OpenAI Secure MCP Tunnel. Supports summaries, scopes, provenance, versioned corrections, history, recoverable deletion, and restoration.",
+        "longDescription": "Search and maintain current human-readable memories through a private OpenAI Secure MCP Tunnel. Supports summaries, scopes, provenance, concurrency-safe updates, permanent deletion, and required audit messages.",
         "developerName": "mayazrakib",
         "category": "Productivity",
         "capabilities": [],

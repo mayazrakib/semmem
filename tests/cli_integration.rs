@@ -14,19 +14,18 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 #[test]
-fn purge_requires_confirmation_and_an_expected_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
-        .args(["purge", "example", "--expected-version", "1"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--confirm"));
-    let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
-        .args(["purge", "example", "--confirm"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--expected-version"));
+fn delete_requires_a_token_and_an_audit_message_and_retired_commands_are_rejected() {
+    for arguments in [
+        vec!["delete", "example", "--expected-token", "token"],
+        vec!["delete", "example", "--message", "Remove example"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_semmem")).args(arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    for command in ["history", "restore", "purge", "register", "deregister"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_semmem")).arg(command).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
 }
 
 #[derive(Clone, Default)]
@@ -49,11 +48,10 @@ async fn handle_request(
     if operation == "get_memories" {
         return (
             StatusCode::OK,
-            Json(json!({"memories": [{
+            Json(json!({"commit_summary":"Test change", "memories": [{
                 "id": 1, "key": "example", "title": "Example", "body": "Original body\n",
-                "type": "general", "tags": [], "references": [], "author": "test author", "system_created_by": "human", "system_updated_by": "human", "system_deleted_by": null,
-                "system_version": 4, "system_created_at": 1, "system_updated_at": 2,
-                "system_deleted_at": null
+                "type": "general", "tags": [], "references": [], "system_created_by": "human", "system_updated_by": "human",
+                "system_token": "fixture-token", "system_created_at": 1, "system_updated_at": 2
             }]})),
         );
     }
@@ -61,14 +59,17 @@ async fn handle_request(
     if state.has_conflict {
         return (
             StatusCode::CONFLICT,
-            Json(json!({"code": "version_conflict", "message": "A newer revision exists."})),
+            Json(json!({"code": "token_conflict", "message": "A newer change exists."})),
         );
     }
 
     (StatusCode::OK, Json(json!({"saved": arguments})))
 }
 
-async fn start_service(socket: &Path, state: ServerState) -> tokio::task::JoinHandle<()> {
+async fn start_service(
+    socket: &Path,
+    state: ServerState,
+) -> tokio::task::JoinHandle<()> {
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
     let router = Router::new()
         .route("/api/{operation}", post(handle_request))
@@ -79,7 +80,10 @@ async fn start_service(socket: &Path, state: ServerState) -> tokio::task::JoinHa
     })
 }
 
-fn write_editor(root: &Path, script: &str) -> String {
+fn write_editor(
+    root: &Path,
+    script: &str,
+) -> String {
     let path = root.join("editor with spaces");
     fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -87,14 +91,23 @@ fn write_editor(root: &Path, script: &str) -> String {
     format!("'{}'", path.display())
 }
 
-async fn run_cli(socket: &Path, editor: String, arguments: &[&str]) -> Output {
+async fn run_cli(
+    socket: &Path,
+    editor: String,
+    arguments: &[&str],
+) -> Output {
     let mut arguments = arguments.to_vec();
 
     if arguments.first() == Some(&"add") && !arguments.contains(&"--no-input") {
         arguments.push("--no-input");
     }
 
-    run_cli_with_input(socket, editor, &arguments, None).await
+    run_cli_with_input(
+        socket,
+        editor,
+        &arguments,
+        None,
+    ).await
 }
 
 async fn run_cli_with_input(
@@ -106,19 +119,12 @@ async fn run_cli_with_input(
     let socket = socket.to_path_buf();
     let mut arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
 
-    if arguments.first().is_some_and(|name| name == "add")
-        && !arguments.iter().any(|value| value == "--author")
-    {
-        arguments.extend(["--author".into(), "test author".into()]);
+    let is_write = arguments.first().is_some_and(|name| ["add", "edit", "delete"].contains(&name.as_str()))
+        || (arguments.first().is_some_and(|name| name == "taxonomy") && arguments.iter().any(|value| ["create", "update", "delete"].contains(&value.as_str())));
+    if is_write && !arguments.iter().any(|value| value == "--message") {
+        arguments.extend(["--message".into(), "Test CLI change".into()]);
     }
 
-    if arguments.first().is_some_and(|name| name == "taxonomy")
-        && arguments
-            .iter()
-            .any(|value| value == "create" || value == "update")
-    {
-        arguments.extend(["--author".into(), "test author".into()]);
-    }
     let input = input.map(str::to_owned);
 
     tokio::task::spawn_blocking(move || {
@@ -165,7 +171,12 @@ async fn interactive_add_collects_metadata_before_opening_an_empty_body_editor()
         "[ ! -s \"$1\" ] || exit 23\nprintf '# Body only\\n\\nExact café.\\n' > \"$1\"",
     );
     let input = "prompted\nPrompted title\ndecision\nManual summary\n2\nproject\n100\n200\n300\nresearch\npersistent\n\nsupports=target\n\n";
-    let output = run_cli_with_input(&socket, editor, &["add"], Some(input)).await;
+    let output = run_cli_with_input(
+        &socket,
+        editor,
+        &["add"],
+        Some(input),
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -173,7 +184,6 @@ async fn interactive_add_collects_metadata_before_opening_an_empty_body_editor()
     );
     let text = String::from_utf8(output.stdout.clone()).unwrap();
     assert!(!text.contains('\u{1b}'));
-    assert!(text.contains("\n    \"saved\": {\n        \"memories\": [\n            {"));
     let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
     let record = &stdout["saved"]["memories"][0];
     assert_eq!(record["key"], "prompted");
@@ -224,7 +234,12 @@ async fn interactive_add_reprompts_invalid_values_and_keeps_blank_metadata_unkno
         "[ ! -s \"$1\" ] || exit 23\nprintf 'Body\\n' > \"$1\"",
     );
     let input = "\nvalid-key\n\n\n\nnot-a-basis\n5\ninferred\n\nyesterday\n123\n1.5\n200\n\n\ninvalid-link\nsupports=\nsupports=target\n\n";
-    let output = run_cli_with_input(&socket, editor, &["add"], Some(input)).await;
+    let output = run_cli_with_input(
+        &socket,
+        editor,
+        &["add"],
+        Some(input),
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -342,7 +357,11 @@ async fn noninteractive_add_preserves_defaults_and_requires_a_key() {
         root.path(),
         "[ ! -s \"$1\" ] || exit 23\nprintf 'Unprompted body\\n' > \"$1\"",
     );
-    let output = run_cli(&socket, editor.clone(), &["add", "explicit", "--no-input"]).await;
+    let output = run_cli(
+        &socket,
+        editor.clone(),
+        &["add", "explicit", "--no-input"],
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -358,7 +377,11 @@ async fn noninteractive_add_preserves_defaults_and_requires_a_key() {
         assert!(record["basis"].is_null());
         assert_eq!(record["tags"], json!([]));
     }
-    let missing = run_cli(&socket, editor, &["add", "--no-input"]).await;
+    let missing = run_cli(
+        &socket,
+        editor,
+        &["add", "--no-input"],
+    ).await;
     assert!(!missing.status.success());
     assert_eq!(state.requests.lock().unwrap().len(), 1);
     server.abort();
@@ -374,7 +397,11 @@ async fn creates_markdown_using_the_quoted_visual_editor() {
         root.path(),
         "printf '# Memory\\n\\nUnicode: café ♟\\n' > \"$1\"",
     );
-    let output = run_cli(&socket, editor, &["add", "example", "--title", "Example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["add", "example", "--title", "Example"],
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -392,13 +419,17 @@ async fn creates_markdown_using_the_quoted_visual_editor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unchanged_editor_does_not_create_a_revision() {
+async fn unchanged_editor_does_not_write() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("service.sock");
     let state = ServerState::default();
     let server = start_service(&socket, state.clone()).await;
     let editor = write_editor(root.path(), "exit 0");
-    let output = run_cli(&socket, editor, &["edit", "example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["edit", "example"],
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -411,7 +442,7 @@ async fn unchanged_editor_does_not_create_a_revision() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conflict_preserves_the_edited_draft_and_sends_expected_version() {
+async fn conflict_preserves_the_edited_draft_and_sends_expected_token() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("service.sock");
     let state = ServerState {
@@ -420,10 +451,14 @@ async fn conflict_preserves_the_edited_draft_and_sends_expected_version() {
     };
     let server = start_service(&socket, state.clone()).await;
     let editor = write_editor(root.path(), "printf 'Unsaved correction\\n' >> \"$1\"");
-    let output = run_cli(&socket, editor, &["edit", "example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["edit", "example"],
+    ).await;
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("version_conflict"), "{stderr}");
+    assert!(stderr.contains("token_conflict"), "{stderr}");
     let path = stderr
         .split("The draft was preserved at ")
         .nth(1)
@@ -438,7 +473,7 @@ async fn conflict_preserves_the_edited_draft_and_sends_expected_version() {
     );
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests[1].0, "update_memories");
-    assert_eq!(requests[1].1["memories"][0]["expected_version"], 4);
+    assert_eq!(requests[1].1["memories"][0]["expected_token"], "fixture-token");
     fs::remove_file(draft).unwrap();
     server.abort();
 }
@@ -453,7 +488,11 @@ async fn editor_failure_preserves_the_draft_without_sending_a_write() {
         root.path(),
         "printf 'Recover this draft\\n' > \"$1\"; exit 7",
     );
-    let output = run_cli(&socket, editor, &["add", "example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["add", "example"],
+    ).await;
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("The editor exited"), "{stderr}");
@@ -481,7 +520,11 @@ async fn frontmatter_edits_update_metadata_and_body() {
         r#"sed -i -e 's/^summary: null$/summary: Complete summary/' -e 's/^scope: null$/scope: project/' -e 's/^basis: null$/basis: observed/' -e 's/^observed_at: null$/observed_at: 100/' -e 's/^verified_at: null$/verified_at: 200/' -e 's/^review_after: null$/review_after: 300/' "$1"
 printf 'Additional content\n' >> "$1""#,
     );
-    let output = run_cli(&socket, editor, &["edit", "example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["edit", "example"],
+    ).await;
     assert!(
         output.status.success(),
         "{}",
@@ -509,9 +552,13 @@ async fn readonly_frontmatter_change_preserves_draft_and_does_not_write() {
     let server = start_service(&socket, state.clone()).await;
     let editor = write_editor(
         root.path(),
-        r#"sed -i 's/^system_version: 4$/system_version: 5/' "$1""#,
+        r#"sed -i 's/^system_token: fixture-token$/system_token: changed/' "$1""#,
     );
-    let output = run_cli(&socket, editor, &["edit", "example"]).await;
+    let output = run_cli(
+        &socket,
+        editor,
+        &["edit", "example"],
+    ).await;
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("The draft was preserved at"), "{stderr}");

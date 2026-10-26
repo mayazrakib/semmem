@@ -1,0 +1,23 @@
+version: '3'
+
+tasks:
+    default:
+        desc: Display available tasks.
+        cmds:
+            - task --list
+    help:
+        desc: Describe available project tasks.
+        cmds:
+            - task --list
+    init:
+        desc: Initialize the development environment.
+        cmds:
+            - 'cargo fetch --locked'
+    test:
+        desc: Execute automated tests.
+        cmds:
+            - 'cargo test --locked --features fault-injection --tests'
+    build:
+        desc: Build project artifacts.
+        cmds:
+            - 'cargo build --locked --release'

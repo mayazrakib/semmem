@@ -48,7 +48,12 @@ impl OAuth {
         audience: String,
         public_url: String,
     ) -> anyhow::Result<Self> {
-        Self::discover_with_http(issuer, audience, public_url, false).await
+        Self::discover_with_http(
+            issuer,
+            audience,
+            public_url,
+            false,
+        ).await
     }
 
     pub async fn discover_with_http(
@@ -111,7 +116,11 @@ impl OAuth {
         })
     }
 
-    pub async fn validate(&self, token: &str, required_scope: &str) -> Result<Principal, String> {
+    pub async fn validate(
+        &self,
+        token: &str,
+        required_scope: &str,
+    ) -> Result<Principal, String> {
         let header = decode_header(token).map_err(|_| "Malformed access token.")?;
         if !matches!(
             header.alg,
@@ -154,7 +163,11 @@ impl OAuth {
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.validate_nbf = true;
         validation.leeway = 5;
-        let principal = decode::<Principal>(token, &key, &validation)
+        let principal = decode::<Principal>(
+            token,
+            &key,
+            &validation,
+        )
             .map_err(|_| "Access token is expired or invalid.")?
             .claims;
         let scopes: HashSet<_> = principal.scope.split_whitespace().collect();
@@ -167,7 +180,7 @@ impl OAuth {
 }
 
 pub fn operation_scope(operation: &str) -> &'static str {
-    if operation == "purge_memories" {
+    if operation == "delete_memories" {
         "memory:purge"
     } else if operation.starts_with("get_")
         || operation.starts_with("list_")
@@ -179,7 +192,11 @@ pub fn operation_scope(operation: &str) -> &'static str {
     }
 }
 
-pub async fn authorize(State(auth): State<Arc<OAuth>>, request: Request, next: Next) -> Response {
+pub async fn authorize(
+    State(auth): State<Arc<OAuth>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let token = request
         .headers()
         .get("authorization")

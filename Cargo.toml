@@ -2,7 +2,7 @@
 name = "semmem"
 version = "0.1.0"
 edition = "2024"
-description = "Persistent human-readable memory, revision history, and retrieval for AI."
+description = "Current-state human-readable memory, audited writes, and retrieval for AI."
 repository = "https://github.com/mayazrakib/semmem"
 
 [[bin]]

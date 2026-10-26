@@ -1,4 +1,4 @@
-# Secrets and credentials
+# Secrets And Credentials
 .env
 .env.*
 !.env.example
@@ -13,7 +13,7 @@
 *.token
 *.secret
 
-# OS metadata
+# Os Metadata
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -24,7 +24,7 @@ $RECYCLE.BIN/
 .Trash-*
 .directory
 
-# Editor and IDE metadata
+# Editor And Ide Metadata
 .idea/
 .vscode/
 *.code-workspace
@@ -41,7 +41,7 @@ $RECYCLE.BIN/
 .tags
 .tags_sorted_by_file
 
-# Temporary files
+# Temporary Files
 *.tmp
 *.temp
 *.cache
@@ -50,18 +50,18 @@ $RECYCLE.BIN/
 *.log
 *.log.*
 
-# Runtime state
+# Runtime State
 *.pid
 *.sock
 *.socket
 
-# Build artefacts
+# Build Artefacts
 .out/
 build/
 dist/
 out/
 
-# Compiler artefacts
+# Compiler Artefacts
 *.o
 *.obj
 *.a
@@ -71,12 +71,12 @@ out/
 *.dll
 *.exe
 
-# Test artefacts
+# Test Artefacts
 .test_cache/
 junit.xml
 *.junit.xml
 
-# Coverage artefacts
+# Coverage Artefacts
 .coverage
 .coverage.*
 coverage.xml
@@ -87,7 +87,8 @@ htmlcov/
 # Rust
 target/
 Cargo.lock.local
-.cargo/
+.cargo/*
+!.cargo/config.toml
 
 # Databases
 *.db
@@ -104,5 +105,5 @@ Cargo.lock.local
 *.dump
 /.semmem/
 
-# AI
+# Ai
 .dmux/

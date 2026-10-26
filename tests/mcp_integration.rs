@@ -22,9 +22,8 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         .build()?;
     let created: Value = http
         .post("http://localhost/api/create_memories")
-        .json(&json!({"memories": [{
+        .json(&json!({"commit_summary":"Test change", "memories": [{
             "key": "local-api",
-            "author": "test author",
             "body": "# Shared registry\n\nunixregistryneedle exact Markdown.\n",
             "summary": "Shared local registry summary",
             "scope": "unix socket",
@@ -86,7 +85,7 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         full.structured_content.as_ref().unwrap()["memories"][0]["body"],
         "# Shared registry\n\nunixregistryneedle exact Markdown.\n"
     );
-    let created = invoke("create_memories", json!({"memories": [{"key": "mcp-created", "body": "Written through private MCP.", "author": "test author"}]})).await?;
+    let created = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [{"key": "mcp-created", "body": "Written through private MCP."}]})).await?;
     assert_ne!(created.is_error, Some(true));
     let full: Value = http
         .post("http://localhost/api/get_memories")
@@ -142,15 +141,11 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
         "create_memories",
         "update_memories",
         "delete_memories",
-        "restore_memories",
-        "purge_memories",
-        "list_memory_revisions",
+        "list_commits",
+        "get_commits",
         "create_type",
         "update_tag",
         "delete_reference_type",
-        "list_authors",
-        "register_author",
-        "deregister_author",
     ] {
         assert!(
             tools.iter().any(|tool| tool.name == name),
@@ -169,7 +164,7 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
             .await
         }
     };
-    let created = invoke("create_memories", json!({"memories": [{"key": "reading", "title": "Reading", "body": "Remember the beautiful library.", "summary": "Library knowledge", "scope": "personal", "basis": "observed", "observed_at": 100, "verified_at": 200, "review_after": 300, "author": "test author"}]})).await?;
+    let created = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [{"key": "reading", "title": "Reading", "body": "Remember the beautiful library.", "summary": "Library knowledge", "scope": "personal", "basis": "observed", "observed_at": 100, "verified_at": 200, "review_after": 300}]})).await?;
     assert_ne!(created.is_error, Some(true));
     assert_eq!(
         created.structured_content.as_ref().unwrap()["memories"][0]["system_updated_by"],
@@ -208,7 +203,8 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
         scoped.structured_content.as_ref().unwrap()["hits"][0]["key"],
         "reading"
     );
-    let updated = invoke("update_memories", json!({"memories": [{"key": "reading", "expected_version": 1, "body": "Remember the enormous library.", "summary": null, "review_after": null}]})).await?;
+    let token = created.structured_content.as_ref().unwrap()["memories"][0]["system_token"].clone();
+    let updated = invoke("update_memories", json!({"commit_summary":"Test change", "memories": [{"key": "reading", "expected_token": token, "body": "Remember the enormous library.", "summary": null, "review_after": null}]})).await?;
     assert_ne!(updated.is_error, Some(true));
     assert!(updated.structured_content.as_ref().unwrap()["memories"][0]["summary"].is_null());
     assert_eq!(
@@ -217,56 +213,32 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
     );
     let conflict = invoke(
         "update_memories",
-        json!({"memories": [{"key": "reading", "expected_version": 1, "body": "Stale content."}]}),
+        json!({"commit_summary":"Test change", "memories": [{"key": "reading", "expected_token": token, "body": "Stale content."}]}),
     )
     .await?;
     assert_eq!(conflict.is_error, Some(true));
     assert_eq!(
         conflict.structured_content.as_ref().unwrap()["code"],
-        "version_conflict"
+        "token_conflict"
     );
-    let history = invoke("list_memory_revisions", json!({"key": "reading"})).await?;
-    assert_eq!(
-        history.structured_content.as_ref().unwrap()["memories"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let registered = invoke("register_author", json!({"author": "Ada"})).await?;
-    assert_ne!(registered.is_error, Some(true));
-    let authors = invoke("list_authors", json!({})).await?;
-    assert!(
-        authors.structured_content.as_ref().unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|author| author["author"] == "Ada")
-    );
-    let historical = invoke(
-        "search_memories",
-        json!({"query": "library", "history": true}),
-    )
-    .await?;
-    let hits = historical.structured_content.as_ref().unwrap()["hits"]
-        .as_array()
-        .unwrap();
-    assert_eq!(hits.len(), 2);
-
-    for hit in hits {
-        assert!(hit["body"].as_str().unwrap().contains("library"));
-        assert!(hit["system_created_at"].is_i64());
-        assert!(hit["system_updated_at"].is_i64());
-        assert!(hit.get("excerpt").is_none());
+    let current = invoke("search_memories", json!({"query": "library"})).await?;
+    let hits = current.structured_content.as_ref().unwrap()["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["body"], "Remember the enormous library.");
+    assert!(hits[0].get("author").is_none());
+    assert!(hits[0].get("system_version").is_none());
+    let audit = invoke("get_commits", json!({"ids": [updated.structured_content.as_ref().unwrap()["commit_id"]]})).await?;
+    assert_eq!(audit.structured_content.as_ref().unwrap()["commits"][0]["summary"], "Test change");
+    for retired in ["history", "as_of", "include_deleted"] {
+        let mut arguments = json!({"query": "library"});
+        arguments[retired] = json!(true);
+        let rejected = invoke("search_memories", arguments).await;
+        assert!(rejected.is_err() || rejected.as_ref().is_ok_and(|result| result.is_error == Some(true)));
     }
-
-    assert!(
-        hits.windows(2)
-            .all(|pair| pair[0]["score"].as_f64() >= pair[1]["score"].as_f64())
-    );
-    let deregistered = invoke("deregister_author", json!({"author": "Ada"})).await?;
-    assert_ne!(deregistered.is_error, Some(true));
-    let assumed = invoke("create_memories", json!({"memories": [{"key": "assumption", "body": "Assumptionneedle complete body.", "basis": "assumed", "author": "Ada"}]})).await?;
+    for retired in ["restore_memories", "purge_memories", "list_memory_revisions", "list_authors", "register_author", "deregister_author"] {
+        assert!(!tools.iter().any(|tool| tool.name == retired));
+    }
+    let assumed = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [{"key": "assumption", "body": "Assumptionneedle complete body.", "basis": "assumed"}]})).await?;
     assert_ne!(assumed.is_error, Some(true));
     let assumed = invoke(
         "search_memories",
@@ -274,14 +246,13 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
     )
     .await?;
     let hit = &assumed.structured_content.as_ref().unwrap()["hits"][0];
-    assert_eq!(hit["author"], "Ada");
     assert_eq!(hit["system_created_by"], "mcp-test");
     assert_eq!(hit["body"], "Assumptionneedle complete body.");
 
-    for legacy in ["actor", "kind", "claim_type", "links"] {
-        let mut memory = json!({"key": "legacy", "body": "Body", "author": "Ada"});
+    for legacy in ["author", "actor", "kind", "claim_type", "links"] {
+        let mut memory = json!({"key": "legacy", "body": "Body"});
         memory[legacy] = json!("legacy");
-        let rejected = invoke("create_memories", json!({"memories": [memory]})).await;
+        let rejected = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [memory]})).await;
         assert!(
             rejected.is_err()
                 || rejected
@@ -291,7 +262,7 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
         );
     }
 
-    let malformed = invoke("create_memories", json!({"memories": [{"key": "broken"}]})).await;
+    let malformed = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [{"key": "broken"}]})).await;
     assert!(
         malformed.is_err()
             || malformed

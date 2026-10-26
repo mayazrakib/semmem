@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::models::{
-    AppError, AppResult, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryVersion,
-    RestoreMemory, SearchRequest, TaxonomyInput, UpdateMemory,
+    AppError, AppResult, CreateMemory, GetCommits, GetMemories, ListCommits, ListMemories, MemoryToken,
+    SearchRequest, TaxonomyInput, UpdateMemory,
 };
 use crate::search::{SearchIndex, SearchReader};
 use crate::storage::Store;
@@ -106,6 +106,7 @@ impl Drop for ReadConnection<'_> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Batch<T> {
+    commit_summary: String,
     memories: Vec<T>,
 }
 
@@ -113,17 +114,16 @@ struct Batch<T> {
 #[serde(deny_unknown_fields)]
 struct KeyInput {
     key: String,
+    commit_summary: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AuthorInput {
-    author: String,
+struct TaxonomyWrite {
+    key: String,
+    name: String,
+    commit_summary: String,
 }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyInput {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,7 +139,7 @@ fn taxonomy_limit() -> usize {
 
 impl Service {
     pub fn open(directory: impl AsRef<Path>) -> anyhow::Result<Arc<Self>> {
-        Self::open_with_batch_window(directory, Duration::from_millis(2))
+        Self::open_with_batch_window(directory, Duration::ZERO)
     }
 
     pub fn open_with_batch_window(
@@ -161,15 +161,14 @@ impl Service {
         let identity = store.database_key()?;
         let index_path = directory.join("search");
         let marker = directory.join("search.identity");
-        let expected_identity = format!("{identity}:search-v1-history");
+        validate_derived_path(&index_path, true)?;
+        validate_derived_path(&marker, false)?;
+        let expected_identity = format!("{identity}:search-current-state-v2");
         let matches = index_path.join("meta.json").is_file()
             && std::fs::read_to_string(&marker).ok().as_deref() == Some(expected_identity.as_str());
 
         if index_path.exists() && !matches {
-            std::fs::rename(
-                &index_path,
-                directory.join(format!("search.replaced.{}", uuid::Uuid::now_v7())),
-            )?;
+            discard_search_index(directory)?;
         }
 
         let (mut index, rebuild) = match SearchIndex::open(&index_path) {
@@ -177,10 +176,7 @@ impl Service {
             Err(error) => {
                 tracing::warn!(%error, "Rebuilding unreadable search index");
                 if index_path.exists() {
-                    std::fs::rename(
-                        &index_path,
-                        directory.join(format!("search.damaged.{}", uuid::Uuid::now_v7())),
-                    )?;
+                    discard_search_index(directory)?;
                 }
 
                 (SearchIndex::open(&index_path)?, true)
@@ -196,7 +192,7 @@ impl Service {
                 }
 
                 for (id, key) in keys {
-                    index.replace_revisions(&key, &store.revisions_for_key(&key)?)?;
+                    index.upsert(&store.get_memory(&key)?)?;
                     after = id;
                 }
             }
@@ -222,7 +218,13 @@ impl Service {
             .name("memory-writer".into())
             .spawn(move || {
                 let _ownership = worker_lock;
-                run_writer(store, index, receiver, writer_metrics, batch_window);
+                run_writer(
+                    store,
+                    index,
+                    receiver,
+                    writer_metrics,
+                    batch_window,
+                );
             })?;
 
         Ok(Arc::new(Self {
@@ -234,7 +236,12 @@ impl Service {
         }))
     }
 
-    pub fn dispatch(&self, operation: &str, arguments: Value, writer: &str) -> AppResult<Value> {
+    pub fn dispatch(
+        &self,
+        operation: &str,
+        arguments: Value,
+        writer: &str,
+    ) -> AppResult<Value> {
         if is_read_operation(operation) {
             return self.read(operation, arguments);
         }
@@ -257,7 +264,7 @@ impl Service {
         receiver.recv().map_err(|_| {
             AppError::new(
                 "internal_failure",
-                "The write worker stopped; inspect current versions before retrying.",
+                "The write worker stopped; inspect current tokens before retrying.",
             )
         })?
     }
@@ -275,7 +282,11 @@ impl Service {
         })
     }
 
-    fn read(&self, operation: &str, arguments: Value) -> AppResult<Value> {
+    fn read(
+        &self,
+        operation: &str,
+        arguments: Value,
+    ) -> AppResult<Value> {
         if operation == "search_memories" {
             let request: SearchRequest = serde_json::from_value(arguments)?;
             let mut response = self.search.search(&request).map_err(|error| {
@@ -294,45 +305,28 @@ impl Service {
             let snapshot = store.connection().unchecked_transaction()?;
             let mut valid = Vec::with_capacity(response.hits.len());
             for hit in response.hits {
-                let selected = if request.history {
-                    snapshot.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM memory_revisions r JOIN memories m ON m.id = r.memory_id WHERE m.key = ?1 AND r.system_version = ?2 AND (?3 OR r.system_deleted_at IS NULL))",
-                        rusqlite::params![hit.key, hit.version, request.include_deleted],
-                        |row| row.get::<_, bool>(0),
-                    )?
-                } else if let Some(as_of) = request.as_of {
-                    snapshot.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM memory_revisions r JOIN memories m ON m.id = r.memory_id WHERE m.key = ?1 AND r.system_version = ?2 AND r.system_updated_at <= ?3 AND (?4 OR r.system_deleted_at IS NULL) AND NOT EXISTS(SELECT 1 FROM memory_revisions later WHERE later.memory_id = r.memory_id AND later.system_updated_at <= ?3 AND later.system_version > r.system_version))",
-                        rusqlite::params![hit.key, hit.version, as_of, request.include_deleted],
-                        |row| row.get::<_, bool>(0),
-                    )?
-                } else {
-                    snapshot.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM memories WHERE key = ?1 AND system_version = ?2 AND (?3 OR system_deleted_at IS NULL))",
-                        rusqlite::params![hit.key, hit.version, request.include_deleted],
-                        |row| row.get::<_, bool>(0),
-                    )?
-                };
+                let selected = snapshot.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memories WHERE key = ?1 AND system_token = ?2)",
+                    rusqlite::params![hit.key, hit.system_token],
+                    |row| row.get::<_, bool>(0),
+                )?;
 
                 if selected {
-                    let record = crate::storage::read_revision(&snapshot, &hit.key, hit.version)?;
+                    let record = crate::storage::read_memory(&snapshot, &hit.key)?;
                     valid.push(crate::models::SearchHit {
                         key: record.key,
                         title: record.title,
                         body: record.body,
-                        version: record.system_version,
+                        system_token: record.system_token,
                         score: hit.score,
                         metadata: record.metadata,
                         r#type: record.r#type,
-                        author: record.author,
                         tags: record.tags,
                         references: record.references,
                         system_created_at: record.system_created_at,
                         system_updated_at: record.system_updated_at,
-                        system_deleted_at: record.system_deleted_at,
                         system_created_by: record.system_created_by,
                         system_updated_by: record.system_updated_by,
-                        system_deleted_by: record.system_deleted_by,
                     });
                 }
             }
@@ -362,26 +356,37 @@ impl Service {
 
                 Ok(json!({"memories": records, "next_cursor": cursor}))
             }
-            "list_memory_revisions" => {
-                let request: HistoryRequest = serde_json::from_value(arguments)?;
-                let records = store.list_revision_summaries(&request)?;
+            "list_commits" => {
+                let request: ListCommits = serde_json::from_value(arguments)?;
+                let records = store.list_commits(&request)?;
                 let cursor = if records.len() == request.limit {
-                    records
-                        .last()
-                        .map(|record| record["system_version"].clone())
+                    records.last().map(|record| record.id.to_string())
                 } else {
                     None
                 };
 
-                Ok(json!({"memories": records, "before_version": cursor}))
+                Ok(json!({"commits": records, "next_cursor": cursor}))
             }
-            "list_types" => taxonomy_page(&store, "memory_types", arguments),
-            "list_tags" => taxonomy_page(&store, "tags", arguments),
-            "list_reference_types" => taxonomy_page(&store, "reference_types", arguments),
-            "list_authors" => {
-                let _: EmptyInput = serde_json::from_value(arguments)?;
-                Ok(json!({"items": store.list_authors()?}))
+            "get_commits" => {
+                let request: GetCommits = serde_json::from_value(arguments)?;
+
+                Ok(json!({"commits": store.get_commits(&request)?}))
             }
+            "list_types" => taxonomy_page(
+                &store,
+                "memory_types",
+                arguments,
+            ),
+            "list_tags" => taxonomy_page(
+                &store,
+                "tags",
+                arguments,
+            ),
+            "list_reference_types" => taxonomy_page(
+                &store,
+                "reference_types",
+                arguments,
+            ),
             _ => Err(AppError::invalid("Unknown read operation.")),
         }
     }
@@ -393,12 +398,71 @@ pub fn is_read_operation(operation: &str) -> bool {
         "search_memories"
             | "get_memories"
             | "list_memories"
-            | "list_memory_revisions"
+            | "list_commits"
+            | "get_commits"
             | "list_types"
             | "list_tags"
             | "list_reference_types"
-            | "list_authors"
     )
+}
+
+fn validate_derived_path(path: &Path, is_directory: bool) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "The derived search path must not be a symbolic link: {}.",
+                path.display(),
+            );
+            anyhow::ensure!(
+                if is_directory { metadata.is_dir() } else { metadata.is_file() },
+                "The derived search path has an unexpected file type: {}.",
+                path.display(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+fn discard_search_index(directory: &Path) -> anyhow::Result<()> {
+    let index_path = directory.join("search");
+    validate_derived_path(&index_path, true)?;
+    std::fs::remove_dir_all(index_path)?;
+
+    Ok(())
+}
+
+fn collect_write_requests(
+    first: WriteRequest,
+    receiver: &mpsc::Receiver<WriteRequest>,
+    batch_window: Duration,
+    cutoff: Instant,
+) -> Vec<WriteRequest> {
+    let mut requests = vec![first];
+    loop {
+        let next = if batch_window.is_zero() {
+            receiver.try_recv().map_err(|_| ())
+        } else if let Some(remaining) = batch_window.checked_sub(cutoff.elapsed()) {
+            receiver.recv_timeout(remaining).map_err(|_| ())
+        } else {
+            break;
+        };
+        match next {
+            Ok(request) => {
+                let is_later = request.enqueued_at > cutoff;
+                requests.push(request);
+                if batch_window.is_zero() && is_later {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    requests
 }
 
 fn run_writer(
@@ -409,16 +473,12 @@ fn run_writer(
     batch_window: Duration,
 ) {
     while let Ok(first) = receiver.recv() {
-        let started = Instant::now();
-        let mut requests = vec![first];
-        while let Some(remaining) = batch_window.checked_sub(started.elapsed()) {
-            match receiver.recv_timeout(remaining) {
-                Ok(request) => {
-                    requests.push(request);
-                }
-                Err(_) => break,
-            }
-        }
+        let mut requests = collect_write_requests(
+            first,
+            &receiver,
+            batch_window,
+            Instant::now(),
+        );
         let mut results = Vec::with_capacity(requests.len());
         for request in &mut requests {
             let queued = request
@@ -460,17 +520,18 @@ fn run_writer(
                     let mut failure = AppError::new(
                         "publication_incomplete",
                         format!(
-                            "SQLite committed the write, but search publication failed: {error}. Inspect affected versions before retrying."
+                            "SQLite committed the write, but search publication failed: {error}. Inspect affected tokens before retrying."
                         ),
                     );
                     failure.committed = true;
+                    failure.commit_id = result.get("commit_id").and_then(Value::as_i64);
                     if let Some(memories) = result.get("memories").and_then(Value::as_array) {
                         failure.affected = memories
                             .iter()
                             .filter_map(|memory| {
                                 Some(crate::models::MemoryReceipt {
                                     key: memory.get("key")?.as_str()?.into(),
-                                    version: memory.get("system_version").and_then(Value::as_i64),
+                                    token: memory.get("system_token").and_then(Value::as_str).map(str::to_owned),
                                 })
                             })
                             .collect();
@@ -480,7 +541,7 @@ fn run_writer(
                             .filter_map(|key| {
                                 key.as_str().map(|key| crate::models::MemoryReceipt {
                                     key: key.into(),
-                                    version: None,
+                                    token: None,
                                 })
                             })
                             .collect();
@@ -517,47 +578,26 @@ fn apply_write(
     arguments: Value,
     writer: &str,
 ) -> AppResult<Value> {
-    match operation {
+    let mut result = match operation {
         "create_memories" => {
             let batch: Batch<CreateMemory> = serde_json::from_value(arguments)?;
 
-            Ok(json!({"memories": summaries(store.create_memories(&batch.memories, writer)?)?}))
+            json!({"memories": summaries(store.create_memories(&batch.memories, writer, &batch.commit_summary)?)?})
         }
         "update_memories" => {
             let batch: Batch<UpdateMemory> = serde_json::from_value(arguments)?;
 
-            Ok(json!({"memories": summaries(store.update_memories(&batch.memories, writer)?)?}))
-        }
-        "update_memory" => {
-            let input: UpdateMemory = serde_json::from_value(arguments)?;
-
-            Ok(json!({"memories": summaries(store.update_memories(&[input], writer)?)?}))
+            json!({"memories": summaries(store.update_memories(&batch.memories, writer, &batch.commit_summary)?)?})
         }
         "delete_memories" => {
-            let batch: Batch<MemoryVersion> = serde_json::from_value(arguments)?;
+            let batch: Batch<MemoryToken> = serde_json::from_value(arguments)?;
 
-            Ok(json!({"memories": summaries(store.delete_memories(&batch.memories, writer)?)?}))
-        }
-        "restore_memories" => {
-            let batch: Batch<RestoreMemory> = serde_json::from_value(arguments)?;
+            let removed = store.delete_memories(&batch.memories, writer, &batch.commit_summary)?;
+            let receipts = removed.into_iter().map(|memory| {
+                json!({"key": memory.key, "system_token": memory.system_token})
+            }).collect::<Vec<_>>();
 
-            Ok(json!({"memories": summaries(store.restore_memories(&batch.memories, writer)?)?}))
-        }
-        "purge_memories" => {
-            let batch: Batch<MemoryVersion> = serde_json::from_value(arguments)?;
-
-            Ok(json!({"keys": store.purge_memories(&batch.memories, writer)?}))
-        }
-        "register_author" => {
-            let input: AuthorInput = serde_json::from_value(arguments)?;
-
-            Ok(json!({"author": store.register_author(&input.author, writer)?}))
-        }
-        "deregister_author" => {
-            let input: AuthorInput = serde_json::from_value(arguments)?;
-            store.deregister_author(&input.author, writer)?;
-
-            Ok(json!({"author": input.author, "deleted": true}))
+            json!({"memories": receipts})
         }
         _ => {
             let (verb, category) = operation
@@ -569,32 +609,56 @@ fn apply_write(
                 "reference_type" => "reference_types",
                 _ => return Err(AppError::invalid("Unknown operation.")),
             };
-            if verb == "delete" {
-                let input: KeyInput = serde_json::from_value(arguments)?;
-                store.delete_taxonomy(taxonomy, &input.key, writer)?;
+            match verb {
+                "delete" => {
+                    let input: KeyInput = serde_json::from_value(arguments)?;
+                    store.delete_taxonomy(
+                        taxonomy,
+                        &input.key,
+                        writer,
+                        &input.commit_summary,
+                    )?;
 
-                return Ok(json!({"key": input.key, "deleted": true}));
-            }
-            let input: TaxonomyInput = serde_json::from_value(arguments)?;
-            let item = match verb {
-                "create" => store.create_taxonomy(taxonomy, &input, writer)?,
-                "update" => store.update_taxonomy(taxonomy, &input, writer)?,
-                "put" => match store.update_taxonomy(taxonomy, &input, writer) {
-                    Ok(item) => item,
-                    Err(error) if error.code == "not_found" => {
-                        store.create_taxonomy(taxonomy, &input, writer)?
-                    }
-                    Err(error) => return Err(error),
-                },
+                    json!({"key": input.key, "deleted": true})
+                }
+                "create" | "update" => {
+                    let input: TaxonomyWrite = serde_json::from_value(arguments)?;
+                    let taxonomy_input = TaxonomyInput {
+                        key: input.key,
+                        name: input.name,
+                    };
+                    let item = if verb == "create" {
+                        store.create_taxonomy(
+                            taxonomy,
+                            &taxonomy_input,
+                            writer,
+                            &input.commit_summary,
+                        )?
+                    } else {
+                        store.update_taxonomy(
+                            taxonomy,
+                            &taxonomy_input,
+                            writer,
+                            &input.commit_summary,
+                        )?
+                    };
+
+                    json!({"item": item})
+                }
                 _ => return Err(AppError::invalid("Unknown operation.")),
-            };
-
-            Ok(json!({"item": item}))
+            }
         }
-    }
+    };
+    result["commit_id"] = serde_json::to_value(store.last_commit_id()?)?;
+
+    Ok(result)
 }
 
-fn taxonomy_page(store: &Store, table: &str, arguments: Value) -> AppResult<Value> {
+fn taxonomy_page(
+    store: &Store,
+    table: &str,
+    arguments: Value,
+) -> AppResult<Value> {
     let page: TaxonomyPage = serde_json::from_value(arguments)?;
     if page.limit == 0 {
         return Err(AppError::invalid("Taxonomy page size must be positive."));
@@ -604,7 +668,7 @@ fn taxonomy_page(store: &Store, table: &str, arguments: Value) -> AppResult<Valu
         .checked_add(1)
         .and_then(|limit| i64::try_from(limit).ok())
         .ok_or_else(|| AppError::invalid("Taxonomy page size exceeds SQLite's integer range."))?;
-    let mut statement = store.connection().prepare_cached(&format!("SELECT t.id, t.key, t.name, t.system_created_at, t.system_updated_at, a.name, t.system_created_by, t.system_updated_by FROM {table} t JOIN authors a ON a.id = t.author WHERE t.key > ?1 ORDER BY t.key LIMIT ?2"))?;
+    let mut statement = store.connection().prepare_cached(&format!("SELECT t.id, t.key, t.name, t.system_created_at, t.system_updated_at, t.system_created_by, t.system_updated_by FROM {table} t WHERE t.key > ?1 ORDER BY t.key LIMIT ?2"))?;
     let mut items = statement
         .query_map(
             rusqlite::params![page.cursor.as_deref().unwrap_or(""), requested],
@@ -613,9 +677,8 @@ fn taxonomy_page(store: &Store, table: &str, arguments: Value) -> AppResult<Valu
                     id: row.get(0)?,
                     key: row.get(1)?,
                     name: row.get(2)?,
-                    author: row.get(5)?,
-                    system_created_by: row.get(6)?,
-                    system_updated_by: row.get(7)?,
+                    system_created_by: row.get(5)?,
+                    system_updated_by: row.get(6)?,
                     system_created_at: row.get(3)?,
                     system_updated_at: row.get(4)?,
                 })
@@ -633,7 +696,10 @@ fn taxonomy_page(store: &Store, table: &str, arguments: Value) -> AppResult<Valu
     Ok(json!({"items": items, "next_cursor": cursor}))
 }
 
-fn publish_events(store: &mut Store, index: &mut SearchIndex) -> anyhow::Result<()> {
+fn publish_events(
+    store: &mut Store,
+    index: &mut SearchIndex,
+) -> anyhow::Result<()> {
     let mut watermark = index.watermark()?;
     loop {
         let events = store.index_events(watermark, 1000)?;
@@ -645,7 +711,11 @@ fn publish_events(store: &mut Store, index: &mut SearchIndex) -> anyhow::Result<
             .map(|event| event.memory_key.as_str())
             .collect();
         for key in keys {
-            index.replace_revisions(key, &store.revisions_for_key(key)?)?;
+            match store.get_memory(key) {
+                Ok(memory) => index.upsert(&memory)?,
+                Err(error) if error.code == "not_found" => index.remove(key)?,
+                Err(error) => return Err(error.into()),
+            }
         }
         watermark = events.last().expect("Nonempty event batch").sequence;
         index.commit(watermark)?;
@@ -678,4 +748,41 @@ mod tests {
         assert_eq!(pool.opened.load(Ordering::Relaxed), 8);
         assert!(!again.database_key().unwrap().is_empty());
     }
+    #[test]
+    fn zero_window_batch_stops_at_the_enqueue_cutoff_without_a_size_ceiling() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use serde_json::json;
+
+        use super::{WriteRequest, collect_write_requests};
+
+        let cutoff = Instant::now();
+        let request = |key: &str, enqueued_at| {
+            let (result, _) = mpsc::channel();
+
+            WriteRequest {
+                operation: key.into(),
+                arguments: json!({}),
+                writer: "tester".into(),
+                result,
+                enqueued_at,
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        for index in 0..1001 {
+            sender.send(request(&index.to_string(), cutoff)).unwrap();
+        }
+        sender.send(request("later", cutoff + Duration::from_millis(1))).unwrap();
+        sender.send(request("next batch", cutoff + Duration::from_millis(2))).unwrap();
+        let batch = collect_write_requests(
+            request("first", cutoff),
+            &receiver,
+            Duration::ZERO,
+            cutoff,
+        );
+        assert_eq!(batch.len(), 1003);
+        assert_eq!(batch.last().unwrap().operation, "later");
+        assert_eq!(receiver.try_recv().unwrap().operation, "next batch");
+    }
+
 }

@@ -54,7 +54,7 @@ if [ -n "${SEMMEM_BINARY:-}" ]; then
 else
     cd "$checkout"
     cargo build --locked --release --bin semmem
-    source_binary=${CARGO_TARGET_DIR:-"$checkout/target"}/release/semmem
+    source_binary=${CARGO_TARGET_DIR:-"$checkout/build"}/release/semmem
 fi
 
 if [ ! -f "$source_binary" ] || [ ! -x "$source_binary" ]; then

@@ -1,0 +1,20 @@
+name: CI
+on:
+    push:
+    pull_request:
+permissions:
+    contents: read
+jobs:
+    verify:
+        name: Build and Test
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+            - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e
+              with:
+                  version: 3.54.0
+            - name: Install Rust
+              run: rustup toolchain install 1.98.0 --profile minimal && rustup default 1.98.0
+            - run: task init
+            - run: task test
+            - run: task build

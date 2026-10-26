@@ -1,103 +1,51 @@
-# semmem
+# `semmem`
 
-`semmem` is a persistent memory and retrieval system for AI. It stores human-readable Markdown, revision history, and typed relationships in SQLite, and uses Tantivy for full-text and fuzzy search. A terminal client and an OAuth-protected Model Context Protocol (MCP) server share one registry.
+![Version](https://img.shields.io/badge/Version-0.1.0-737373?style=flat-square)
+![License](https://img.shields.io/badge/License-Unknown-737373?style=flat-square)
+![Languages](https://img.shields.io/badge/Languages-Rust-737373?style=flat-square)
+![Frameworks](https://img.shields.io/badge/Frameworks-SQLite%20and%20Tantivy-737373?style=flat-square)
+![Compatibility](https://img.shields.io/badge/Compatibility-Unknown-737373?style=flat-square)
+![Build](https://img.shields.io/badge/Build-Not%20verified-737373?style=flat-square)
+![Tests](https://img.shields.io/badge/Tests-Not%20measured-737373?style=flat-square)
+![Vulnerabilities](https://img.shields.io/badge/Vulnerabilities-Unknown-737373?style=flat-square)
 
-## Build and run
+## 1. Introduction
 
-Use Rust on Linux with a systemd user manager. Install the executable and user service from a checkout, then manage the service through the CLI:
+A persistent Markdown memory registry with current-state writes, an append-only audit log, typed relationships, lexical retrieval, a terminal client, and an OAuth-protected MCP server.
 
-```sh
-./install.sh
-semmem start
-semmem status
-```
+## 2. Usage
 
-`semmem start`, `semmem stop`, and `semmem status` manage `semmem.service` through `systemctl --user`. The installer puts the executable in `$HOME/.local/bin`, enables the unit without starting it, and preserves an existing environment file. Ensure `$HOME/.local/bin` is on `PATH`.
+Use Rust 1.98.0 and Task 3.54.0. Run `task init`, `task test`, and `task build`. On Linux, `./install.sh` installs the executable and user service; `semmem start` starts it. Installation preserves existing configuration.
 
-The service owns the database and search index. Terminal clients connect through a private Unix socket. Data lives in `$XDG_DATA_HOME/semmem`, or `$HOME/.local/share/semmem` when `XDG_DATA_HOME` is unset. Use `--socket` or `SEMMEM_SOCKET` for another socket; use the service launch configuration for another data directory. The hidden `run` command hosts the server when configuring a custom service supervisor.
+Create a memory with `semmem add reading --message "Record reading preferences."`, then use `semmem search "reading"`. See [deployment](docs/deployment.md), [schema](docs/schema.md), and `semmem --help` for configuration and command details.
 
-## Use
+## 3. Features
 
-After starting the service, add, find, and edit memories:
+Atomic writes use opaque concurrency tokens. Every mutation requires an audit message. Deletion permanently removes the selected records and their incoming and outgoing references. Previous bodies, snapshots, and historical search are unavailable. Retrieval returns complete Markdown bodies with metadata.
 
-```sh
-semmem register author "mayaz rakib"
-semmem add reading --author "mayaz rakib" --title "Reading preferences" --tag personal
-semmem search "libary"
-semmem show reading
-semmem edit reading
-semmem history reading
-```
+## 4. Architecture
 
-`add [KEY]` prompts for missing metadata before opening a Markdown draft using `VISUAL`, then `EDITOR`, then `vim`. Select a registered author with the arrow keys, or select the empty entry and enter a custom name. New names register automatically. Noninteractive creation requires `--no-input`, a key, and `--author`. The default title is the key, and the default type is `general`. Prompts use stderr. End-of-input or cancellation stops before saving. Failed editor saves preserve the draft.
+SQLite is authoritative, and Tantivy is rebuildable. The service owns storage; clients connect through a private Unix socket. MCP can use the same registry through a private tunnel or an OAuth-protected HTTP endpoint. `database/initialize.sql` initializes new databases. Existing incompatible schemas are rejected intact. Benchmark code lives in `tests/perf/`; historical results remain byte-preserved under `benchmarks/results/`.
 
-`edit KEY` opens YAML frontmatter and the exact Markdown body. Content fields, including author, are editable. Internal IDs, the key, and system audit fields are read-only. Unchanged edits create no revision. `semmem deregister author "Name"` removes an unused author; saved records and revisions prevent deregistration.
+## 5. Dependencies
 
-Search supports phrases, prefixes, fuzzy matching, and type, tag, scope, or basis filters. Results contain complete bodies and timestamps and are ordered by descending score. `--history` searches all retained revisions; `--as-of TIMESTAMP` searches the state at a UTC Unix millisecond timestamp. These modes are mutually exclusive. `--include-deleted` includes deleted revision states. Ordinary search returns current live memories.
+| Dependency | Version | Use |
+|---|---|---|
+| Rust | 1.98.0 | Compiler and Cargo toolchain. |
+| SQLite and Tantivy | See `Cargo.lock` | Durable records and rebuildable lexical search. |
+| Axum, Tokio, and rmcp | See `Cargo.lock` | HTTP, asynchronous runtime, and MCP transport. |
+| Clap and terminal libraries | See `Cargo.toml` and `Cargo.lock` | Command parsing and terminal interface. |
 
-`list` browses memories and references; `taxonomy` manages types, tags, and reference types. Search returns JSON by default. Use `--json` for structured output from other commands.
+## 6. Roadmap
 
-Reads return the version required for guarded writes. For a memory at version two, deletion and restoration use:
+The CLI, registry, current-state mutations, audit log, search, and MCP integration are implemented. [Performance notes](docs/performance.md) distinguish historical measurements from the current source.
 
-```sh
-semmem delete reading --expected-version 2
-semmem restore reading --expected-version 3
-```
+## 7. Contributing
 
-`delete` retains history, and `restore` appends a new revision. `purge` requires `--confirm` and permanently removes the memory, its history, and incoming references, including historical references. All reads and mutation responses return full bodies. Use `show --version` to select a historical revision.
+Read `AGENTS.md` and the applicable skills in `.ai/skills/` before contributing. Set up the development environment with `task init`. Follow the repository conventions, preserve supported behavior, and add relevant tests for behavior changes. Run `task test` and `task build` before opening a pull request. Describe the change, its purpose, and the validation results in the pull request.
 
-Writes commit to SQLite and become searchable before success is returned. Stale versions produce conflicts instead of overwriting newer edits. Startup recovers pending index changes, and identical creates with the same key are retry-safe. SQLite uses WAL with FULL synchronization; durability depends on storage honoring synchronization requests. See [the schema](docs/schema.md) for storage and lifecycle details.
+## 8. License
 
-## Metadata and Retrieval
+The licensing classification of `semmem` is unresolved. No license grant is made by this README.
 
-Set `summary`, `basis`, `scope`, `observed_at`, `verified_at`, and `review_after` in the edit frontmatter. The `add` command also accepts corresponding command options. Basis values are `stated`, `observed`, `inferred`, and `assumed`. Timestamp values use UTC milliseconds since Unix epoch. Omitted creation dates `observed_at` and `verified_at` default to the current timestamp. Explicit null remains unknown. Updates preserve omitted values, and explicit null clears nullable metadata.
-
-```sh
-semmem edit reading
-semmem search explanations --scope personal
-semmem show reading --view summary
-semmem show reading
-```
-
-Every retrieval returns complete Markdown bodies, associations, and any stored summary. The accepted `summary` view is a compatibility alias for full records. No excerpts, embeddings, or token budgeting are used.
-
-New databases initialize at schema version one. Earlier schemas are rejected and left intact; this version provides no conversion. The service removes application size, count, and runtime deadline restrictions. Caller-selected pagination, atomic writes, version checks, and unavoidable library representation constraints remain.
-
-## Remote MCP
-
-For private ChatGPT access, the Unix socket also exposes `/mcp` for OpenAI Secure MCP Tunnel. The tunnel connects to the same registry as the CLI without opening a public listener. Register the MCP server through ChatGPT’s Add custom MCP server flow and verify its tools; installing the skill package alone does not establish that connection. See [private tunnel deployment](docs/deployment.md#private-chatgpt-tunnel).
-
-The MCP interface provides search, batch reads and writes, browsing, history, restoration, purge, and taxonomy management. Responses include stable keys and versions for subsequent edits. The `memory:read`, `memory:write`, and `memory:purge` scopes control access separately.
-
-Remote connections require an external OAuth provider and an HTTPS reverse proxy. For the managed service, configure `SEMMEM_ISSUER`, `SEMMEM_AUDIENCE`, and `SEMMEM_PUBLIC_URL` in `$XDG_CONFIG_HOME/semmem/environment`, or `$HOME/.config/semmem/environment` when `XDG_CONFIG_HOME` is unset, then stop and start the service. For a custom supervisor, the hidden server command accepts the OAuth settings:
-
-```sh
-semmem run \
-    --issuer https://identity.example.com \
-    --audience https://memory.example.com/mcp \
-    --public-url https://memory.example.com
-```
-
-The server binds to loopback by default and serves MCP at `/mcp`. Without OAuth configuration, it opens only the private host socket. See [deployment](docs/deployment.md) for provider requirements, proxy configuration, and client connection details. Hosting and live client verification are separate deployment steps.
-
-## Develop
-
-Run the tests and checks from a checkout:
-
-```sh
-cargo test --locked --features fault-injection --tests
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo fmt --check
-```
-
-The `fault-injection` feature enables subprocess crash-recovery tests. Build release deployments with the default features.
-
-Run the deterministic million-memory benchmark with:
-
-```sh
-cargo bench --locked --bench search -- --memories 1000000 --clients 16 --iterations 100 --data-dir ./target/benchmark-million
-```
-
-The benchmark reports isolated and concurrent latency measurements, throughput, startup time, memory use, and storage size. See [performance](docs/performance.md) for the measured results, workload, and limits. These timings exclude HTTP, OAuth, MCP transport, and model generation.
-
-The Rust library separates domain contracts, SQLite storage, search, write coordination, authentication, server transport, MCP tools, and terminal interaction under `src/`. The fresh-database initializer is `initialize.sql`, integration tests in `tests/`, benchmark code in `tests/perf/`, and benchmark results in `benchmark/`.
+See `ACKNOWLEDGEMENTS.md` for third-party notices and attributions.

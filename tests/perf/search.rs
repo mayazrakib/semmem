@@ -26,7 +26,7 @@ struct Arguments {
     clients: usize,
     #[arg(long, hide = true)]
     startup_probe: bool,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 0)]
     batch_window_ms: u64,
 }
 
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "fixture_version": 1,
+            "fixture_version": 2,
             "startup_processes": {
                 "initial": initial_process,
                 "reopened": reopened_process,
@@ -217,7 +217,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 .context("Existing data directory is not a completed benchmark fixture")?,
         )?;
 
-        if identity.version != 1 || identity.memories != memories {
+        if identity.version != 2 || identity.memories != memories {
             bail!("Existing benchmark fixture differs; choose another data directory");
         }
 
@@ -225,13 +225,12 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     }
 
     let mut store = Store::open(database_path)?;
-    store.register_author("benchmark", "benchmark")?;
 
     for first in (0..memories).step_by(64) {
         let batch = (first..(first + 64).min(memories))
             .map(create_fixture_memory)
             .collect::<Vec<_>>();
-        store.create_memories(&batch, "benchmark")?;
+        store.create_memories(&batch, "benchmark", "Seed benchmark memories")?;
 
         if first / 100_000 != (first + batch.len()) / 100_000 {
             eprintln!("Seeded {} memories", first + batch.len());
@@ -239,27 +238,29 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     }
 
     for first in (0..memories).step_by(6400) {
-        let revisions = (first..(first + 6400).min(memories))
+        let updates = (first..(first + 6400).min(memories))
             .step_by(100)
             .map(|index| UpdateMemory {
                 key: format!("bench-record-{index:07}"),
-                expected_version: 1,
+                expected_token: store
+                    .get_memory(&format!("bench-record-{index:07}"))
+                    .unwrap()
+                    .system_token,
                 title: Some(format!("Revised observation {index}")),
                 body: None,
                 metadata: MetadataPatch::default(),
                 r#type: None,
                 tags: None,
                 references: None,
-                author: Some("benchmark".into()),
             })
             .collect::<Vec<_>>();
-        store.update_memories(&revisions, "benchmark")?;
+        store.update_memories(&updates, "benchmark", "Update benchmark observations")?;
     }
 
     std::fs::write(
         identity_path,
         serde_json::to_vec(&FixtureIdentity {
-            version: 1,
+            version: 2,
             memories,
         })?,
     )?;
@@ -325,7 +326,6 @@ fn create_fixture_memory(index: usize) -> CreateMemory {
             format!("group-{}", index % 32),
         ],
         references,
-        author: "benchmark".into(),
     }
 }
 
@@ -348,7 +348,11 @@ fn run_client(
         } else {
             let started = Instant::now();
             let _: Value = if iteration % 10 < 7 {
-                service.dispatch("search_memories", json!({"query": format!("marker{selected:07}"), "fuzzy": iteration % 2 == 0, "limit": 20}), "benchmark")?
+                service.dispatch(
+                    "search_memories",
+                    json!({"query": format!("marker{selected:07}"), "fuzzy": iteration % 2 == 0, "limit": 20}),
+                    "benchmark",
+                )?
             } else {
                 service.dispatch(
                     "get_memories",
@@ -366,16 +370,16 @@ fn run_client(
 fn run_write(service: &Service, client: usize, iteration: usize) -> Result<f64> {
     let key = format!("bench-record-{client:07}");
     let current = service.dispatch("get_memories", json!({"keys": [&key]}), "benchmark")?;
-    let version = current["memories"][0]["system_version"]
-        .as_i64()
-        .context("Missing current version")?;
+    let token = current["memories"][0]["system_token"]
+        .as_str()
+        .context("Missing concurrency token")?;
     let mut body = create_fixture_memory(client).body;
     let publication_marker = format!("publicationclient{client}iteration{iteration}");
     body.push_str(&format!("\n\n{publication_marker}\n"));
     let started = Instant::now();
     service.dispatch(
         "update_memory",
-        json!({"key": key, "expected_version": version, "body": body}),
+        json!({"key": key, "expected_token": token, "body": body, "commit_summary": "Measure benchmark write publication"}),
         "benchmark",
     )?;
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;

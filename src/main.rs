@@ -15,7 +15,14 @@ async fn main() -> anyhow::Result<()> {
             issuer,
             audience,
             public_url,
-        } => semmem::server::run(data_dir, cli.socket, listen, issuer, audience, public_url).await,
+        } => semmem::server::run(
+            data_dir,
+            cli.socket,
+            listen,
+            issuer,
+            audience,
+            public_url,
+        ).await,
         _ => semmem::cli::execute(cli).await,
     }
 }

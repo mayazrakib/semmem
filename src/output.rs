@@ -12,7 +12,10 @@ pub(crate) fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn format_json(value: &Value, color_mode: ColorMode) -> Result<String> {
+fn format_json(
+    value: &Value,
+    color_mode: ColorMode,
+) -> Result<String> {
     let formatter = ColoredFormatter::new(PrettyFormatter::with_indent(INDENT));
 
     Ok(formatter.to_colored_json(value, color_mode)?)

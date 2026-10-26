@@ -5,18 +5,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, params_from_iter,
 };
+use serde_json::{Value, json};
 
 use crate::models::{
-    AppError, AppResult, AuthorRecord, CreateMemory, GetMemories, HistoryRequest, IndexEvent,
-    ListMemories, MemoryMetadata, MemoryRecord, MemoryReference, MemoryVersion, RestoreMemory,
+    AppError, AppResult, CommitRecord, CreateMemory, GetCommits, GetMemories, IndexEvent,
+    ListCommits, ListMemories, MemoryMetadata, MemoryRecord, MemoryReference, MemoryToken,
     TaxonomyInput, TaxonomyRecord, UpdateMemory,
 };
 
-const MEMORY_COLUMNS: &str = "id, key, title, body, type, author, system_version, system_created_at, system_updated_at, system_deleted_at, summary, basis, scope, observed_at, verified_at, review_after, system_created_by, system_updated_by, system_deleted_by";
-const REVISION_SELECT: &str = "SELECT memories.id, memories.key, revisions.title, revisions.body, types.key, authors.name, revisions.system_version, memories.system_created_at, revisions.system_updated_at, revisions.system_deleted_at, revisions.summary, revisions.basis, revisions.scope, revisions.observed_at, revisions.verified_at, revisions.review_after, memories.system_created_by, revisions.system_updated_by, revisions.system_deleted_by FROM memory_revisions AS revisions INNER JOIN memories ON memories.id = revisions.memory_id INNER JOIN memory_types AS types ON types.id = revisions.type_id INNER JOIN authors ON authors.id = revisions.author";
+const MEMORY_COLUMNS: &str = "id, key, title, body, type, system_token, system_created_at, system_updated_at, summary, basis, scope, observed_at, verified_at, review_after, system_created_by, system_updated_by";
+const COMMIT_COLUMNS: &str =
+    "id, key, summary, operation, actor, changes, system_created_at, system_updated_at";
 
 pub struct Store {
     connection: Connection,
+    last_write_commit: Option<i64>,
 }
 
 impl Store {
@@ -25,169 +28,118 @@ impl Store {
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         validate_schema_version(version)?;
-        if version == 1 {
+        if version == 2 {
             validate_schema_shape(&connection)?;
         }
         if version == 0 && connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get::<_, bool>(0))? {
             return Err(unsupported_schema(version));
         }
         connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA temp_store = MEMORY;")?;
-
         if version == 0 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let locked_version: i64 =
-                transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            validate_schema_version(locked_version)?;
-            if locked_version == 1 {
+            let locked: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            validate_schema_version(locked)?;
+            if locked == 0 {
+                transaction.execute_batch(include_str!("../database/initialize.sql"))?;
+            } else {
                 validate_schema_shape(&transaction)?;
             }
-
-            if locked_version == 0 {
-                transaction.execute_batch(include_str!("../initialize.sql"))?;
-                let now = current_time()?;
-                transaction.execute("INSERT INTO database (id, key, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (1, ?1, 1, 'system', 'system', ?2, ?2)", params![uuid::Uuid::now_v7().to_string(), now])?;
-            }
-
             transaction.commit()?;
         }
-
-        Ok(Self { connection })
-    }
-
-    pub fn connection(&self) -> &Connection {
-        &self.connection
+        Ok(Self {
+            connection,
+            last_write_commit: None,
+        })
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> AppResult<Self> {
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-
-        if version != 1 {
+        if version != 2 {
             return Err(unsupported_schema(version));
         }
-
         validate_schema_shape(&connection)?;
         connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY;")?;
+        Ok(Self {
+            connection,
+            last_write_commit: None,
+        })
+    }
 
-        Ok(Self { connection })
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     pub fn database_key(&self) -> AppResult<String> {
-        self.connection
+        Ok(self
+            .connection
             .query_row("SELECT key FROM database WHERE id = 1", [], |row| {
                 row.get(0)
-            })
-            .map_err(Into::into)
+            })?)
     }
 
-    pub fn get_memory(&self, key: &str, include_deleted: bool) -> AppResult<MemoryRecord> {
-        let snapshot = self.connection.unchecked_transaction()?;
-        let record = read_memory(&snapshot, key, include_deleted)?;
-        snapshot.commit()?;
-
-        Ok(record)
-    }
-
-    pub fn get_revision(&self, key: &str, version: i64) -> AppResult<MemoryRecord> {
-        let snapshot = self.connection.unchecked_transaction()?;
-        let record = read_revision(&snapshot, key, version)?;
-        snapshot.commit()?;
-
+    pub fn get_memory(&self, key: &str) -> AppResult<MemoryRecord> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let record = read_memory(&transaction, key)?;
+        transaction.commit()?;
         Ok(record)
     }
 
     pub fn get_memories(&self, request: &GetMemories) -> AppResult<Vec<MemoryRecord>> {
-        self.read_memories(request, false)
-    }
-
-    pub fn get_memory_summaries(&self, request: &GetMemories) -> AppResult<Vec<serde_json::Value>> {
-        compact_records(self.read_memories(request, false)?)
-    }
-
-    fn read_memories(
-        &self,
-        request: &GetMemories,
-        _is_summary: bool,
-    ) -> AppResult<Vec<MemoryRecord>> {
-        if request.keys.is_empty() {
-            return Err(AppError::invalid("Get requires at least one key."));
-        }
-
-        let snapshot = self.connection.unchecked_transaction()?;
-        let mut values = vec![rusqlite::types::Value::from(serde_json::to_string(
-            &request.keys,
-        )?)];
-        let columns = MEMORY_COLUMNS;
-        let revision_select = REVISION_SELECT;
-        let sql = if let Some(version) = request.version {
-            values.push(version.into());
-
-            format!(
-                "{revision_select} WHERE memories.key IN (SELECT value FROM json_each(?)) AND revisions.system_version = ?"
-            )
-        } else {
-            values.push(i64::from(request.include_deleted).into());
-
-            format!(
-                "SELECT {columns} FROM current_memories WHERE key IN (SELECT value FROM json_each(?)) AND (? OR system_deleted_at IS NULL)"
-            )
-        };
-        let mut statement = snapshot.prepare_cached(&sql)?;
-        let mut selected = statement
-            .query_map(params_from_iter(values), read_record)?
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(&format!("SELECT {MEMORY_COLUMNS} FROM current_memories WHERE key IN (SELECT value FROM json_each(?1))"))?;
+        let mut records = statement
+            .query_map([serde_json::to_string(&request.keys)?], read_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut selected)?;
-        let by_key: BTreeMap<&str, &MemoryRecord> = selected
-            .iter()
-            .map(|record| (record.key.as_str(), record))
-            .collect();
-        let records = request
+        drop(statement);
+        hydrate(&transaction, &mut records)?;
+        let records = records
+            .into_iter()
+            .map(|record| (record.key.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let ordered = request
             .keys
             .iter()
-            .map(|key| {
-                by_key
-                    .get(key.as_str())
-                    .map(|record| (*record).clone())
-                    .ok_or_else(|| {
-                        AppError::new(
-                            "not_found",
-                            format!("Memory '{key}' or its requested revision was not found."),
-                        )
-                    })
-            })
+            .map(|key| records.get(key).cloned().ok_or_else(|| not_found(key)))
             .collect::<AppResult<Vec<_>>>()?;
-        drop(statement);
-        snapshot.commit()?;
+        transaction.commit()?;
+        Ok(ordered)
+    }
 
-        Ok(records)
+    pub fn get_memory_summaries(&self, request: &GetMemories) -> AppResult<Vec<Value>> {
+        serialize_records(self.get_memories(request)?)
     }
 
     pub fn create_memories(
         &mut self,
         inputs: &[CreateMemory],
-        writer: &str,
+        actor: &str,
+        commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
-        validate_label(writer)?;
-        validate_batch(inputs.len())?;
-        validate_unique_keys(inputs.iter().map(|input| input.key.as_str()))?;
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
+        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = current_time()?;
-        let mut identities = Vec::with_capacity(inputs.len());
-
+        let mut changes = Vec::new();
+        let mut inserted = BTreeSet::new();
         for input in inputs {
             validate_key(&input.key)?;
             validate_body(&input.body)?;
-            let author = ensure_author(&transaction, &input.author, writer, now)?;
-            let inserted = transaction.prepare_cached("INSERT INTO memories (key, author, system_created_by, system_updated_by, system_created_at, system_updated_at, system_version) VALUES (?1, ?3, ?4, ?4, ?2, ?2, 1) ON CONFLICT (key) DO NOTHING")?.execute(params![input.key, now, author, writer])?;
-
-            if inserted == 0 {
-                let existing = read_memory(&transaction, &input.key, true)?;
-
-                if !matches_create(&existing, input) {
+            if let Some(existing) = transaction
+                .query_row(
+                    "SELECT id FROM memories WHERE key = ?1",
+                    [&input.key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                let current = read_memory(&transaction, &input.key)?;
+                if current.id != existing || !matches_create(&current, input) {
                     return Err(AppError::new(
                         "already_exists",
                         format!(
@@ -196,202 +148,173 @@ impl Store {
                         ),
                     ));
                 }
-
-                identities.push(None);
-
                 continue;
             }
-
-            identities.push(Some(transaction.last_insert_rowid()));
+            let type_id = ensure_taxonomy(
+                &transaction,
+                "memory_types",
+                &input.r#type,
+                actor,
+                now,
+                &mut changes,
+            )?;
+            let metadata = create_metadata(input, now);
+            let basis = metadata.basis.map(|value| {
+                serde_json::to_value(value)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            });
+            transaction.execute("INSERT INTO memories (key, title, body, summary, basis, scope, observed_at, verified_at, review_after, type_id, system_token, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13)", params![input.key, input.title, input.body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now])?;
+            inserted.insert(input.key.clone());
         }
-
-        for (input, id) in inputs.iter().zip(identities) {
-            if let Some(id) = id {
-                insert_revision(
-                    &transaction,
-                    id,
-                    1,
-                    &input.title,
-                    &input.body,
-                    &create_metadata(input, now),
-                    &input.r#type,
-                    &input.tags,
-                    &input.references,
-                    &input.author,
-                    writer,
-                    "create",
-                    None,
-                    now,
-                )?;
-                add_index_event(&transaction, &input.key, 1, "upsert", now, writer)?;
+        for input in inputs {
+            if !inserted.contains(&input.key) {
+                continue;
             }
+            let id: i64 = transaction.query_row(
+                "SELECT id FROM memories WHERE key = ?1",
+                [&input.key],
+                |row| row.get(0),
+            )?;
+            replace_associations(
+                &transaction,
+                id,
+                &input.tags,
+                &input.references,
+                actor,
+                now,
+                &mut changes,
+            )?;
+            add_index_event(&transaction, &input.key, "upsert", actor, now)?;
+            changes.push(json!({"entity":"memories","key":input.key,"operation":"create","fields":["title","body","metadata","type","tags","references"],"index_event":"upsert"}));
         }
-
+        let commit_id = if !changes.is_empty() {
+            Some(append_commit(
+                &transaction,
+                actor,
+                commit_summary,
+                "create_memories",
+                changes,
+                now,
+            )?)
+        } else {
+            None
+        };
         let records = inputs
             .iter()
-            .map(|input| read_memory(&transaction, &input.key, false))
+            .map(|input| read_memory(&transaction, &input.key))
             .collect::<AppResult<Vec<_>>>()?;
         transaction.commit()?;
-
+        self.last_write_commit = commit_id;
         Ok(records)
     }
 
     pub fn update_memories(
         &mut self,
         inputs: &[UpdateMemory],
-        writer: &str,
+        actor: &str,
+        commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
-        validate_label(writer)?;
-        validate_batch(inputs.len())?;
-        validate_unique_keys(inputs.iter().map(|input| input.key.as_str()))?;
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
+        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = current_time()?;
-        let mut records = Vec::with_capacity(inputs.len());
-
+        let mut changes = Vec::new();
+        let mut records = Vec::new();
         for input in inputs {
-            let current = read_memory(&transaction, &input.key, false)?;
-            validate_version(&current, input.expected_version)?;
+            let current = read_memory(&transaction, &input.key)?;
+            validate_token(&current, &input.expected_token)?;
             let title = input.title.as_deref().unwrap_or(&current.title);
             let body = input.body.as_deref().unwrap_or(&current.body);
+            validate_body(body)?;
+            let metadata = input.metadata.apply(&current.metadata);
+            let basis = metadata.basis.map(|value| {
+                serde_json::to_value(value)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            });
             let memory_type = input.r#type.as_deref().unwrap_or(&current.r#type);
             let tags = input.tags.as_deref().unwrap_or(&current.tags);
             let references = input.references.as_deref().unwrap_or(&current.references);
-            validate_body(body)?;
-            let version = next_version(current.system_version)?;
-            let metadata = input.metadata.apply(&current.metadata);
-            insert_revision(
+            if title == current.title
+                && body == current.body
+                && metadata == current.metadata
+                && memory_type == current.r#type
+                && same_associations(tags, references, &current)
+            {
+                records.push(current);
+                continue;
+            }
+            let type_id = ensure_taxonomy(
+                &transaction,
+                "memory_types",
+                memory_type,
+                actor,
+                now,
+                &mut changes,
+            )?;
+            let changed = transaction.execute("UPDATE memories SET title = ?2, body = ?3, summary = ?4, basis = ?5, scope = ?6, observed_at = ?7, verified_at = ?8, review_after = ?9, type_id = ?10, system_token = ?11, system_updated_by = ?12, system_updated_at = ?13 WHERE id = ?1 AND system_token = ?14", params![current.id, title, body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now, input.expected_token])?;
+            if changed != 1 {
+                return Err(conflict(&input.key));
+            }
+            replace_associations(
                 &transaction,
                 current.id,
-                version,
-                title,
-                body,
-                &metadata,
-                memory_type,
-                tags,
-                references,
-                input.author.as_deref().unwrap_or(&current.author),
-                writer,
-                "update",
-                None,
+                input.tags.as_deref().unwrap_or(&current.tags),
+                input.references.as_deref().unwrap_or(&current.references),
+                actor,
                 now,
+                &mut changes,
             )?;
-            advance_memory(&transaction, &current, version, None, now, writer)?;
-            add_index_event(&transaction, &input.key, version, "upsert", now, writer)?;
-            records.push(read_memory(&transaction, &input.key, false)?);
+            add_index_event(&transaction, &input.key, "upsert", actor, now)?;
+            let updated = read_memory(&transaction, &input.key)?;
+            let before = serde_json::to_value(&current)?;
+            let after = serde_json::to_value(&updated)?;
+            let fields = after
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, value)| {
+                    !key.starts_with("system_") && before.get(*key) != Some(*value)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            changes.push(json!({"entity":"memories","key":input.key,"operation":"update","fields":fields,"index_event":"upsert"}));
+            records.push(updated);
         }
-
+        let commit_id = if changes.is_empty() {
+            None
+        } else {
+            Some(append_commit(
+                &transaction,
+                actor,
+                commit_summary,
+                "update_memories",
+                changes,
+                now,
+            )?)
+        };
         transaction.commit()?;
-
+        self.last_write_commit = commit_id;
         Ok(records)
     }
 
     pub fn delete_memories(
         &mut self,
-        inputs: &[MemoryVersion],
-        writer: &str,
+        inputs: &[MemoryToken],
+        actor: &str,
+        commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
-        validate_label(writer)?;
-        validate_batch(inputs.len())?;
-        validate_unique_keys(inputs.iter().map(|input| input.key.as_str()))?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = current_time()?;
-        let mut records = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let current = read_memory(&transaction, &input.key, false)?;
-            validate_version(&current, input.expected_version)?;
-            let version = next_version(current.system_version)?;
-            insert_revision(
-                &transaction,
-                current.id,
-                version,
-                &current.title,
-                &current.body,
-                &current.metadata,
-                &current.r#type,
-                &current.tags,
-                &current.references,
-                &current.author,
-                writer,
-                "delete",
-                Some(now),
-                now,
-            )?;
-            advance_memory(&transaction, &current, version, Some(now), now, writer)?;
-            add_index_event(&transaction, &input.key, version, "delete", now, writer)?;
-            records.push(read_memory(&transaction, &input.key, true)?);
-        }
-
-        transaction.commit()?;
-
-        Ok(records)
-    }
-
-    pub fn restore_memories(
-        &mut self,
-        inputs: &[RestoreMemory],
-        writer: &str,
-    ) -> AppResult<Vec<MemoryRecord>> {
-        validate_label(writer)?;
-        validate_batch(inputs.len())?;
-        validate_unique_keys(inputs.iter().map(|input| input.key.as_str()))?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = current_time()?;
-        let mut records = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let current = read_memory(&transaction, &input.key, true)?;
-            validate_version(&current, input.expected_version)?;
-            let selected = match input.revision {
-                Some(version) => read_revision(&transaction, &input.key, version)?,
-                None if current.system_deleted_at.is_some() => current.clone(),
-                None => {
-                    return Err(AppError::invalid(
-                        "Specify a revision when restoring an active memory.",
-                    ));
-                }
-            };
-            let version = next_version(current.system_version)?;
-            insert_revision(
-                &transaction,
-                current.id,
-                version,
-                &selected.title,
-                &selected.body,
-                &selected.metadata,
-                &selected.r#type,
-                &selected.tags,
-                &selected.references,
-                &selected.author,
-                writer,
-                "restore",
-                None,
-                now,
-            )?;
-            advance_memory(&transaction, &current, version, None, now, writer)?;
-            add_index_event(&transaction, &input.key, version, "upsert", now, writer)?;
-            records.push(read_memory(&transaction, &input.key, false)?);
-        }
-
-        transaction.commit()?;
-
-        Ok(records)
-    }
-
-    pub fn purge_memories(
-        &mut self,
-        inputs: &[MemoryVersion],
-        writer: &str,
-    ) -> AppResult<Vec<String>> {
-        validate_label(writer)?;
-        validate_batch(inputs.len())?;
-        validate_unique_keys(inputs.iter().map(|input| input.key.as_str()))?;
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
+        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -399,265 +322,130 @@ impl Store {
         let records = inputs
             .iter()
             .map(|input| {
-                let record = read_memory(&transaction, &input.key, true)?;
-                validate_version(&record, input.expected_version)?;
-
+                let record = read_memory(&transaction, &input.key)?;
+                validate_token(&record, &input.expected_token)?;
                 Ok(record)
             })
             .collect::<AppResult<Vec<_>>>()?;
-        let selected_ids: BTreeSet<i64> = records.iter().map(|record| record.id).collect();
-        let mut affected_sources = BTreeSet::new();
-        let mut affected_history = BTreeSet::new();
-
+        let ids = records
+            .iter()
+            .map(|record| record.id)
+            .collect::<BTreeSet<_>>();
+        let mut surviving_sources = BTreeSet::new();
+        let mut changes = Vec::new();
         for record in &records {
-            let mut statement = transaction.prepare_cached("SELECT DISTINCT source.id, source.key, source.system_version = revisions.system_version FROM memory_revision_references AS outgoing INNER JOIN memory_revisions AS revisions ON revisions.id = outgoing.revision_id INNER JOIN memories AS source ON source.id = revisions.memory_id WHERE outgoing.target_memory_id = ?1")?;
+            let mut statement = transaction.prepare_cached(
+                "SELECT DISTINCT memory_id FROM memory_references WHERE target_memory_id = ?1",
+            )?;
             let sources = statement
-                .query_map([record.id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, bool>(2)?,
-                    ))
-                })?
+                .query_map([record.id], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
-
-            for (id, key, is_current) in sources {
-                if !selected_ids.contains(&id) {
-                    affected_history.insert(key.clone());
-
-                    if is_current {
-                        affected_sources.insert(key);
-                    }
+            for source in sources {
+                if !ids.contains(&source) {
+                    surviving_sources.insert(source);
                 }
             }
         }
-
         for record in &records {
             transaction.execute(
-                "DELETE FROM memory_revision_references WHERE target_memory_id = ?1",
-                [record.id],
+                "DELETE FROM memories WHERE id = ?1 AND system_token = ?2",
+                params![record.id, record.system_token],
             )?;
-            transaction.execute("DELETE FROM memory_revision_references WHERE revision_id IN (SELECT id FROM memory_revisions WHERE memory_id = ?1)", [record.id])?;
+            add_index_event(&transaction, &record.key, "delete", actor, now)?;
+            changes.push(json!({"entity":"memories","key":record.key,"operation":"delete","associations":"remove outgoing tags and references, and incoming references","index_event":"delete"}));
         }
-
-        for record in &records {
-            transaction.execute("DELETE FROM memories WHERE id = ?1", [record.id])?;
-            add_index_event(
-                &transaction,
-                &record.key,
-                record.system_version,
-                "delete",
-                now,
-                writer,
-            )?;
+        for id in surviving_sources {
+            transaction.execute("UPDATE memories SET system_token = ?2, system_updated_by = ?3, system_updated_at = ?4 WHERE id = ?1", params![id, new_token(), actor, now])?;
+            let key: String =
+                transaction.query_row("SELECT key FROM memories WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })?;
+            add_index_event(&transaction, &key, "upsert", actor, now)?;
+            changes.push(json!({"entity":"memories","key":key,"operation":"update","fields":["references"],"reason":"remove references to deleted targets","index_event":"upsert"}));
         }
-
-        for key in &affected_sources {
-            let current = read_memory(&transaction, key, true)?;
-            let version = next_version(current.system_version)?;
-            insert_revision(
-                &transaction,
-                current.id,
-                version,
-                &current.title,
-                &current.body,
-                &current.metadata,
-                &current.r#type,
-                &current.tags,
-                &current.references,
-                &current.author,
-                writer,
-                "update",
-                current.system_deleted_at,
-                now,
-            )?;
-            advance_memory(
-                &transaction,
-                &current,
-                version,
-                current.system_deleted_at,
-                now,
-                writer,
-            )?;
-            let operation = if current.system_deleted_at.is_some() {
-                "delete"
-            } else {
-                "upsert"
-            };
-            add_index_event(&transaction, key, version, operation, now, writer)?;
-        }
-
-        for key in affected_history.difference(&affected_sources) {
-            let current = read_memory(&transaction, key, true)?;
-            let operation = if current.system_deleted_at.is_some() {
-                "delete"
-            } else {
-                "upsert"
-            };
-            add_index_event(
-                &transaction,
-                key,
-                current.system_version,
-                operation,
-                now,
-                writer,
-            )?;
-        }
-
+        let commit_id = Some(append_commit(
+            &transaction,
+            actor,
+            commit_summary,
+            "delete_memories",
+            changes,
+            now,
+        )?);
         transaction.commit()?;
-
-        Ok(records.into_iter().map(|record| record.key).collect())
+        self.last_write_commit = commit_id;
+        Ok(records)
     }
 
     pub fn list_memories(&self, request: &ListMemories) -> AppResult<Vec<MemoryRecord>> {
-        self.read_list(request, false)
-    }
-
-    pub fn list_memory_summaries(
-        &self,
-        request: &ListMemories,
-    ) -> AppResult<Vec<serde_json::Value>> {
-        compact_records(self.read_list(request, false)?)
-    }
-
-    fn read_list(&self, request: &ListMemories, _is_summary: bool) -> AppResult<Vec<MemoryRecord>> {
         if request.limit == 0 {
-            return Err(AppError::invalid("Limit must be positive."));
+            return Err(AppError::invalid("Page size must be positive."));
         }
-
-        let snapshot = self.connection.unchecked_transaction()?;
-        let columns = MEMORY_COLUMNS;
-        let mut sql = format!("SELECT {columns} FROM current_memories WHERE 1 = 1");
-        let mut values: Vec<rusqlite::types::Value> = Vec::new();
-
-        if !request.include_deleted {
-            sql.push_str(" AND system_deleted_at IS NULL");
-        }
-
-        if let Some(memory_type) = &request.r#type {
-            sql.push_str(" AND type = ?");
-            values.push(memory_type.clone().into());
-        }
-
-        if !request.tags.is_empty() {
-            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(?) AS requested WHERE NOT EXISTS (SELECT 1 FROM memory_revision_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id WHERE membership.revision_id = current_memories.revision_id AND tags.key = requested.value))");
-            values.push(serde_json::to_string(&request.tags)?.into());
-        }
-
-        if let Some(scope) = &request.scope {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut sql = format!("SELECT {MEMORY_COLUMNS} FROM current_memories WHERE 1 = 1");
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(value) = &request.scope {
             sql.push_str(" AND scope = ?");
-            values.push(scope.clone().into());
+            values.push(value.clone().into());
         }
-
-        if let Some(basis) = request.basis {
+        if let Some(value) = request.basis {
             sql.push_str(" AND basis = ?");
-            let value = serde_json::to_value(basis)?;
             values.push(
-                value
+                serde_json::to_value(value)?
                     .as_str()
-                    .expect("Basis values serialize as text")
+                    .unwrap()
                     .to_owned()
                     .into(),
             );
         }
-
-        if let Some(target) = &request.referenced_to {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM memory_revision_references AS outgoing INNER JOIN memories AS target ON target.id = outgoing.target_memory_id WHERE outgoing.revision_id = current_memories.revision_id AND target.key = ?)");
-            values.push(target.clone().into());
+        if let Some(value) = &request.r#type {
+            sql.push_str(" AND type = ?");
+            values.push(value.clone().into());
         }
-
-        if let Some(source) = &request.referenced_from {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM memory_revision_references AS outgoing INNER JOIN memory_revisions AS revisions ON revisions.id = outgoing.revision_id INNER JOIN memories AS source ON source.id = revisions.memory_id AND source.system_version = revisions.system_version WHERE outgoing.target_memory_id = current_memories.id AND source.key = ? AND source.system_deleted_at IS NULL)");
-            values.push(source.clone().into());
+        if !request.tags.is_empty() {
+            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(?) AS requested WHERE NOT EXISTS (SELECT 1 FROM memory_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id WHERE membership.memory_id = current_memories.id AND tags.key = requested.value))");
+            values.push(serde_json::to_string(&request.tags)?.into());
         }
-
+        if let Some(value) = &request.referenced_to {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM memory_references AS outgoing INNER JOIN memories AS target ON target.id = outgoing.target_memory_id WHERE outgoing.memory_id = current_memories.id AND target.key = ?)");
+            values.push(value.clone().into());
+        }
+        if let Some(value) = &request.referenced_from {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM memory_references AS outgoing INNER JOIN memories AS source ON source.id = outgoing.memory_id WHERE outgoing.target_memory_id = current_memories.id AND source.key = ?)");
+            values.push(value.clone().into());
+        }
         if let Some(cursor) = &request.cursor {
             let (timestamp, id) = parse_cursor(cursor)?;
             sql.push_str(" AND (system_updated_at, id) < (?, ?)");
             values.push(timestamp.into());
             values.push(id.into());
         }
-
         sql.push_str(" ORDER BY system_updated_at DESC, id DESC LIMIT ?");
-        values.push((sqlite_limit(request.limit)?).into());
-        let mut statement = snapshot.prepare_cached(&sql)?;
+        values.push(sqlite_limit(request.limit)?.into());
+        let mut statement = transaction.prepare_cached(&sql)?;
         let mut records = statement
             .query_map(params_from_iter(values), read_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
         drop(statement);
-        snapshot.commit()?;
-
+        hydrate(&transaction, &mut records)?;
+        transaction.commit()?;
         Ok(records)
     }
 
-    pub fn list_revisions(&self, request: &HistoryRequest) -> AppResult<Vec<MemoryRecord>> {
-        self.read_revisions(request, false)
+    pub fn list_memory_summaries(&self, request: &ListMemories) -> AppResult<Vec<Value>> {
+        serialize_records(self.list_memories(request)?)
     }
 
-    pub fn list_revision_summaries(
-        &self,
-        request: &HistoryRequest,
-    ) -> AppResult<Vec<serde_json::Value>> {
-        compact_records(self.read_revisions(request, false)?)
-    }
-
-    fn read_revisions(
-        &self,
-        request: &HistoryRequest,
-        _is_summary: bool,
-    ) -> AppResult<Vec<MemoryRecord>> {
-        if request.limit == 0 {
-            return Err(AppError::invalid("Limit must be positive."));
-        }
-
-        let snapshot = self.connection.unchecked_transaction()?;
-        let exists: bool = snapshot
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM memories WHERE key = ?1)")?
-            .query_row([&request.key], |row| row.get(0))?;
-
-        if !exists {
-            return Err(AppError::new(
-                "not_found",
-                format!("Memory '{}' was not found.", request.key),
-            ));
-        }
-
-        let revision_select = REVISION_SELECT;
-        let sql = format!(
-            "{revision_select} WHERE memories.key = ?1 AND (?2 IS NULL OR revisions.system_version < ?2) ORDER BY revisions.system_version DESC LIMIT ?3"
-        );
-        let mut statement = snapshot.prepare_cached(&sql)?;
-        let mut records = statement
-            .query_map(
-                params![
-                    request.key,
-                    request.before_version,
-                    sqlite_limit(request.limit)?
-                ],
-                read_record,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
-        drop(statement);
-        snapshot.commit()?;
-
-        Ok(records)
-    }
-
-    pub fn all_current(&self, after_id: i64, limit: usize) -> AppResult<Vec<MemoryRecord>> {
-        let snapshot = self.connection.unchecked_transaction()?;
-        let sql = format!(
-            "SELECT {MEMORY_COLUMNS} FROM current_memories WHERE id > ?1 AND system_deleted_at IS NULL ORDER BY id LIMIT ?2"
-        );
-        let mut statement = snapshot.prepare_cached(&sql)?;
+    pub fn current_batch(&self, after_id: i64, limit: usize) -> AppResult<Vec<MemoryRecord>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM current_memories WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
         let mut records = statement
             .query_map(params![after_id, sqlite_limit(limit)?], read_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
         drop(statement);
-        snapshot.commit()?;
-
+        hydrate(&transaction, &mut records)?;
+        transaction.commit()?;
         Ok(records)
     }
 
@@ -665,124 +453,85 @@ impl Store {
         let mut statement = self
             .connection
             .prepare_cached("SELECT id, key FROM memories WHERE id > ?1 ORDER BY id LIMIT ?2")?;
-        let keys = statement
+        Ok(statement
             .query_map(params![after_id, sqlite_limit(limit)?], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(keys)
-    }
-
-    pub fn revisions_for_key(&self, key: &str) -> AppResult<Vec<MemoryRecord>> {
-        let snapshot = self.connection.unchecked_transaction()?;
-        let mut statement = snapshot.prepare_cached(&format!(
-            "{REVISION_SELECT} WHERE memories.key = ?1 ORDER BY revisions.system_version"
-        ))?;
-        let mut records = statement
-            .query_map([key], read_record)?
-            .collect::<Result<Vec<_>, _>>()?;
-        read_record_attachments(&snapshot, &mut records)?;
-        drop(statement);
-        snapshot.commit()?;
-
-        Ok(records)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn index_events(&self, after: i64, limit: usize) -> AppResult<Vec<IndexEvent>> {
         let mut statement = self.connection.prepare_cached(
             "SELECT id, memory_key FROM index_events WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
-        let events = statement
+        Ok(statement
             .query_map(params![after, sqlite_limit(limit)?], |row| {
                 Ok(IndexEvent {
                     sequence: row.get(0)?,
                     memory_key: row.get(1)?,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(events)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn acknowledge_events(&mut self, watermark: i64) -> AppResult<()> {
-        self.connection
-            .execute("DELETE FROM index_events WHERE id <= ?1", [watermark])?;
-
-        Ok(())
-    }
-
-    pub fn list_authors(&self) -> AppResult<Vec<AuthorRecord>> {
-        let mut statement = self.connection.prepare_cached("SELECT name, system_created_at, system_updated_at, system_created_by, system_updated_by FROM authors WHERE id != 1 ORDER BY name")?;
-        let authors = statement
-            .query_map([], read_author)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(authors)
-    }
-
-    pub fn register_author(&mut self, author: &str, writer: &str) -> AppResult<AuthorRecord> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_author(&transaction, author, writer, current_time()?)?;
-        let record = transaction.query_row("SELECT name, system_created_at, system_updated_at, system_created_by, system_updated_by FROM authors WHERE name = ?1", [author], read_author)?;
-        transaction.commit()?;
-
-        Ok(record)
-    }
-
-    pub fn deregister_author(&mut self, author: &str, writer: &str) -> AppResult<()> {
-        validate_author(author)?;
-        validate_label(writer)?;
-        let changed = self
-            .connection
-            .execute("DELETE FROM authors WHERE name = ?1", [author])
-            .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(ref detail, _) if detail.extended_code == 787 => {
-                    AppError::new(
-                        "referenced_author",
-                        "Author is referenced by canonical records.",
-                    )
-                }
-                _ => error.into(),
-            })?;
-
-        if changed == 0 {
-            return Err(AppError::new("not_found", "Author was not found."));
+        let changed =
+            transaction.execute("DELETE FROM index_events WHERE id <= ?1", [watermark])?;
+        if changed != 0 {
+            append_commit(
+                &transaction,
+                "system",
+                "Acknowledge published search index events.",
+                "acknowledge_index_events",
+                vec![
+                    json!({"entity":"index_events","operation":"delete","through_sequence":watermark,"count":changed}),
+                ],
+                current_time()?,
+            )?;
         }
-
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn list_taxonomy(&self, taxonomy: &str) -> AppResult<Vec<TaxonomyRecord>> {
         let table = taxonomy_table(taxonomy)?;
-        let mut statement = self.connection.prepare_cached(&format!("SELECT items.id, items.key, items.name, items.system_created_at, items.system_updated_at, authors.name, items.system_created_by, items.system_updated_by FROM {table} AS items INNER JOIN authors ON authors.id = items.author ORDER BY items.key"))?;
-        let records = statement
+        let mut statement = self.connection.prepare_cached(&format!("SELECT id, key, name, system_created_by, system_updated_by, system_created_at, system_updated_at FROM {table} ORDER BY key"))?;
+        Ok(statement
             .query_map([], read_taxonomy)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(records)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn create_taxonomy(
         &mut self,
         taxonomy: &str,
         input: &TaxonomyInput,
-        writer: &str,
+        actor: &str,
+        commit_summary: &str,
     ) -> AppResult<TaxonomyRecord> {
-        let table = taxonomy_table(taxonomy)?;
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
         validate_key(&input.key)?;
         validate_label(&input.name)?;
+        let table = taxonomy_table(taxonomy)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = current_time()?;
-        let author = ensure_author(&transaction, &input.author, writer, now)?;
-        transaction.execute(&format!("INSERT INTO {table} (key, name, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5)"), params![input.key, input.name, author, writer, now])?;
+        transaction.execute(&format!("INSERT INTO {table} (key, name, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?3, ?4, ?4)"), params![input.key, input.name, actor, now])?;
+        let commit_id = Some(append_commit(
+            &transaction,
+            actor,
+            commit_summary,
+            "create_taxonomy",
+            vec![json!({"entity":table,"key":input.key,"operation":"create","fields":["name"]})],
+            now,
+        )?);
         let record = read_taxonomy_by_key(&transaction, table, &input.key)?;
         transaction.commit()?;
-
+        self.last_write_commit = commit_id;
         Ok(record)
     }
 
@@ -790,281 +539,246 @@ impl Store {
         &mut self,
         taxonomy: &str,
         input: &TaxonomyInput,
-        writer: &str,
+        actor: &str,
+        commit_summary: &str,
     ) -> AppResult<TaxonomyRecord> {
-        let table = taxonomy_table(taxonomy)?;
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
         validate_label(&input.name)?;
+        let table = taxonomy_table(taxonomy)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = current_time()?;
-        let author = ensure_author(&transaction, &input.author, writer, now)?;
-        let changed = transaction.execute(&format!("UPDATE {table} SET name = ?2, author = ?3, system_updated_by = ?4, system_updated_at = ?5 WHERE key = ?1"), params![input.key, input.name, author, writer, now])?;
-
-        if changed == 0 {
-            return Err(AppError::new("not_found", "Taxonomy item was not found."));
+        let current = read_taxonomy_by_key(&transaction, table, &input.key).map_err(|error| {
+            if error.code == "storage_failure" {
+                not_found(&input.key)
+            } else {
+                error
+            }
+        })?;
+        if current.name == input.name {
+            transaction.commit()?;
+            return Ok(current);
         }
-
+        if transaction.execute(&format!("UPDATE {table} SET name = ?2, system_updated_by = ?3, system_updated_at = ?4 WHERE key = ?1"), params![input.key, input.name, actor, now])? == 0 {
+            return Err(not_found(&input.key));
+        }
+        let commit_id = Some(append_commit(
+            &transaction,
+            actor,
+            commit_summary,
+            "update_taxonomy",
+            vec![json!({"entity":table,"key":input.key,"operation":"update","fields":["name"]})],
+            now,
+        )?);
         let record = read_taxonomy_by_key(&transaction, table, &input.key)?;
         transaction.commit()?;
-
+        self.last_write_commit = commit_id;
         Ok(record)
     }
 
-    pub fn delete_taxonomy(&mut self, taxonomy: &str, key: &str, writer: &str) -> AppResult<()> {
+    pub fn delete_taxonomy(
+        &mut self,
+        taxonomy: &str,
+        key: &str,
+        actor: &str,
+        commit_summary: &str,
+    ) -> AppResult<()> {
+        self.last_write_commit = None;
+        validate_write(actor, commit_summary)?;
         let table = taxonomy_table(taxonomy)?;
-        validate_label(writer)?;
         if table == "memory_types" && key == "general" {
             return Err(AppError::new(
                 "default_type",
                 "The general memory type is required by the database default.",
             ));
         }
-
-        let changed = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction
             .execute(&format!("DELETE FROM {table} WHERE key = ?1"), [key])
             .map_err(|error| match error {
                 rusqlite::Error::SqliteFailure(ref detail, _) if detail.extended_code == 787 => {
                     AppError::new(
                         "referenced_taxonomy",
-                        "Taxonomy item is referenced by memory history.",
+                        "Taxonomy item is referenced by current memories.",
                     )
                 }
                 _ => error.into(),
             })?;
-
         if changed == 0 {
-            return Err(AppError::new("not_found", "Taxonomy item was not found."));
+            return Err(not_found(key));
         }
-
+        let commit_id = Some(append_commit(
+            &transaction,
+            actor,
+            commit_summary,
+            "delete_taxonomy",
+            vec![json!({"entity":table,"key":key,"operation":"delete"})],
+            current_time()?,
+        )?);
+        transaction.commit()?;
+        self.last_write_commit = commit_id;
         Ok(())
+    }
+
+    pub fn last_commit_id(&self) -> AppResult<Option<i64>> {
+        Ok(self.last_write_commit)
+    }
+
+    pub fn list_commits(&self, request: &ListCommits) -> AppResult<Vec<CommitRecord>> {
+        if request.limit == 0 {
+            return Err(AppError::invalid("Commit page size must be positive."));
+        }
+        let cursor = request
+            .cursor
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|_| AppError::invalid("Invalid commit cursor."))?;
+        let mut statement = self.connection.prepare_cached(&format!("SELECT {COMMIT_COLUMNS} FROM commits WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2"))?;
+        Ok(statement
+            .query_map(params![cursor, sqlite_limit(request.limit)?], read_commit)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_commits(&self, request: &GetCommits) -> AppResult<Vec<CommitRecord>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(&format!(
+            "SELECT {COMMIT_COLUMNS} FROM commits WHERE id IN (SELECT value FROM json_each(?1))"
+        ))?;
+        let records = statement
+            .query_map([serde_json::to_string(&request.ids)?], read_commit)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let records = records
+            .into_iter()
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
+        let ordered = request
+            .ids
+            .iter()
+            .map(|id| {
+                records.get(id).cloned().ok_or_else(|| {
+                    AppError::new("not_found", format!("Commit {id} was not found."))
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        transaction.commit()?;
+        Ok(ordered)
     }
 }
 
 fn read_record(row: &Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    let basis: Option<String> = row.get(9)?;
     Ok(MemoryRecord {
         id: row.get(0)?,
         key: row.get(1)?,
         title: row.get(2)?,
         body: row.get(3)?,
         r#type: row.get(4)?,
-        tags: Vec::new(),
-        references: Vec::new(),
-        author: row.get(5)?,
-        system_created_by: row.get(16)?,
-        system_updated_by: row.get(17)?,
-        system_deleted_by: row.get(18)?,
-        system_version: row.get(6)?,
-        system_created_at: row.get(7)?,
-        system_updated_at: row.get(8)?,
-        system_deleted_at: row.get(9)?,
+        system_token: row.get(5)?,
+        system_created_at: row.get(6)?,
+        system_updated_at: row.get(7)?,
         metadata: MemoryMetadata {
-            summary: row.get(10)?,
-            basis: row
-                .get::<_, Option<String>>(11)?
-                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+            summary: row.get(8)?,
+            basis: basis
+                .map(|value| serde_json::from_value(json!(value)))
                 .transpose()
                 .map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        11,
+                        9,
                         rusqlite::types::Type::Text,
                         Box::new(error),
                     )
                 })?,
-            scope: row.get(12)?,
-            observed_at: row.get(13)?,
-            verified_at: row.get(14)?,
-            review_after: row.get(15)?,
+            scope: row.get(10)?,
+            observed_at: row.get(11)?,
+            verified_at: row.get(12)?,
+            review_after: row.get(13)?,
         },
+        system_created_by: row.get(14)?,
+        system_updated_by: row.get(15)?,
+        tags: Vec::new(),
+        references: Vec::new(),
     })
 }
 
-fn read_memory(
-    connection: &Connection,
-    key: &str,
-    include_deleted: bool,
-) -> AppResult<MemoryRecord> {
-    let sql = format!(
-        "SELECT {MEMORY_COLUMNS} FROM current_memories WHERE key = ?1 AND (?2 OR system_deleted_at IS NULL)"
-    );
+pub(crate) fn read_memory(connection: &Connection, key: &str) -> AppResult<MemoryRecord> {
     let mut record = connection
-        .prepare_cached(&sql)?
-        .query_row(params![key, include_deleted], read_record)
+        .query_row(
+            &format!("SELECT {MEMORY_COLUMNS} FROM current_memories WHERE key = ?1"),
+            [key],
+            read_record,
+        )
         .optional()?
-        .ok_or_else(|| AppError::new("not_found", format!("Memory '{key}' was not found.")))?;
-    read_attachments(connection, &mut record)?;
-
+        .ok_or_else(|| not_found(key))?;
+    hydrate(connection, std::slice::from_mut(&mut record))?;
     Ok(record)
 }
 
-pub(crate) fn read_revision(
-    connection: &Connection,
-    key: &str,
-    version: i64,
-) -> AppResult<MemoryRecord> {
-    let sql =
-        format!("{REVISION_SELECT} WHERE memories.key = ?1 AND revisions.system_version = ?2");
-    let mut record = connection
-        .prepare_cached(&sql)?
-        .query_row(params![key, version], read_record)
-        .optional()?
-        .ok_or_else(|| {
-            AppError::new(
-                "not_found",
-                format!("Revision {version} of memory '{key}' was not found."),
-            )
-        })?;
-    read_attachments(connection, &mut record)?;
-
-    Ok(record)
-}
-
-fn read_attachments(connection: &Connection, record: &mut MemoryRecord) -> AppResult<()> {
-    let mut tags = connection.prepare_cached("SELECT tags.key FROM memory_revision_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id INNER JOIN memory_revisions AS revisions ON revisions.id = membership.revision_id WHERE revisions.memory_id = ?1 AND revisions.system_version = ?2 ORDER BY tags.key")?;
-    record.tags = tags
-        .query_map(params![record.id, record.system_version], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut references = connection.prepare_cached("SELECT target.key, relations.key FROM memory_revision_references AS outgoing INNER JOIN memories AS target ON target.id = outgoing.target_memory_id INNER JOIN reference_types AS relations ON relations.id = outgoing.reference_type_id INNER JOIN memory_revisions AS revisions ON revisions.id = outgoing.revision_id WHERE revisions.memory_id = ?1 AND revisions.system_version = ?2 ORDER BY relations.key, target.key")?;
-    record.references = references
-        .query_map(params![record.id, record.system_version], |row| {
-            Ok(MemoryReference {
-                target_key: row.get(0)?,
-                reference_type: row.get(1)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(())
-}
-
-fn read_record_attachments(connection: &Connection, records: &mut [MemoryRecord]) -> AppResult<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
-
-    let positions: BTreeMap<(i64, i64), usize> = records
+fn hydrate(connection: &Connection, records: &mut [MemoryRecord]) -> AppResult<()> {
+    let ids = serde_json::to_string(&records.iter().map(|record| record.id).collect::<Vec<_>>())?;
+    let positions = records
         .iter()
         .enumerate()
-        .map(|(index, record)| ((record.id, record.system_version), index))
-        .collect();
-    let identities = records
-        .iter()
-        .map(|record| [record.id, record.system_version])
-        .collect::<Vec<_>>();
-    let values = serde_json::to_string(&identities)?;
-    let requested = "WITH requested (memory_id, system_version) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?1)) ";
-    let tags_sql = format!(
-        "{requested} SELECT requested.memory_id, requested.system_version, tags.key FROM requested INNER JOIN memory_revisions AS revisions ON revisions.memory_id = requested.memory_id AND revisions.system_version = requested.system_version INNER JOIN memory_revision_tags AS membership ON membership.revision_id = revisions.id INNER JOIN tags ON tags.id = membership.tag_id ORDER BY requested.memory_id, requested.system_version, tags.key"
-    );
-    let mut tags = connection.prepare_cached(&tags_sql)?;
-    let mut rows = tags.query([&values])?;
-
-    while let Some(row) = rows.next()? {
-        let identity = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
-        records[positions[&identity]].tags.push(row.get(2)?);
+        .map(|(position, record)| (record.id, position))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut statement = connection.prepare_cached("SELECT membership.memory_id, tags.key FROM memory_tags AS membership INNER JOIN tags ON tags.id = membership.tag_id WHERE membership.memory_id IN (SELECT value FROM json_each(?1)) ORDER BY membership.memory_id, tags.key")?;
+    for entry in statement.query_map([&ids], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, key) = entry?;
+        records[positions[&id]].tags.push(key);
     }
-
-    let references_sql = format!(
-        "{requested} SELECT requested.memory_id, requested.system_version, target.key, relations.key FROM requested INNER JOIN memory_revisions AS revisions ON revisions.memory_id = requested.memory_id AND revisions.system_version = requested.system_version INNER JOIN memory_revision_references AS outgoing ON outgoing.revision_id = revisions.id INNER JOIN memories AS target ON target.id = outgoing.target_memory_id INNER JOIN reference_types AS relations ON relations.id = outgoing.reference_type_id ORDER BY requested.memory_id, requested.system_version, relations.key, target.key"
-    );
-    let mut references = connection.prepare_cached(&references_sql)?;
-    let mut rows = references.query([&values])?;
-
-    while let Some(row) = rows.next()? {
-        let identity = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
-        records[positions[&identity]]
-            .references
-            .push(MemoryReference {
-                target_key: row.get(2)?,
-                reference_type: row.get(3)?,
-            });
+    let mut statement = connection.prepare_cached("SELECT outgoing.memory_id, target.key, relations.key FROM memory_references AS outgoing INNER JOIN memories AS target ON target.id = outgoing.target_memory_id INNER JOIN reference_types AS relations ON relations.id = outgoing.reference_type_id WHERE outgoing.memory_id IN (SELECT value FROM json_each(?1)) ORDER BY outgoing.memory_id, relations.key, target.key")?;
+    for entry in statement.query_map([&ids], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            MemoryReference {
+                target_key: row.get(1)?,
+                reference_type: row.get(2)?,
+            },
+        ))
+    })? {
+        let (id, reference) = entry?;
+        records[positions[&id]].references.push(reference);
     }
-
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_revision(
+fn replace_associations(
     connection: &Connection,
-    memory_id: i64,
-    version: i64,
-    title: &str,
-    body: &str,
-    metadata: &MemoryMetadata,
-    memory_type: &str,
+    id: i64,
     tags: &[String],
     references: &[MemoryReference],
-    author: &str,
-    writer: &str,
-    operation: &str,
-    deleted_at: Option<i64>,
+    actor: &str,
     now: i64,
+    changes: &mut Vec<Value>,
 ) -> AppResult<()> {
-    let author_id = ensure_author(connection, author, writer, now)?;
-    let type_id = ensure_taxonomy(
-        connection,
-        "memory_types",
-        memory_type,
-        author_id,
-        writer,
-        now,
-    )?;
-    let basis = metadata
-        .basis
-        .map(serde_json::to_value)
-        .transpose()?
-        .and_then(|value| value.as_str().map(str::to_owned));
-    let deleted_by: Option<String> = if deleted_at.is_none() {
-        None
-    } else if operation == "delete" {
-        Some(writer.into())
-    } else {
-        connection.query_row(
-            "SELECT system_deleted_by FROM memories WHERE id = ?1",
-            [memory_id],
-            |row| row.get(0),
-        )?
-    };
-    connection.prepare_cached("INSERT INTO memory_revisions (memory_id, title, body, type_id, author, summary, basis, scope, observed_at, verified_at, review_after, system_version, system_operation, system_created_at, system_updated_at, system_deleted_at, system_created_by, system_updated_by, system_deleted_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15, ?16, ?16, ?17)")?.execute(params![memory_id, title, body, type_id, author_id, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, version, operation, now, deleted_at, writer, deleted_by])?;
-    let revision_id = connection.last_insert_rowid();
-
-    for tag in tags.iter().collect::<BTreeSet<_>>() {
-        let tag_id = ensure_taxonomy(connection, "tags", tag, author_id, writer, now)?;
-        connection.prepare_cached("INSERT INTO memory_revision_tags (revision_id, tag_id, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5)")?.execute(params![revision_id, tag_id, author_id, writer, now])?;
+    connection.execute("DELETE FROM memory_tags WHERE memory_id = ?1 AND tag_id NOT IN (SELECT tags.id FROM tags INNER JOIN json_each(?2) AS requested ON tags.key = requested.value)", params![id, serde_json::to_string(tags)?])?;
+    connection.execute("DELETE FROM memory_references WHERE memory_id = ?1 AND NOT EXISTS (SELECT 1 FROM json_each(?2) AS requested INNER JOIN memories AS target ON target.key = json_extract(requested.value, '$.target_key') INNER JOIN reference_types AS relation ON relation.key = json_extract(requested.value, '$.reference_type') WHERE target.id = memory_references.target_memory_id AND relation.id = memory_references.reference_type_id)", params![id, serde_json::to_string(references)?])?;
+    for key in tags.iter().collect::<BTreeSet<_>>() {
+        let tag = ensure_taxonomy(connection, "tags", key, actor, now, changes)?;
+        connection.execute("INSERT INTO memory_tags (memory_id, tag_id, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?3, ?4, ?4) ON CONFLICT (memory_id, tag_id) DO NOTHING", params![id, tag, actor, now])?;
     }
-
-    let mut seen_references = BTreeSet::new();
-
-    for reference in references {
-        if !seen_references.insert((&reference.target_key, &reference.reference_type)) {
-            continue;
-        }
-
-        let target_id: i64 = connection
-            .query_row(
-                "SELECT id FROM memories WHERE key = ?1",
-                [&reference.target_key],
-                |row| row.get(0),
-            )
+    let references = references
+        .iter()
+        .map(|reference| (&reference.target_key, &reference.reference_type))
+        .collect::<BTreeSet<_>>();
+    for (key, relation) in references {
+        let target: i64 = connection
+            .query_row("SELECT id FROM memories WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
             .optional()?
-            .ok_or_else(|| {
-                AppError::new(
-                    "not_found",
-                    format!("Reference target '{}' was not found.", reference.target_key),
-                )
-            })?;
-        let reference_type_id = ensure_taxonomy(
-            connection,
-            "reference_types",
-            &reference.reference_type,
-            author_id,
-            writer,
-            now,
-        )?;
-        connection.prepare_cached("INSERT INTO memory_revision_references (revision_id, target_memory_id, reference_type_id, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6)")?.execute(params![revision_id, target_id, reference_type_id, author_id, writer, now])?;
+            .ok_or_else(|| not_found(key))?;
+        let relation =
+            ensure_taxonomy(connection, "reference_types", relation, actor, now, changes)?;
+        connection.execute("INSERT INTO memory_references (memory_id, target_memory_id, reference_type_id, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5) ON CONFLICT (memory_id, target_memory_id, reference_type_id) DO NOTHING", params![id, target, relation, actor, now])?;
     }
-
     Ok(())
 }
 
@@ -1072,86 +786,66 @@ fn ensure_taxonomy(
     connection: &Connection,
     table: &str,
     key: &str,
-    author: i64,
-    writer: &str,
+    actor: &str,
     now: i64,
+    changes: &mut Vec<Value>,
 ) -> AppResult<i64> {
     validate_key(key)?;
-    connection.prepare_cached(&format!("INSERT INTO {table} (key, name, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?1, ?2, ?3, ?3, ?4, ?4) ON CONFLICT (key) DO NOTHING"))?.execute(params![key, author, writer, now])?;
-
-    connection
-        .prepare_cached(&format!("SELECT id FROM {table} WHERE key = ?1"))?
-        .query_row([key], |row| row.get(0))
-        .map_err(Into::into)
-}
-
-fn ensure_author(connection: &Connection, author: &str, writer: &str, now: i64) -> AppResult<i64> {
-    validate_author(author)?;
-    validate_label(writer)?;
-    connection.prepare_cached("INSERT INTO authors (name, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, 1, ?2, ?2, ?3, ?3) ON CONFLICT (name) DO NOTHING")?.execute(params![author, writer, now])?;
-
-    connection
-        .prepare_cached("SELECT id FROM authors WHERE name = ?1")?
-        .query_row([author], |row| row.get(0))
-        .map_err(Into::into)
-}
-
-fn validate_author(author: &str) -> AppResult<()> {
-    validate_label(author)?;
-
-    if author == "system" {
-        return Err(AppError::invalid(
-            "The system author is reserved for internal records.",
-        ));
+    let changed = connection.execute(&format!("INSERT INTO {table} (key, name, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?1, ?2, ?2, ?3, ?3) ON CONFLICT (key) DO NOTHING"), params![key, actor, now])?;
+    if changed != 0 {
+        changes.push(
+            json!({"entity":table,"key":key,"operation":"create","reason":"memory association"}),
+        );
     }
-
-    Ok(())
-}
-
-fn create_metadata(input: &CreateMemory, now: i64) -> MemoryMetadata {
-    input.metadata.apply(&MemoryMetadata {
-        observed_at: Some(now),
-        verified_at: Some(now),
-        ..Default::default()
-    })
-}
-
-fn advance_memory(
-    connection: &Connection,
-    current: &MemoryRecord,
-    version: i64,
-    deleted_at: Option<i64>,
-    now: i64,
-    writer: &str,
-) -> AppResult<()> {
-    let deleted_by = if deleted_at.is_none() {
-        None
-    } else {
-        current.system_deleted_by.as_deref().or(Some(writer))
-    };
-    let changed = connection.prepare_cached("UPDATE memories SET system_version = ?2, system_updated_at = ?3, system_deleted_at = ?4, system_updated_by = ?6, system_deleted_by = ?7, author = (SELECT author FROM memory_revisions WHERE memory_id = ?1 AND system_version = ?2) WHERE id = ?1 AND system_version = ?5")?.execute(params![current.id, version, now, deleted_at, current.system_version, writer, deleted_by])?;
-
-    if changed != 1 {
-        return Err(AppError::new(
-            "version_conflict",
-            "Memory changed while saving.",
-        ));
-    }
-
-    Ok(())
+    Ok(connection.query_row(
+        &format!("SELECT id FROM {table} WHERE key = ?1"),
+        [key],
+        |row| row.get(0),
+    )?)
 }
 
 fn add_index_event(
     connection: &Connection,
     key: &str,
-    version: i64,
     operation: &str,
+    actor: &str,
     now: i64,
-    writer: &str,
 ) -> AppResult<()> {
-    connection.prepare_cached("INSERT INTO index_events (memory_key, memory_version, operation, author, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT author FROM memories WHERE key = ?1), 1), ?5, ?5, ?4, ?4)")?.execute(params![key, version, operation, now, writer])?;
-
+    connection.execute("INSERT INTO index_events (memory_key, operation, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?3, ?4, ?4)", params![key, operation, actor, now])?;
     Ok(())
+}
+
+fn append_commit(
+    connection: &Connection,
+    actor: &str,
+    summary: &str,
+    operation: &str,
+    changes: Vec<Value>,
+    now: i64,
+) -> AppResult<i64> {
+    validate_write(actor, summary)?;
+    connection.execute("INSERT INTO commits (key, summary, operation, actor, changes, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)", params![new_token(), summary, operation, actor, serde_json::to_string(&changes)?, now])?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn read_commit(row: &Row<'_>) -> rusqlite::Result<CommitRecord> {
+    let changes: String = row.get(5)?;
+    Ok(CommitRecord {
+        id: row.get(0)?,
+        key: row.get(1)?,
+        summary: row.get(2)?,
+        operation: row.get(3)?,
+        actor: row.get(4)?,
+        changes: serde_json::from_str(&changes).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        system_created_at: row.get(6)?,
+        system_updated_at: row.get(7)?,
+    })
 }
 
 fn read_taxonomy(row: &Row<'_>) -> rusqlite::Result<TaxonomyRecord> {
@@ -1159,60 +853,68 @@ fn read_taxonomy(row: &Row<'_>) -> rusqlite::Result<TaxonomyRecord> {
         id: row.get(0)?,
         key: row.get(1)?,
         name: row.get(2)?,
-        system_created_at: row.get(3)?,
-        system_updated_at: row.get(4)?,
-        author: row.get(5)?,
-        system_created_by: row.get(6)?,
-        system_updated_by: row.get(7)?,
+        system_created_by: row.get(3)?,
+        system_updated_by: row.get(4)?,
+        system_created_at: row.get(5)?,
+        system_updated_at: row.get(6)?,
     })
+}
+
+fn read_taxonomy_by_key(
+    connection: &Connection,
+    table: &str,
+    key: &str,
+) -> AppResult<TaxonomyRecord> {
+    Ok(connection.query_row(&format!("SELECT id, key, name, system_created_by, system_updated_by, system_created_at, system_updated_at FROM {table} WHERE key = ?1"), [key], read_taxonomy)?)
 }
 
 fn taxonomy_table(taxonomy: &str) -> AppResult<&'static str> {
     match taxonomy {
-        "type" | "types" | "memory_types" => Ok("memory_types"),
-        "tag" | "tags" => Ok("tags"),
-        "reference_type" | "reference_types" => Ok("reference_types"),
-        _ => Err(AppError::invalid(
-            "Taxonomy must be types, tags, or reference_types.",
-        )),
+        "types" => Ok("memory_types"),
+        "tags" => Ok("tags"),
+        "reference_types" => Ok("reference_types"),
+        _ => Err(AppError::invalid("Unknown taxonomy.")),
     }
 }
 
 fn matches_create(record: &MemoryRecord, input: &CreateMemory) -> bool {
-    let tags: BTreeSet<&String> = record.tags.iter().collect();
-    let requested_tags: BTreeSet<&String> = input.tags.iter().collect();
-    let references: BTreeSet<(&String, &String)> = record
-        .references
-        .iter()
-        .map(|link| (&link.target_key, &link.reference_type))
-        .collect();
-    let requested_references: BTreeSet<(&String, &String)> = input
-        .references
-        .iter()
-        .map(|link| (&link.target_key, &link.reference_type))
-        .collect();
-
-    record.system_deleted_at.is_none()
-        && record.title == input.title
+    record.title == input.title
         && record.body == input.body
         && record.metadata == create_metadata(input, record.system_created_at)
         && record.r#type == input.r#type
-        && record.author == input.author
-        && tags == requested_tags
-        && references == requested_references
+        && record.tags.iter().collect::<BTreeSet<_>>() == input.tags.iter().collect::<BTreeSet<_>>()
+        && record
+            .references
+            .iter()
+            .map(|reference| (&reference.target_key, &reference.reference_type))
+            .collect::<BTreeSet<_>>()
+            == input
+                .references
+                .iter()
+                .map(|reference| (&reference.target_key, &reference.reference_type))
+                .collect::<BTreeSet<_>>()
 }
 
-fn validate_batch(length: usize) -> AppResult<()> {
-    if length == 0 {
-        return Err(AppError::invalid("A batch must contain at least one item."));
-    }
+fn create_metadata(input: &CreateMemory, now: i64) -> MemoryMetadata {
+    input.metadata.apply(&MemoryMetadata {
+        observed_at: Some(now),
+        verified_at: Some(now),
+        ..MemoryMetadata::default()
+    })
+}
 
+fn validate_write(actor: &str, summary: &str) -> AppResult<()> {
+    validate_label(actor)?;
+    if summary.trim().is_empty() {
+        return Err(AppError::invalid(
+            "A nonempty audit commit_summary is required for every change.",
+        ));
+    }
     Ok(())
 }
 
-fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> AppResult<()> {
+fn validate_batch<'a>(keys: impl Iterator<Item = &'a str>) -> AppResult<()> {
     let mut seen = BTreeSet::new();
-
     for key in keys {
         if !seen.insert(key) {
             return Err(AppError::invalid(
@@ -1220,7 +922,9 @@ fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> AppResult<()
             ));
         }
     }
-
+    if seen.is_empty() {
+        return Err(AppError::invalid("A batch must contain at least one item."));
+    }
     Ok(())
 }
 
@@ -1230,17 +934,15 @@ fn validate_key(key: &str) -> AppResult<()> {
             "Keys must be nonempty, trimmed text without control characters.",
         ));
     }
-
     Ok(())
 }
 
 fn validate_label(label: &str) -> AppResult<()> {
     if label.trim().is_empty() {
         return Err(AppError::invalid(
-            "Names and author labels must not be empty.",
+            "Names and actor labels must not be empty.",
         ));
     }
-
     Ok(())
 }
 
@@ -1248,29 +950,31 @@ fn validate_body(body: &str) -> AppResult<()> {
     if body.trim().is_empty() {
         return Err(AppError::invalid("Memory body must not be empty."));
     }
-
     Ok(())
 }
 
-fn validate_version(memory: &MemoryRecord, expected: i64) -> AppResult<()> {
-    if memory.system_version != expected {
-        return Err(AppError::new(
-            "version_conflict",
-            format!(
-                "Memory '{}' is at version {}, expected {expected}.",
-                memory.key, memory.system_version
-            ),
-        ));
+fn validate_token(record: &MemoryRecord, expected: &str) -> AppResult<()> {
+    if record.system_token != expected {
+        return Err(conflict(&record.key));
     }
-
     Ok(())
+}
+
+fn conflict(key: &str) -> AppError {
+    AppError::new(
+        "token_conflict",
+        format!("Memory '{key}' changed since it was read. Reread it before retrying."),
+    )
+}
+
+fn not_found(key: &str) -> AppError {
+    AppError::new("not_found", format!("Record '{key}' was not found."))
 }
 
 fn parse_cursor(cursor: &str) -> AppResult<(i64, i64)> {
     let (timestamp, id) = cursor
         .split_once(':')
         .ok_or_else(|| AppError::invalid("Invalid list cursor."))?;
-
     Ok((
         timestamp
             .parse()
@@ -1284,20 +988,16 @@ fn current_time() -> AppResult<i64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| AppError::new("clock_failure", error.to_string()))?;
-
     i64::try_from(elapsed.as_millis())
         .map_err(|_| AppError::new("clock_failure", "System time is out of range."))
 }
 
-fn next_version(version: i64) -> AppResult<i64> {
-    version
-        .checked_add(1)
-        .ok_or_else(|| AppError::new("version_exhausted", "Memory version limit was reached."))
+fn new_token() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 fn wait_for_database(_: i32) -> bool {
     std::thread::yield_now();
-
     true
 }
 
@@ -1305,16 +1005,15 @@ fn unsupported_schema(version: i64) -> AppError {
     AppError::new(
         "unsupported_schema",
         format!(
-            "Database schema version {version} is unsupported. This build requires a fresh database initialized at version 1."
+            "Database schema version {version} is unsupported. This build requires a fresh current-state database initialized at version 2."
         ),
     )
 }
 
 fn validate_schema_version(version: i64) -> AppResult<()> {
-    if version != 0 && version != 1 {
+    if version != 0 && version != 2 {
         return Err(unsupported_schema(version));
     }
-
     Ok(())
 }
 
@@ -1323,45 +1022,41 @@ fn sqlite_limit(limit: usize) -> AppResult<i64> {
         .map_err(|_| AppError::invalid("The requested count cannot be represented by SQLite."))
 }
 
-fn compact_records(records: Vec<MemoryRecord>) -> AppResult<Vec<serde_json::Value>> {
+fn serialize_records(records: Vec<MemoryRecord>) -> AppResult<Vec<Value>> {
     records
         .into_iter()
         .map(|record| serde_json::to_value(record).map_err(Into::into))
         .collect()
 }
 
-fn read_author(row: &Row<'_>) -> rusqlite::Result<AuthorRecord> {
-    Ok(AuthorRecord {
-        author: row.get(0)?,
-        system_created_at: row.get(1)?,
-        system_updated_at: row.get(2)?,
-        system_created_by: row.get(3)?,
-        system_updated_by: row.get(4)?,
-    })
-}
-
-fn read_taxonomy_by_key(
-    connection: &Connection,
-    table: &str,
-    key: &str,
-) -> AppResult<TaxonomyRecord> {
-    connection.query_row(&format!("SELECT items.id, items.key, items.name, items.system_created_at, items.system_updated_at, authors.name, items.system_created_by, items.system_updated_by FROM {table} AS items INNER JOIN authors ON authors.id = items.author WHERE items.key = ?1"), [key], read_taxonomy).map_err(Into::into)
-}
-
 fn validate_schema_shape(connection: &Connection) -> AppResult<()> {
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("../initialize.sql"))?;
-
+    expected.execute_batch(include_str!("../database/initialize.sql"))?;
     fn read_schema(connection: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut statement = connection.prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")?;
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect()
     }
-
     if read_schema(connection)? != read_schema(&expected)? {
-        return Err(unsupported_schema(1));
+        return Err(unsupported_schema(2));
     }
-
     Ok(())
+}
+
+fn same_associations(
+    tags: &[String],
+    references: &[MemoryReference],
+    current: &MemoryRecord,
+) -> bool {
+    tags.iter().collect::<BTreeSet<_>>() == current.tags.iter().collect::<BTreeSet<_>>()
+        && references
+            .iter()
+            .map(|reference| (&reference.target_key, &reference.reference_type))
+            .collect::<BTreeSet<_>>()
+            == current
+                .references
+                .iter()
+                .map(|reference| (&reference.target_key, &reference.reference_type))
+                .collect::<BTreeSet<_>>()
 }

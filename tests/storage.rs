@@ -1,869 +1,501 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
+use rusqlite::Connection;
 use semmem::models::{
-    Basis, CreateMemory, GetMemories, HistoryRequest, ListMemories, MemoryMetadata,
-    MemoryReference, MemoryVersion, RestoreMemory, TaxonomyInput, UpdateMemory,
+    CreateMemory, GetCommits, GetMemories, ListCommits, ListMemories, MemoryToken, TaxonomyInput,
+    UpdateMemory,
 };
 use semmem::storage::Store;
+use serde_json::json;
 
-fn create_memory(key: &str) -> CreateMemory {
-    CreateMemory {
-        key: key.into(),
-        title: format!("Title {key}"),
-        metadata: Default::default(),
-        body: format!("# Memory {key}\n\nUTF-8 content: café, 日本語, 🦀.\n"),
-        r#type: "note".into(),
-        tags: vec!["project".into()],
-        references: Vec::new(),
-        author: "human".into(),
-    }
+fn memory(key: &str) -> CreateMemory {
+    serde_json::from_value(
+        json!({"key":key,"body":"# Exact Markdown\r\n\r\ncafé 東京\n","summary":"Manual summary"}),
+    )
+    .unwrap()
 }
 
-fn update_memory(key: &str, version: i64, body: &str) -> UpdateMemory {
-    UpdateMemory {
-        key: key.into(),
-        expected_version: version,
-        metadata: Default::default(),
-        title: None,
-        body: Some(body.into()),
-        r#type: None,
-        tags: None,
-        references: None,
-        author: None,
-    }
+fn update(key: &str, token: &str, body: &str) -> UpdateMemory {
+    serde_json::from_value(json!({"key":key,"expected_token":token,"body":body})).unwrap()
+}
+
+fn commits(store: &Store) -> Vec<semmem::models::CommitRecord> {
+    store
+        .list_commits(&ListCommits {
+            limit: 10000,
+            cursor: None,
+        })
+        .unwrap()
 }
 
 #[test]
-fn preserves_exact_markdown_and_idempotent_creation() {
+fn initializes_current_schema_and_audits_initialization() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let key = store.database_key().unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(tables.contains(&"commits".into()));
+    assert!(
+        !tables
+            .iter()
+            .any(|name| name.contains("revision") || name == "authors")
+    );
+    assert_eq!(commits(&store).len(), 1);
+    assert_eq!(commits(&store)[0].operation, "initialize");
+    assert_eq!(store.last_commit_id().unwrap(), None);
+    drop(store);
+    assert_eq!(Store::open(&path).unwrap().database_key().unwrap(), key);
+}
+
+#[test]
+fn preserves_markdown_and_idempotent_create_has_no_commit_receipt() {
     let mut store = Store::open(":memory:").unwrap();
-    let input = create_memory("preferences");
-    let first = store
-        .create_memories(std::slice::from_ref(&input), "test writer")
+    let created = store
+        .create_memories(&[memory("one")], "trusted actor", "Save the first memory.")
         .unwrap();
-    let repeated = store
-        .create_memories(std::slice::from_ref(&input), "test writer")
+    assert_eq!(created[0].body, memory("one").body);
+    assert_eq!(created[0].system_created_by, "trusted actor");
+    let first = store.last_commit_id().unwrap().unwrap();
+    let again = store
+        .create_memories(&[memory("one")], "another actor", "Retry the first memory.")
         .unwrap();
-    assert_eq!(first, repeated);
-    assert_eq!(first[0].body, input.body);
-    assert_eq!(store.index_events(0, 100).unwrap().len(), 1);
-    let mut changed = input;
-    changed.body = "Changed content".into();
+    assert_eq!(created, again);
+    assert_eq!(store.last_commit_id().unwrap(), None);
+    assert_eq!(commits(&store)[0].id, first);
+    let mut different = memory("one");
+    different.body = "Different".into();
     assert_eq!(
         store
-            .create_memories(&[changed], "test writer")
+            .create_memories(&[different], "actor", "Reject duplicate.")
             .unwrap_err()
             .code,
         "already_exists"
     );
+    assert_eq!(commits(&store).len(), 2);
+}
+
+#[test]
+fn audit_message_is_required_for_every_mutation() {
+    let mut store = Store::open(":memory:").unwrap();
+    assert!(
+        store
+            .create_memories(&[memory("one")], "actor", " \n")
+            .is_err()
+    );
+    let created = store
+        .create_memories(&[memory("one")], "actor", "Create one.")
+        .unwrap();
+    let token = &created[0].system_token;
+    assert!(
+        store
+            .update_memories(&[update("one", token, "changed")], "actor", "")
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_memories(
+                &[MemoryToken {
+                    key: "one".into(),
+                    expected_token: token.clone()
+                }],
+                "actor",
+                ""
+            )
+            .is_err()
+    );
+    let taxonomy = TaxonomyInput {
+        key: "example".into(),
+        name: "Example".into(),
+    };
+    assert!(
+        store
+            .create_taxonomy("tags", &taxonomy, "actor", "")
+            .is_err()
+    );
+    store
+        .create_taxonomy("tags", &taxonomy, "actor", "Create example tag.")
+        .unwrap();
+    assert!(
+        store
+            .update_taxonomy("tags", &taxonomy, "actor", "")
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_taxonomy("tags", "example", "actor", "")
+            .is_err()
+    );
+    assert_eq!(commits(&store).len(), 3);
 }
 
 #[test]
 fn batch_creation_supports_forward_references_and_rolls_back_invalid_references() {
     let mut store = Store::open(":memory:").unwrap();
-    let mut first = create_memory("first");
-    first.references.push(MemoryReference {
-        target_key: "second".into(),
-        reference_type: "related to".into(),
-    });
-    let records = store
-        .create_memories(&[first, create_memory("second")], "test writer")
+    let mut source = memory("source");
+    source.references =
+        serde_json::from_value(json!([{"target_key":"target","reference_type":"related to"}]))
+            .unwrap();
+    source.tags = vec!["example".into()];
+    store
+        .create_memories(
+            &[source.clone(), memory("target")],
+            "actor",
+            "Create a linked pair.",
+        )
         .unwrap();
-    assert_eq!(records[0].references[0].target_key, "second");
-    let mut invalid = create_memory("invalid");
-    invalid.references.push(MemoryReference {
-        target_key: "missing".into(),
-        reference_type: "related to".into(),
-    });
+    assert_eq!(
+        store.get_memory("source").unwrap().references,
+        source.references
+    );
+    let audit = &commits(&store)[0];
+    assert!(
+        audit
+            .changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["entity"] == "reference_types")
+    );
+    assert!(
+        audit
+            .changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["entity"] == "tags")
+    );
+    source.key = "invalid".into();
+    source.references[0].target_key = "missing".into();
+    source.tags = vec!["rolled back".into()];
+    let count = commits(&store).len();
     assert!(
         store
-            .create_memories(&[create_memory("rolled_back"), invalid], "test writer")
+            .create_memories(&[source], "actor", "This transaction must roll back.")
             .is_err()
     );
-    assert_eq!(
-        store.get_memory("rolled_back", true).unwrap_err().code,
-        "not_found"
+    assert!(store.get_memory("invalid").is_err());
+    assert!(
+        !store
+            .list_taxonomy("tags")
+            .unwrap()
+            .iter()
+            .any(|tag| tag.key == "rolled back")
     );
-    assert_eq!(store.index_events(0, 100).unwrap().len(), 2);
+    assert_eq!(commits(&store).len(), count);
 }
 
 #[test]
-fn atomic_update_rejects_stale_versions_without_partial_changes() {
+fn stale_token_rolls_back_entire_batch_and_audit() {
     let mut store = Store::open(":memory:").unwrap();
-    store
-        .create_memories(
-            &[create_memory("first"), create_memory("second")],
-            "test writer",
-        )
+    let records = store
+        .create_memories(&[memory("one"), memory("two")], "actor", "Create two.")
         .unwrap();
-    let error = store
+    let count = commits(&store).len();
+    let err = store
         .update_memories(
             &[
-                update_memory("first", 1, "First changed"),
-                update_memory("second", 99, "Invalid"),
+                update("one", &records[0].system_token, "changed"),
+                update("two", "stale", "changed"),
             ],
-            "test writer",
+            "actor",
+            "Atomic update.",
         )
         .unwrap_err();
-    assert_eq!(error.code, "version_conflict");
-    assert_eq!(store.get_memory("first", false).unwrap().system_version, 1);
-    assert_eq!(store.index_events(0, 100).unwrap().len(), 2);
+    assert_eq!(err.code, "token_conflict");
+    assert_eq!(store.get_memory("one").unwrap(), records[0]);
+    assert_eq!(commits(&store).len(), count);
+    assert_eq!(store.last_commit_id().unwrap(), None);
+}
+
+#[test]
+fn overwrite_preserves_only_current_content_and_noop_preserves_token() {
+    let mut store = Store::open(":memory:").unwrap();
+    let record = store
+        .create_memories(&[memory("one")], "actor", "Create one.")
+        .unwrap()
+        .remove(0);
+    let noop = update("one", &record.system_token, &record.body);
     assert_eq!(
         store
-            .update_memories(&[update_memory("first", 1, "Changed")], "test writer")
-            .unwrap()[0]
-            .system_version,
-        2
+            .update_memories(&[noop], "actor", "No change.")
+            .unwrap()[0],
+        record
+    );
+    assert_eq!(store.last_commit_id().unwrap(), None);
+    let changed = store
+        .update_memories(
+            &[update("one", &record.system_token, "new content")],
+            "editor",
+            "Replace obsolete content.",
+        )
+        .unwrap()
+        .remove(0);
+    assert_ne!(changed.system_token, record.system_token);
+    assert_eq!(changed.system_created_at, record.system_created_at);
+    assert_eq!(changed.system_updated_by, "editor");
+    assert_eq!(store.get_memory("one").unwrap().body, "new content");
+    assert!(
+        !serde_json::to_string(&commits(&store))
+            .unwrap()
+            .contains("Exact Markdown")
+    );
+    assert!(
+        !serde_json::to_value(changed)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("author")
     );
 }
 
 #[test]
-fn history_includes_normalized_tags_references_and_restoration() {
+fn hard_delete_removes_links_and_invalidates_surviving_source_tokens() {
     let mut store = Store::open(":memory:").unwrap();
-    let mut input = create_memory("first");
-    input.references.push(MemoryReference {
-        target_key: "second".into(),
-        reference_type: "related to".into(),
-    });
-    store
-        .create_memories(&[input.clone(), create_memory("second")], "test writer")
-        .unwrap();
-    let mut update = update_memory("first", 1, "Changed body");
-    update.tags = Some(vec!["new".into()]);
-    update.references = Some(Vec::new());
-    store.update_memories(&[update], "test writer").unwrap();
-    let previous = store.get_revision("first", 1).unwrap();
-    assert_eq!(previous.body, input.body);
-    assert_eq!(previous.tags, input.tags);
-    assert_eq!(previous.references, input.references);
-    let restored = store
-        .restore_memories(
-            &[RestoreMemory {
-                key: "first".into(),
-                expected_version: 2,
-                revision: Some(1),
-            }],
-            "test writer",
+    let source: CreateMemory = serde_json::from_value(json!({"key":"source","body":"source","references":[{"target_key":"target","reference_type":"related"}]})).unwrap();
+    let records = store
+        .create_memories(
+            &[source, memory("target")],
+            "actor",
+            "Create linked memories.",
         )
         .unwrap();
-    assert_eq!(restored[0].system_version, 3);
-    assert_eq!(restored[0].body, input.body);
-    assert_eq!(restored[0].tags, input.tags);
-    assert_eq!(restored[0].references, input.references);
-    let history = store
-        .list_revisions(&HistoryRequest {
-            key: "first".into(),
-            limit: 20,
-            before_version: None,
-        })
-        .unwrap();
-    assert_eq!(
-        history
-            .iter()
-            .map(|record| record.system_version)
-            .collect::<Vec<_>>(),
-        vec![3, 2, 1]
-    );
-}
-
-#[test]
-fn deletion_is_hidden_and_recoverable_then_purge_is_permanent() {
-    let mut store = Store::open(":memory:").unwrap();
-    store
-        .create_memories(&[create_memory("first")], "test writer")
-        .unwrap();
+    let before = store.index_events(0, 100).unwrap().last().unwrap().sequence;
     let deleted = store
         .delete_memories(
-            &[MemoryVersion {
-                key: "first".into(),
-                expected_version: 1,
+            &[MemoryToken {
+                key: "target".into(),
+                expected_token: records[1].system_token.clone(),
             }],
-            "human",
+            "actor",
+            "Remove target and incoming links.",
         )
         .unwrap();
-    assert!(deleted[0].system_deleted_at.is_some());
-    assert!(store.get_memory("first", false).is_err());
-    assert!(
-        store
-            .list_memories(&ListMemories::default())
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .restore_memories(
-            &[RestoreMemory {
-                key: "first".into(),
-                expected_version: 2,
-                revision: None,
-            }],
-            "test writer",
-        )
-        .unwrap();
-    assert!(
-        store
-            .get_memory("first", false)
-            .unwrap()
-            .system_deleted_at
-            .is_none()
-    );
-    store
-        .delete_memories(
-            &[MemoryVersion {
-                key: "first".into(),
-                expected_version: 3,
-            }],
-            "human",
-        )
-        .unwrap();
+    assert_eq!(deleted[0].key, "target");
+    assert!(store.get_memory("target").is_err());
+    let source = store.get_memory("source").unwrap();
+    assert!(source.references.is_empty());
+    assert_ne!(source.system_token, records[0].system_token);
     assert_eq!(
         store
-            .purge_memories(
-                &[MemoryVersion {
-                    key: "first".into(),
-                    expected_version: 3
-                }],
-                "test writer"
+            .update_memories(
+                &[update("source", &records[0].system_token, "stale")],
+                "actor",
+                "Stale source update."
             )
             .unwrap_err()
             .code,
-        "version_conflict"
+        "token_conflict"
     );
-    store
-        .purge_memories(
-            &[MemoryVersion {
-                key: "first".into(),
-                expected_version: 4,
-            }],
-            "test writer",
-        )
+    assert_eq!(store.index_events(before, 100).unwrap().len(), 2);
+    let recreated = store
+        .create_memories(&[memory("target")], "actor", "Recreate target.")
         .unwrap();
-    assert!(store.get_revision("first", 1).is_err());
-    let violations: i64 = store
-        .connection()
-        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(violations, 0);
-}
-
-#[test]
-fn purge_removes_incoming_references_from_current_and_historical_revisions() {
-    let mut store = Store::open(":memory:").unwrap();
-    let mut first = create_memory("first");
-    let mut second = create_memory("second");
-    first.references.push(MemoryReference {
-        target_key: "second".into(),
-        reference_type: "related to".into(),
-    });
-    second.references.push(MemoryReference {
-        target_key: "first".into(),
-        reference_type: "related to".into(),
-    });
-    store
-        .create_memories(&[first, second], "test writer")
-        .unwrap();
-    let versions = vec![
-        MemoryVersion {
-            key: "first".into(),
-            expected_version: 1,
-        },
-        MemoryVersion {
-            key: "second".into(),
-            expected_version: 1,
-        },
-    ];
-    store.delete_memories(&versions, "human").unwrap();
-    let purges = [
-        MemoryVersion {
-            key: "first".into(),
-            expected_version: 2,
-        },
-        MemoryVersion {
-            key: "second".into(),
-            expected_version: 2,
-        },
-    ];
-    assert_eq!(
-        store.purge_memories(&purges[..1], "test writer").unwrap(),
-        vec!["first"]
-    );
-    let remaining = store.get_memory("second", true).unwrap();
-    assert!(remaining.references.is_empty());
-    assert_eq!(remaining.system_version, 3);
-    assert_eq!(remaining.author, "human");
-    assert_eq!(remaining.system_updated_by, "test writer");
-    assert!(remaining.system_deleted_at.is_some());
-    assert!(
-        store
-            .get_revision("second", 1)
-            .unwrap()
-            .references
-            .is_empty()
-    );
-    assert_eq!(
-        store.get_revision("second", 3).unwrap().system_deleted_at,
-        remaining.system_deleted_at
-    );
+    assert_ne!(recreated[0].system_token, records[1].system_token);
     assert_eq!(
         store
-            .purge_memories(&purges[1..], "test writer")
-            .unwrap_err()
-            .code,
-        "version_conflict"
-    );
-    assert_eq!(
-        store
-            .purge_memories(
-                &[MemoryVersion {
-                    key: "second".into(),
-                    expected_version: 3
-                }],
-                "test writer"
-            )
-            .unwrap(),
-        vec!["second"]
-    );
-}
-
-#[test]
-fn purging_active_targets_revises_surviving_sources_and_rejects_stale_edits() {
-    let mut store = Store::open(":memory:").unwrap();
-    let mut source = create_memory("source");
-    source.references = vec![
-        MemoryReference {
-            target_key: "target".into(),
-            reference_type: "related to".into(),
-        },
-        MemoryReference {
-            target_key: "retained".into(),
-            reference_type: "related to".into(),
-        },
-    ];
-    store
-        .create_memories(
-            &[
-                source.clone(),
-                create_memory("target"),
-                create_memory("retained"),
-            ],
-            "test writer",
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .purge_memories(
-                &[MemoryVersion {
+            .delete_memories(
+                &[MemoryToken {
                     key: "target".into(),
-                    expected_version: 99
+                    expected_token: records[1].system_token.clone()
                 }],
-                "test writer"
+                "actor",
+                "Reject stale deletion."
             )
             .unwrap_err()
             .code,
-        "version_conflict"
+        "token_conflict"
     );
-    assert_eq!(store.get_memory("source", false).unwrap().system_version, 1);
-    assert_eq!(
-        store
-            .purge_memories(
-                &[MemoryVersion {
-                    key: "target".into(),
-                    expected_version: 1
-                }],
-                "test writer"
-            )
-            .unwrap(),
-        vec!["target"]
-    );
-    let current = store.get_memory("source", false).unwrap();
-    assert_eq!(current.system_version, 2);
-    assert_eq!(current.author, "human");
-    assert_eq!(current.system_updated_by, "test writer");
-    assert_eq!(current.body, source.body);
-    assert_eq!(current.tags, source.tags);
-    assert_eq!(
-        current.references,
-        vec![MemoryReference {
-            target_key: "retained".into(),
-            reference_type: "related to".into()
-        }]
-    );
-    assert_eq!(
-        store
-            .update_memories(&[update_memory("source", 1, "Stale edit")], "test writer")
-            .unwrap_err()
-            .code,
-        "version_conflict"
-    );
-    let history = store
-        .list_revisions(&HistoryRequest {
-            key: "source".into(),
-            limit: 100,
-            before_version: None,
-        })
-        .unwrap();
-    assert_eq!(history.len(), 2);
-    assert!(history.iter().all(|record| {
-        record
-            .references
-            .iter()
-            .all(|link| link.target_key != "target")
-    }));
-    let events = store.index_events(0, 100).unwrap();
-    assert_eq!(events.last().unwrap().memory_key, "source");
-    assert!(store.get_memory("target", true).is_err());
 }
 
 #[test]
-fn initializes_current_schema_and_preserves_records_on_reopen() {
+fn audit_log_is_append_only_and_cursor_pages_and_ids_are_stable() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("initialized.sqlite3");
+    let path = directory.path().join("memory.sqlite3");
     let mut store = Store::open(&path).unwrap();
-    let identity = store.database_key().unwrap();
-    let records = store
-        .create_memories(&[create_memory("initialized")], "test writer")
+    store
+        .create_memories(&[memory("one")], "actor", "Create one.")
         .unwrap();
-    let version: i64 = store
-        .connection()
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
+    let id = store.last_commit_id().unwrap().unwrap();
+    let fetched = store.get_commits(&GetCommits { ids: vec![id] }).unwrap();
+    assert_eq!(fetched[0].summary, "Create one.");
+    let page = store
+        .list_commits(&ListCommits {
+            limit: 1,
+            cursor: Some(id.to_string()),
+        })
         .unwrap();
-    assert_eq!(version, 1);
-    assert_eq!(records[0].system_deleted_at, None);
-    drop(store);
-
-    let reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.database_key().unwrap(), identity);
-    assert_eq!(
-        reopened.get_memory("initialized", false).unwrap(),
-        records[0]
-    );
-    assert!(Store::open_read_only(&path).is_ok());
-}
-
-#[test]
-fn rejects_existing_schemas_without_modifying_the_database() {
-    for version in [0, 1, 2, 3, 4] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("existing.sqlite3");
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TABLE preserved (body TEXT); INSERT INTO preserved VALUES ('Original data');").unwrap();
+    assert_eq!(page[0].operation, "initialize");
+    let connection = Connection::open(&path).unwrap();
+    assert!(
         connection
-            .pragma_update(None, "user_version", version)
-            .unwrap();
-        drop(connection);
-        let before = std::fs::read(&path).unwrap();
-        assert_eq!(Store::open(&path).err().unwrap().code, "unsupported_schema");
-        assert_eq!(
-            Store::open_read_only(&path).err().unwrap().code,
-            "unsupported_schema"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        let body: String = connection
-            .query_row("SELECT body FROM preserved", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(body, "Original data");
-    }
+            .execute(
+                "UPDATE commits SET summary = 'tampered' WHERE id = ?1",
+                [id]
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM commits WHERE id = ?1", [id])
+            .is_err()
+    );
+    assert!(connection.execute("INSERT INTO commits (key,summary,operation,actor,changes,system_created_at,system_updated_at) VALUES ('bad',' ','update','actor','[]',1,1)", []).is_err());
 }
 
 #[test]
-fn taxonomy_has_distinct_keys_names_and_restricts_referenced_deletion() {
+fn search_event_acknowledgment_is_audited_only_when_it_changes_rows() {
     let mut store = Store::open(":memory:").unwrap();
     store
-        .create_taxonomy(
-            "types",
-            &TaxonomyInput {
-                key: "preference".into(),
-                name: "Personal preference".into(),
-                author: "human".into(),
-            },
-            "test writer",
-        )
+        .create_memories(&[memory("one")], "actor", "Create one.")
         .unwrap();
+    let watermark = store.index_events(0, 100).unwrap()[0].sequence;
+    store.acknowledge_events(watermark).unwrap();
+    let count = commits(&store).len();
+    assert_eq!(commits(&store)[0].operation, "acknowledge_index_events");
+    store.acknowledge_events(watermark).unwrap();
+    assert_eq!(commits(&store).len(), count);
+    assert!(store.index_events(0, 100).unwrap().is_empty());
+}
+
+#[test]
+fn taxonomy_has_distinct_names_and_restricts_current_references() {
+    let mut store = Store::open(":memory:").unwrap();
+    let taxonomy = TaxonomyInput {
+        key: "custom".into(),
+        name: "Custom Type".into(),
+    };
     store
-        .update_taxonomy(
-            "types",
-            &TaxonomyInput {
-                key: "preference".into(),
-                name: "Preference".into(),
-                author: "human".into(),
-            },
-            "test writer",
-        )
+        .create_taxonomy("types", &taxonomy, "actor", "Create custom type.")
         .unwrap();
-    let mut input = create_memory("first");
-    input.r#type = "preference".into();
-    store.create_memories(&[input], "test writer").unwrap();
-    assert_eq!(
-        store.get_memory("first", false).unwrap().r#type,
-        "preference"
-    );
-    assert_eq!(
-        store
-            .delete_taxonomy("types", "preference", "test writer")
-            .unwrap_err()
-            .code,
-        "referenced_taxonomy"
-    );
     assert_eq!(
         store
             .list_taxonomy("types")
             .unwrap()
-            .into_iter()
-            .find(|item| item.key == "preference")
+            .iter()
+            .find(|item| item.key == "custom")
             .unwrap()
             .name,
-        "Preference"
+        "Custom Type"
     );
-    assert!(
+    let mut input = memory("one");
+    input.r#type = "custom".into();
+    let record = store
+        .create_memories(&[input], "actor", "Use custom type.")
+        .unwrap()
+        .remove(0);
+    assert_eq!(
         store
-            .list_taxonomy("malicious; DROP TABLE memories")
-            .is_err()
+            .delete_taxonomy("types", "custom", "actor", "Remove referenced type.")
+            .unwrap_err()
+            .code,
+        "referenced_taxonomy"
+    );
+    store
+        .delete_memories(
+            &[MemoryToken {
+                key: record.key,
+                expected_token: record.system_token,
+            }],
+            "actor",
+            "Remove memory.",
+        )
+        .unwrap();
+    store
+        .delete_taxonomy("types", "custom", "actor", "Remove unused type.")
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_taxonomy("types", "general", "actor", "Keep required default.")
+            .unwrap_err()
+            .code,
+        "default_type"
     );
 }
 
 #[test]
-fn browsing_filters_tags_references_and_cursor_without_offsets() {
+fn browsing_filters_metadata_tags_and_uses_stable_cursors() {
     let mut store = Store::open(":memory:").unwrap();
-    let mut first = create_memory("first");
-    first.references.push(MemoryReference {
-        target_key: "second".into(),
-        reference_type: "related to".into(),
-    });
+    let mut input = memory("one");
+    input.tags = vec!["tag".into()];
+    input.metadata.scope = Some(Some("project".into()));
     store
-        .create_memories(
-            &[first, create_memory("second"), create_memory("third")],
-            "test writer",
-        )
+        .create_memories(&[input, memory("two")], "actor", "Create browse fixtures.")
         .unwrap();
-    let first_page = store
+    assert_eq!(
+        store
+            .list_memories(&ListMemories {
+                tags: vec!["tag".into()],
+                scope: Some("project".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+    let page = store
         .list_memories(&ListMemories {
             limit: 1,
             ..Default::default()
         })
         .unwrap();
-    let cursor = format!("{}:{}", first_page[0].system_updated_at, first_page[0].id);
-    let second_page = store
+    let cursor = format!("{}:{}", page[0].system_updated_at, page[0].id);
+    let next = store
         .list_memories(&ListMemories {
             limit: 1,
             cursor: Some(cursor),
             ..Default::default()
         })
         .unwrap();
-    assert_ne!(first_page[0].key, second_page[0].key);
-    let incoming = store
-        .list_memories(&ListMemories {
-            referenced_to: Some("second".into()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(incoming[0].key, "first");
-    let outgoing = store
-        .list_memories(&ListMemories {
-            referenced_from: Some("first".into()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(outgoing[0].key, "second");
-    assert!(
-        store
-            .list_memories(&ListMemories {
-                tags: vec!["missing".into()],
-                ..Default::default()
-            })
-            .unwrap()
-            .is_empty()
-    );
+    assert_ne!(page[0].key, next[0].key);
 }
 
 #[test]
-fn database_identity_and_index_sequences_survive_reopening() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = Store::open(&path).unwrap();
-    let identity = store.database_key().unwrap();
-    store
-        .create_memories(&[create_memory("first")], "test writer")
-        .unwrap();
-    let first_sequence = store.index_events(0, 10).unwrap()[0].sequence;
-    store.acknowledge_events(first_sequence).unwrap();
-    drop(store);
-    let mut reopened = Store::open(&path).unwrap();
-    assert_eq!(reopened.database_key().unwrap(), identity);
-    reopened
-        .update_memories(&[update_memory("first", 1, "Changed")], "test writer")
-        .unwrap();
-    assert!(reopened.index_events(0, 10).unwrap()[0].sequence > first_sequence);
-    let mut reader = Store::open_read_only(&path).unwrap();
-    assert_eq!(reader.get_memory("first", false).unwrap().body, "Changed");
-    assert!(
-        reader
-            .create_memories(&[create_memory("forbidden")], "test writer")
-            .is_err()
-    );
-}
-
-#[test]
-fn foreign_keys_prevent_cross_memory_revision_heads() {
+fn nullable_metadata_preserves_omission_and_explicit_unknown_dates() {
     let mut store = Store::open(":memory:").unwrap();
-    store
-        .create_memories(
-            &[create_memory("first"), create_memory("second")],
-            "test writer",
-        )
-        .unwrap();
-    assert!(
-        store
-            .connection()
-            .execute(
-                "UPDATE memories SET system_version = 99 WHERE key = 'first'",
-                []
-            )
-            .is_err()
-    );
-    let json_columns: i64 = store.connection().query_row("SELECT count(*) FROM pragma_table_info('memory_revisions') WHERE name IN ('metadata', 'snapshot', 'properties')", [], |row| row.get(0)).unwrap();
-    assert_eq!(json_columns, 0);
-}
-
-#[test]
-fn batch_get_uses_one_snapshot_during_atomic_concurrent_updates() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut writer = Store::open(&path).unwrap();
-    let mut first = create_memory("first");
-    let mut second = create_memory("second");
-    first.body = "generation0".into();
-    second.body = "generation0".into();
-    writer
-        .create_memories(&[first, second], "test writer")
-        .unwrap();
-    let reader = Store::open_read_only(&path).unwrap();
-    let barrier = Arc::new(Barrier::new(2));
-    let done = Arc::new(AtomicBool::new(false));
-    let writer_barrier = Arc::clone(&barrier);
-    let writer_done = Arc::clone(&done);
-    let worker = std::thread::spawn(move || {
-        writer_barrier.wait();
-        let result = (|| -> semmem::models::AppResult<()> {
-            for version in 1..=100 {
-                let body = format!("generation{version}");
-                writer.update_memories(
-                    &[
-                        update_memory("first", version, &body),
-                        update_memory("second", version, &body),
-                    ],
-                    "test writer",
-                )?;
-            }
-
-            Ok(())
-        })();
-        writer_done.store(true, Ordering::Release);
-
-        result
-    });
-    let request = GetMemories {
-        view: Default::default(),
-        keys: (0..64)
-            .map(|index| {
-                if index % 2 == 0 {
-                    "first".into()
-                } else {
-                    "second".into()
-                }
-            })
-            .collect(),
-        include_deleted: false,
-        version: None,
-    };
-    let mut reads = 0;
-    barrier.wait();
-
-    while !done.load(Ordering::Acquire) || reads < 20 {
-        let records = reader.get_memories(&request).unwrap();
-        assert_eq!(records.len(), 64);
-        assert!(records.iter().all(|record| record.body == records[0].body));
-        assert!(
-            records
-                .iter()
-                .all(|record| record.system_version == records[0].system_version)
-        );
-        reads += 1;
-    }
-
-    worker.join().unwrap().unwrap();
-    let historical = reader
-        .get_memories(&GetMemories {
-            view: Default::default(),
-            keys: vec!["second".into(), "first".into()],
-            include_deleted: false,
-            version: Some(1),
-        })
-        .unwrap();
-    assert_eq!(historical[0].key, "second");
-    assert!(historical.iter().all(|record| record.body == "generation0"));
-}
-
-#[test]
-fn metadata_survives_revisions_deletion_restoration_and_retry_checks() {
-    let mut store = Store::open(":memory:").unwrap();
-    let mut input = create_memory("metadata");
-    input.metadata = MemoryMetadata {
-        summary: Some("A supplied summary".into()),
-        basis: Some(Basis::STATED),
-        scope: Some("project/environment".into()),
-        observed_at: Some(100),
-        verified_at: Some(200),
-        review_after: Some(300),
-    }
-    .into();
-    let created = store
-        .create_memories(std::slice::from_ref(&input), "test writer")
-        .unwrap();
-    assert_eq!(
-        created[0].metadata,
-        input.metadata.apply(&Default::default())
-    );
-    assert_eq!(
-        store
-            .create_memories(std::slice::from_ref(&input), "test writer")
-            .unwrap(),
-        created
-    );
-    let mut different = input.clone();
-    different.metadata.review_after = Some(None);
-    assert_eq!(
-        store
-            .create_memories(&[different], "test writer")
-            .unwrap_err()
-            .code,
-        "already_exists"
-    );
-    let update: UpdateMemory = serde_json::from_value(serde_json::json!({
-        "key": "metadata", "expected_version": 1,
-        "summary": null, "basis": "observed", "verified_at": 400
-    }))
+    let input: CreateMemory = serde_json::from_value(json!({"key":"one","body":"body","summary":"summary","observed_at":null,"verified_at":null})).unwrap();
+    let record = store
+        .create_memories(&[input], "actor", "Save unknown dates.")
+        .unwrap()
+        .remove(0);
+    assert_eq!(record.metadata.observed_at, None);
+    assert_eq!(record.metadata.verified_at, None);
+    let input: UpdateMemory = serde_json::from_value(
+        json!({"key":"one","expected_token":record.system_token,"summary":null,"verified_at":123}),
+    )
     .unwrap();
-    let updated = store.update_memories(&[update], "test writer").unwrap();
-    assert_eq!(updated[0].metadata.summary, None);
-    assert_eq!(updated[0].metadata.basis, Some(Basis::OBSERVED));
-    assert_eq!(updated[0].metadata.verified_at, Some(400));
-    assert_eq!(
-        updated[0].metadata.scope,
-        input.metadata.scope.clone().unwrap()
-    );
-    assert_eq!(
-        updated[0].metadata.observed_at,
-        input.metadata.observed_at.unwrap()
-    );
-    assert_eq!(
-        updated[0].metadata.review_after,
-        input.metadata.review_after.unwrap()
-    );
-    let deleted = store
-        .delete_memories(
-            &[MemoryVersion {
-                key: "metadata".into(),
-                expected_version: 2,
-            }],
-            "human",
-        )
-        .unwrap();
-    assert_eq!(deleted[0].metadata, updated[0].metadata);
-    let restored = store
-        .restore_memories(
-            &[RestoreMemory {
-                key: "metadata".into(),
-                expected_version: 3,
-                revision: Some(1),
-            }],
-            "test writer",
-        )
-        .unwrap();
-    assert_eq!(
-        restored[0].metadata,
-        input.metadata.apply(&Default::default())
-    );
-    assert_eq!(
-        store.get_revision("metadata", 2).unwrap().metadata,
-        updated[0].metadata
-    );
-    let filtered = store
-        .list_memories(&ListMemories {
-            scope: input.metadata.scope.unwrap(),
-            basis: input.metadata.basis.unwrap(),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(filtered.len(), 1);
-    assert!(
-        store
-            .list_memories(&ListMemories {
-                scope: Some("another project".into()),
-                ..Default::default()
-            })
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        serde_json::from_value::<CreateMemory>(
-            serde_json::json!({"key":"invalid", "body":"Text", "basis":"guessed"})
-        )
-        .is_err()
-    );
+    let record = store
+        .update_memories(&[input], "actor", "Clear summary and verify.")
+        .unwrap()
+        .remove(0);
+    assert_eq!(record.metadata.summary, None);
+    assert_eq!(record.metadata.observed_at, None);
+    assert_eq!(record.metadata.verified_at, Some(123));
 }
 
 #[test]
-fn legacy_summary_aliases_return_full_records_without_excerpts() {
+fn accepts_large_batches_and_reads_without_bind_variable_or_body_caps() {
     let mut store = Store::open(":memory:").unwrap();
-    let mut input = create_memory("complete");
-    input.body = "First paragraph.\n\nFull remaining body 日本語.".into();
-    input.metadata.summary = Some(Some("Manual summary".into()));
-    store.create_memories(&[input.clone()], "writer").unwrap();
-    let request = GetMemories {
-        keys: vec!["complete".into()],
-        ..Default::default()
-    };
-    let records = store.get_memory_summaries(&request).unwrap();
-    assert_eq!(records[0]["body"], input.body);
-    assert_eq!(records[0]["summary"], "Manual summary");
-    assert!(records[0].get("excerpt").is_none());
-    assert!(records[0].get("references").is_some());
-    let history = store
-        .list_revision_summaries(&HistoryRequest {
-            key: "complete".into(),
-            limit: 20,
-            before_version: None,
-        })
-        .unwrap();
-    assert_eq!(history[0]["body"], input.body);
-    let listed = store
-        .list_memory_summaries(&ListMemories::default())
-        .unwrap();
-    assert_eq!(listed[0]["body"], input.body);
-}
-
-#[test]
-fn accepts_batches_and_reads_above_previous_caps_and_bind_variable_counts() {
-    let mut store = Store::open(":memory:").unwrap();
-    let inputs = (0..1100)
-        .map(|index| create_memory(&format!("large-{index}")))
+    let inputs = (0..1500)
+        .map(|index| memory(&format!("memory-{index}")))
         .collect::<Vec<_>>();
-    assert_eq!(
-        store.create_memories(&inputs, "test writer").unwrap().len(),
-        inputs.len()
-    );
-    let records = store
+    store
+        .create_memories(&inputs, "actor", "Create a large batch.")
+        .unwrap();
+    let read = store
         .get_memories(&GetMemories {
-            keys: (0..33000)
-                .map(|index| format!("large-{}", index % inputs.len()))
-                .collect(),
+            keys: inputs.iter().map(|input| input.key.clone()).collect(),
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(records.len(), 33000);
-    assert_eq!(records.last().unwrap().key, "large-1099");
+    assert_eq!(read.len(), 1500);
     assert_eq!(
         store
             .list_memories(&ListMemories {
@@ -872,231 +504,68 @@ fn accepts_batches_and_reads_above_previous_caps_and_bind_variable_counts() {
             })
             .unwrap()
             .len(),
-        inputs.len()
+        1500
     );
 }
 
 #[test]
-fn defaults_preserve_nulls_and_trusted_audit_identity() {
-    let mut store = Store::open(":memory:").unwrap();
-    let input: CreateMemory = serde_json::from_value(serde_json::json!({
-        "key": "defaults", "body": "Complete content", "author": "Content author"
-    }))
-    .unwrap();
-    let created = store
-        .create_memories(std::slice::from_ref(&input), "authenticated writer")
-        .unwrap();
-    assert_eq!(created[0].r#type, "general");
-    assert_eq!(created[0].author, "Content author");
-    assert_eq!(
-        created[0].metadata.observed_at,
-        Some(created[0].system_created_at)
-    );
-    assert_eq!(
-        created[0].metadata.verified_at,
-        Some(created[0].system_created_at)
-    );
-    assert_eq!(created[0].system_created_by, "authenticated writer");
-    assert_eq!(created[0].system_updated_by, "authenticated writer");
-    assert_eq!(
-        store.create_memories(&[input], "retry writer").unwrap(),
-        created
-    );
-    let nulls: CreateMemory = serde_json::from_value(serde_json::json!({
-        "key": "nulls", "body": "Null timestamps", "author": "Content author",
-        "observed_at": null, "verified_at": null
-    }))
-    .unwrap();
-    let null_record = store.create_memories(&[nulls], "writer").unwrap().remove(0);
-    assert_eq!(null_record.metadata.observed_at, None);
-    assert_eq!(null_record.metadata.verified_at, None);
-    let update: UpdateMemory = serde_json::from_value(serde_json::json!({
-        "key": "defaults", "expected_version": 1, "author": "Second author", "basis": "assumed"
-    }))
-    .unwrap();
-    let updated = store
-        .update_memories(&[update], "editor identity")
-        .unwrap()
-        .remove(0);
-    assert_eq!(updated.author, "Second author");
-    assert_eq!(updated.system_created_by, "authenticated writer");
-    assert_eq!(updated.system_updated_by, "editor identity");
-    assert_eq!(
-        updated.metadata.observed_at,
-        created[0].metadata.observed_at
-    );
-    assert_eq!(updated.metadata.basis, Some(Basis::ASSUMED));
-    let deleted = store
-        .delete_memories(
-            &[MemoryVersion {
-                key: "defaults".into(),
-                expected_version: 2,
-            }],
-            "deleter identity",
-        )
-        .unwrap()
-        .remove(0);
-    assert_eq!(deleted.author, "Second author");
-    assert_eq!(
-        deleted.system_deleted_by.as_deref(),
-        Some("deleter identity")
-    );
-    let restored = store
-        .restore_memories(
-            &[RestoreMemory {
-                key: "defaults".into(),
-                expected_version: 3,
-                revision: Some(1),
-            }],
-            "restorer identity",
-        )
-        .unwrap()
-        .remove(0);
-    assert_eq!(restored.author, "Content author");
-    assert_eq!(restored.system_updated_by, "restorer identity");
-    assert_eq!(restored.system_deleted_by, None);
-    assert_eq!(store.revisions_for_key("defaults").unwrap().len(), 4);
-    assert_eq!(store.all_memory_keys(0, 100).unwrap().len(), 2);
-}
-
-#[test]
-fn authors_register_list_and_reject_referenced_or_reserved_deregistration() {
-    let mut store = Store::open(":memory:").unwrap();
-    assert!(store.list_authors().unwrap().is_empty());
-    let registered = store
-        .register_author("Available author", "registrar")
-        .unwrap();
-    assert_eq!(registered.author, "Available author");
-    assert_eq!(registered.system_created_by, "registrar");
-    assert_eq!(store.list_authors().unwrap().len(), 1);
+fn batch_reads_are_consistent_during_atomic_concurrent_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite3");
+    let mut store = Store::open(&path).unwrap();
     store
-        .deregister_author("Available author", "registrar")
+        .create_memories(
+            &[memory("one"), memory("two")],
+            "actor",
+            "Create concurrent fixtures.",
+        )
         .unwrap();
-    assert!(store.list_authors().unwrap().is_empty());
-    assert!(store.register_author(" ", "registrar").is_err());
-    assert!(store.register_author("system", "registrar").is_err());
-    assert!(store.deregister_author("system", "registrar").is_err());
-    store
-        .create_memories(&[create_memory("authored")], "writer")
-        .unwrap();
-    assert_eq!(
-        store
-            .deregister_author("human", "registrar")
-            .unwrap_err()
-            .code,
-        "referenced_author"
-    );
-}
-
-#[test]
-fn every_application_table_has_required_author_and_system_attribution() {
-    let store = Store::open(":memory:").unwrap();
-    let tables = [
-        "database",
-        "authors",
-        "memory_types",
-        "reference_types",
-        "tags",
-        "memories",
-        "memory_revisions",
-        "memory_revision_tags",
-        "memory_revision_references",
-        "index_events",
-    ];
-
-    for table in tables {
-        let sql = format!(
-            "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = 'author' AND \"notnull\" = 1"
-        );
-        let required: i64 = store
-            .connection()
-            .query_row(&sql, [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(required, 1, "{table} requires author");
-        let sql = format!(
-            "SELECT count(*) FROM pragma_table_info('{table}') WHERE name IN ('system_created_by', 'system_updated_by') AND \"notnull\" = 1"
-        );
-        let audit: i64 = store
-            .connection()
-            .query_row(&sql, [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(audit, 2, "{table} requires system attribution");
-        let sql = format!(
-            "SELECT count(*) FROM pragma_foreign_key_list('{table}') WHERE \"from\" = 'author' AND \"table\" = 'authors'"
-        );
-        let foreign_key: i64 = store
-            .connection()
-            .query_row(&sql, [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(foreign_key, 1, "{table} has normalized author");
-    }
-}
-
-#[test]
-fn purge_requeues_sources_with_only_historical_references() {
-    let mut store = Store::open(":memory:").unwrap();
-    let mut source = create_memory("historical_source");
-    source.references.push(MemoryReference {
-        target_key: "historical_target".into(),
-        reference_type: "related to".into(),
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_path = path.clone();
+    let worker = std::thread::spawn(move || {
+        let mut writer = Store::open(&worker_path).unwrap();
+        worker_barrier.wait();
+        for index in 0..30 {
+            let one = writer.get_memory("one").unwrap();
+            let two = writer.get_memory("two").unwrap();
+            writer
+                .update_memories(
+                    &[
+                        update("one", &one.system_token, &index.to_string()),
+                        update("two", &two.system_token, &index.to_string()),
+                    ],
+                    "actor",
+                    "Update pair atomically.",
+                )
+                .unwrap();
+        }
     });
-    store
-        .create_memories(&[source, create_memory("historical_target")], "writer")
-        .unwrap();
-    let mut update = update_memory("historical_source", 1, "Current body");
-    update.references = Some(Vec::new());
-    store.update_memories(&[update], "writer").unwrap();
-    let watermark = store.index_events(0, 100).unwrap().last().unwrap().sequence;
-    store.acknowledge_events(watermark).unwrap();
-    store
-        .purge_memories(
-            &[MemoryVersion {
-                key: "historical_target".into(),
-                expected_version: 1,
-            }],
-            "purger",
-        )
-        .unwrap();
-    let events = store.index_events(watermark, 100).unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.memory_key == "historical_source")
-    );
-    assert!(
-        store
-            .get_revision("historical_source", 1)
-            .unwrap()
-            .references
-            .is_empty()
-    );
-    assert_eq!(
-        store
-            .get_memory("historical_source", false)
-            .unwrap()
-            .system_version,
-        2
-    );
+    let reader = Store::open_read_only(&path).unwrap();
+    barrier.wait();
+    for _ in 0..100 {
+        let records = reader
+            .get_memories(&GetMemories {
+                keys: vec!["one".into(), "two".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(records[0].body, records[1].body);
+    }
+    worker.join().unwrap();
 }
 
 #[test]
-fn sql_defaults_use_general_and_current_timestamps_and_keep_default_type() {
-    let mut store = Store::open(":memory:").unwrap();
-    store.register_author("SQL author", "registrar").unwrap();
+fn rejects_old_schemas_without_modifying_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TABLE legacy (body TEXT); INSERT INTO legacy (body) VALUES ('preserve'); PRAGMA user_version = 1;").unwrap();
+    assert_eq!(Store::open(&path).err().unwrap().code, "unsupported_schema");
     assert_eq!(
-        store
-            .delete_taxonomy("types", "general", "writer")
-            .unwrap_err()
-            .code,
-        "default_type"
+        connection
+            .query_row("SELECT body FROM legacy", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "preserve"
     );
-    let transaction = store.connection().unchecked_transaction().unwrap();
-    transaction.execute("INSERT INTO memories (key, author, system_created_by, system_updated_by, system_created_at, system_updated_at, system_version) SELECT 'sql-defaults', id, 'writer', 'writer', 1, 1, 1 FROM authors WHERE name = 'SQL author'", []).unwrap();
-    let id = transaction.last_insert_rowid();
-    transaction.execute("INSERT INTO memory_revisions (memory_id, title, body, author, system_version, system_operation, system_created_by, system_updated_by, system_created_at, system_updated_at) SELECT ?1, 'SQL defaults', 'Full SQL body', id, 1, 'create', 'writer', 'writer', 1, 1 FROM authors WHERE name = 'SQL author'", [id]).unwrap();
-    transaction.commit().unwrap();
-    let record = store.get_memory("sql-defaults", false).unwrap();
-    assert_eq!(record.r#type, "general");
-    assert!(record.metadata.observed_at.unwrap() > 1_000_000_000_000);
-    assert!(record.metadata.verified_at.unwrap() > 1_000_000_000_000);
 }

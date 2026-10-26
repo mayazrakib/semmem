@@ -11,14 +11,11 @@ fn create_memory(id: i64, key: &str, title: &str, body: &str) -> MemoryRecord {
         r#type: "note".into(),
         tags: vec![],
         references: vec![],
-        author: "test".into(),
-        system_version: 1,
+        system_token: "token-1".into(),
         system_created_at: 1,
         system_updated_at: 1,
-        system_deleted_at: None,
         system_created_by: "test".into(),
         system_updated_by: "test".into(),
-        system_deleted_by: None,
     }
 }
 
@@ -32,9 +29,6 @@ fn create_request(query: &str) -> SearchRequest {
         prefix: false,
         fuzzy: true,
         limit: 20,
-        history: false,
-        as_of: None,
-        include_deleted: false,
     }
 }
 
@@ -259,7 +253,7 @@ fn should_publish_cloned_reader_and_replace_and_delete_without_duplicates() {
     assert_eq!(reader.search(&create_request("oldword")).unwrap().total, 1);
 
     memory.body = "newword".into();
-    memory.system_version = 2;
+    memory.system_token = "token-2".into();
     index.upsert(&memory).unwrap();
     index.upsert(&memory).unwrap();
     index.commit(2).unwrap();
@@ -267,7 +261,7 @@ fn should_publish_cloned_reader_and_replace_and_delete_without_duplicates() {
     let response = reader.search(&create_request("newword")).unwrap();
 
     assert_eq!(response.total, 1);
-    assert_eq!(response.hits[0].version, 2);
+    assert_eq!(response.hits[0].system_token, "token-2");
 
     let mut old_query = create_request("oldword");
     old_query.fuzzy = false;
@@ -526,7 +520,7 @@ fn should_publish_summary_only_updates_and_remove_old_scope_matches() {
     memory.metadata.scope = Some("oldscope".into());
     index.upsert(&memory).unwrap();
     index.commit(1).unwrap();
-    memory.system_version = 2;
+    memory.system_token = "token-2".into();
     memory.metadata.summary = Some("newsummary".into());
     memory.metadata.scope = Some("newscope".into());
     index.upsert(&memory).unwrap();
@@ -536,7 +530,10 @@ fn should_publish_summary_only_updates_and_remove_old_scope_matches() {
     assert_eq!(reader.search(&old).unwrap().total, 0);
     let mut current = create_request("newsummary");
     current.scope = Some("newscope".into());
-    assert_eq!(reader.search(&current).unwrap().hits[0].version, 2);
+    assert_eq!(
+        reader.search(&current).unwrap().hits[0].system_token,
+        "token-2"
+    );
     current.scope = Some("oldscope".into());
     assert_eq!(reader.search(&current).unwrap().total, 0);
 }
@@ -613,93 +610,42 @@ fn should_return_full_body_when_only_the_title_matches() {
 }
 
 #[test]
-fn should_search_retained_revisions_and_as_of_snapshots_before_limiting() {
+fn should_overwrite_content_and_reopen_only_current_records() {
     let directory = tempfile::tempdir().unwrap();
-    let mut index = SearchIndex::open(directory.path()).unwrap();
-    let mut original = create_memory(1, "revised", "", "Original registry body\n\n東京");
-    original.system_updated_at = 10;
-    original.metadata.scope = Some("original".into());
-    let mut changed = original.clone();
-    changed.system_version = 2;
-    changed.system_updated_at = 20;
-    changed.body = "Changed registry body".into();
-    changed.metadata.scope = Some("changed".into());
-    let mut deleted = changed.clone();
-    deleted.system_version = 3;
-    deleted.system_updated_at = 30;
-    deleted.system_deleted_at = Some(30);
-    deleted.system_deleted_by = Some("test".into());
-    index
-        .replace_revisions(
-            "revised",
-            &[original.clone(), changed.clone(), deleted.clone()],
-        )
-        .unwrap();
-    index.commit(1).unwrap();
-    let mut request = create_request("registry");
-    request.limit = 1;
-    assert_eq!(index.search(&request).unwrap().total, 0);
-    request.include_deleted = true;
-    assert_eq!(index.search(&request).unwrap().hits[0].version, 3);
-    request.include_deleted = false;
-    request.history = true;
-    let historical = index.search(&request).unwrap();
-    assert_eq!(historical.total, 2);
-    assert_eq!(historical.hits.len(), 1);
-    assert!(historical.truncated);
-    request.scope = Some("original".into());
-    let historical = index.search(&request).unwrap();
-    assert_eq!(historical.total, 1);
-    assert_eq!(historical.hits[0].body, original.body);
-    assert_eq!(historical.hits[0].system_updated_at, 10);
-    assert_eq!(historical.hits[0].system_created_at, 1);
-    assert_eq!(historical.hits[0].system_created_by, "test");
-    assert_eq!(historical.hits[0].author, "test");
-    request.history = false;
-    request.scope = None;
-    request.as_of = Some(9);
-    assert_eq!(index.search(&request).unwrap().total, 0);
-    request.as_of = Some(10);
-    assert_eq!(index.search(&request).unwrap().hits[0].version, 1);
-    request.as_of = Some(20);
-    assert_eq!(index.search(&request).unwrap().hits[0].version, 2);
-    request.as_of = Some(30);
-    assert_eq!(index.search(&request).unwrap().total, 0);
-    request.include_deleted = true;
-    assert_eq!(index.search(&request).unwrap().hits[0].version, 3);
-    request.history = true;
-    assert!(index.search(&request).is_err());
-    request.as_of = None;
-    index.remove("revised").unwrap();
-    index.commit(2).unwrap();
-    assert_eq!(index.search(&request).unwrap().total, 0);
-}
+    let mut memory = create_memory(1, "updated", "", "obsoleteword original body");
 
-#[test]
-fn should_choose_highest_version_at_equal_timestamps_and_reopen_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut original = create_memory(1, "equal", "", "Shared registry original");
-    original.system_updated_at = 20;
-    let mut changed = original.clone();
-    changed.system_version = 2;
-    changed.body = "Shared registry updated".into();
     {
         let mut index = SearchIndex::open(directory.path()).unwrap();
-        index
-            .replace_revisions("equal", &[changed.clone(), original.clone()])
-            .unwrap();
+        index.upsert(&memory).unwrap();
         index.commit(1).unwrap();
+        memory.body = "replacementword current body".into();
+        memory.system_token = "replacement-token".into();
+        index.upsert(&memory).unwrap();
+        index.commit(2).unwrap();
+        assert_eq!(
+            index.search(&create_request("obsoleteword")).unwrap().total,
+            0
+        );
     }
-    let index = SearchIndex::open(directory.path()).unwrap();
-    let mut request = create_request("registry");
-    request.as_of = Some(20);
-    assert_eq!(index.search(&request).unwrap().hits[0].version, 2);
-    request.as_of = None;
-    request.history = true;
-    let response = index.search(&request).unwrap();
-    assert_eq!(response.total, 2);
-    assert_eq!(response.hits[0].version, 2);
-    assert_eq!(response.hits[1].version, 1);
+
+    let mut index = SearchIndex::open(directory.path()).unwrap();
+    let response = index.search(&create_request("replacementword")).unwrap();
+    assert_eq!(response.total, 1);
+    assert_eq!(response.hits[0].system_token, "replacement-token");
+    assert_eq!(response.hits[0].body, memory.body);
+    assert_eq!(
+        index.search(&create_request("obsoleteword")).unwrap().total,
+        0
+    );
+    index.remove("updated").unwrap();
+    index.commit(3).unwrap();
+    assert_eq!(
+        index
+            .search(&create_request("replacementword"))
+            .unwrap()
+            .total,
+        0
+    );
 }
 
 #[test]

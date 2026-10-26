@@ -1,6 +1,6 @@
 # Performance qualification
 
-The retained measurements predate the new schema v1 and historical revision index. They do not establish performance for current full-body responses or historical search.
+The retained measurements predate the current-state architecture and required audit commits. They do not establish performance for the current implementation.
 
 The historical version-two section describes the earlier schema and its former application limits. They are retained as historical evidence, not measurements of the metadata update. New benchmark runs use a fresh compatible fixture and report construction, process startup, first request, and warm requests separately. A process restart reuses operating-system caches and does not establish cold-disk performance.
 
@@ -8,7 +8,7 @@ Measurements use a release build on Linux x86-64 under a Microsoft hypervisor, w
 
 ## Semmem schema version three
 
-The final `semmem` run reused the compatible million-record schema-three fixture, with 16 clients and 100 iterations per client. [The final report](../benchmark/semmem-million.json) records all samples and startup probes. [The initial schema-three report](../benchmark/schema3-initial-million.json) preserves fixture creation and the first full index construction. Historical version-two reports below remain unchanged.
+The final `semmem` run reused the compatible million-record schema-three fixture, with 16 clients and 100 iterations per client. [The final report](../benchmarks/results/semmem-million.json) records all samples and startup probes. [The initial schema-three report](../benchmarks/results/schema3-initial-million.json) preserves fixture creation and the first full index construction. Historical version-two reports below remain unchanged.
 
 | Scenario | Final p95 |
 |---|---:|
@@ -26,7 +26,7 @@ All isolated acceptance gates passed. The loaded write p95 exceeded the separate
 
 The final restart probe opened the existing index in 4.97 ms, then served its first request in 1.16 ms. The initial schema-three process built the index in 176.06 seconds, then served its first request in 1.63 ms. Those construction and reopening workloads are distinct. Every startup probe ran in its own process; operating-system caches were not flushed. These measurements exclude HTTP, OAuth, MCP framing, and client/model latency.
 
-[Historical source checksums](../benchmark/semmem-source.sha256) identify the source measured in that historical run. The current initializer and revision-aware retrieval require fresh measurements. Tantivy retains its required finite writer arena and index-maintenance merge policy; those settings do not reject caller input. Production request counts, payloads, query expansion, pool growth, and queues have no application ceilings, and no token budgeting or embeddings are used.
+[Historical source checksums](../benchmarks/results/semmem-source.sha256) identify the source measured in that historical run. The current initializer and audited current-state retrieval require fresh measurements. Tantivy uses a configurable writer arena through `SEMMEM_INDEX_MEMORY_BYTES` (default 64 MiB) and worker count through `SEMMEM_INDEX_THREADS` (default available hardware threads, constrained by Tantivy's minimum arena per worker). Callers can increase these settings without an application maximum. The standard Tantivy merge policy applies; no custom document-count merge threshold is imposed. These index-construction settings do not cap database growth or reject caller input. Production request counts, payloads, query expansion, pool growth, and queues have no application ceilings, and no token budgeting or embeddings are used.
 
 ## Historical version-two results
 
@@ -42,7 +42,7 @@ Each isolated query has three warmup calls followed by 100 measured calls. Resul
 
 The initial million-memory run missed the broad phrase target: p95 was 40.70 ms against a 20 ms target. Bounded fuzzy expansion and a four-thread executor reduced it to 26.96 ms, which still failed. Inspection found one segment holding approximately 94 percent of the corpus, preventing useful segment-level parallelism.
 
-The current implementation uses Tantivy's existing log merge policy with four-segment merge groups and a 50,000-document merge-eligibility threshold. Resulting segments can exceed that threshold, but the policy avoids repeatedly merging them into one giant segment. The balanced rebuild brought the same broad phrase query to 10.07 ms p95 without changing its query, corpus, exact count, or ranking semantics.
+The measured implementation used Tantivy's existing log merge policy with four-segment merge groups and a 50,000-document merge-eligibility threshold. Resulting segments can exceed that threshold, but the policy avoids repeatedly merging them into one giant segment. The balanced rebuild brought the same broad phrase query to 10.07 ms p95 without changing its query, corpus, exact count, or ranking semantics.
 
 The deletion-ratio setting applies only to segments eligible for merging. It does not establish a global tombstone-space bound. A rebuild can reclaim space retained by larger segments.
 
@@ -75,7 +75,7 @@ The batch-window experiment retained identical queries and the same million-memo
 | 5 ms | 120.23 ms | 339.28 ms | Pass |
 | 10 ms | 236.26 ms | 1,143.27 ms | Fail |
 
-The 2 ms default is retained. The small 1 versus 2 ms difference does not establish a reliable winner from one run, and longer windows did not improve this workload. Raw measurements, including the earlier phrase failures and the 10 ms write failure, are preserved in [benchmark evidence](../benchmark/). [The final default-window report](../benchmark/benchmark-million-window-2.json) contains every percentile and the workload counters. [Source checksums](../benchmark/source.sha256) identify the final implementation and benchmark source tree.
+The 2 ms default is retained. The small 1 versus 2 ms difference does not establish a reliable winner from one run, and longer windows did not improve this workload. Raw measurements, including the earlier phrase failures and the 10 ms write failure, are preserved in [benchmark evidence](../benchmarks/results/). [The final default-window report](../benchmarks/results/benchmark-million-window-2.json) contains every percentile and the workload counters. [Source checksums](../benchmarks/results/source.sha256) identify the final implementation and benchmark source tree.
 
 ## Reproduction
 
@@ -90,7 +90,7 @@ cargo bench --locked --bench search -- \
     --data-dir ./target/benchmark-million
 ```
 
-The harness rejects an existing database without its completed benchmark-fixture identity. It reports whether the fixture was created and whether an index existed before opening. Initial fixture generation and index construction take substantially longer than reopening a ready index. Schema and search-generation changes can trigger migrations or an index rebuild.
+The harness rejects an existing database without its completed benchmark-fixture identity. It reports whether the fixture was created and whether an index existed before opening. Initial fixture generation and index construction take substantially longer than reopening a ready index. Incompatible database schemas are rejected; search-generation changes can require an index rebuild.
 
 Reports include p50/p95/p99, mixed throughput, process peak RSS, active storage, retained replaced-index storage, mixed-workload disk growth, and queue/transaction/publication telemetry. Peak RSS during a full rebuild and peak RSS while reopening an index describe different workloads and must not be compared as equivalent steady-state measurements.
 

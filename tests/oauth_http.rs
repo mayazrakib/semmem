@@ -50,7 +50,12 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
     let address = format!("http://{}", listener.local_addr()?);
     let audience = format!("{address}/mcp");
     let auth = Arc::new(
-        OAuth::discover_with_http(issuer_url.clone(), audience.clone(), address.clone(), true)
+        OAuth::discover_with_http(
+            issuer_url.clone(),
+            audience.clone(),
+            address.clone(),
+            true,
+        )
             .await?,
     );
     let application = remote_router(
@@ -70,7 +75,12 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
             &encoder,
         )
     };
-    let token = make_token("memory:read", &issuer_url, &audience, now + 300)?;
+    let token = make_token(
+        "memory:read",
+        &issuer_url,
+        &audience,
+        now + 300,
+    )?;
     assert_eq!(
         auth.validate(&token, "memory:read").await.unwrap().sub,
         "test-human"
@@ -123,8 +133,8 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
             .to_str()?
             .contains("resource_metadata")
     );
-    let denied_purge = client.post(format!("{address}/mcp")).bearer_auth(&token).json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"purge_memories","arguments":{"memories":[]}}})).send().await?;
-    assert_eq!(denied_purge.status(), 403);
+    let denied_delete = client.post(format!("{address}/mcp")).bearer_auth(&token).json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_memories","arguments":{"memories":[]}}})).send().await?;
+    assert_eq!(denied_delete.status(), 403);
     let token = make_token(
         "memory:read memory:write memory:purge",
         &issuer_url,
@@ -146,7 +156,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
     let created = peer
         .call_tool(
             CallToolRequestParams::new("create_memories").with_arguments(
-                json!({"memories":[{"key":"network","author":"test author", "body":"Network MCP memory"}]})
+                json!({"commit_summary":"Test change", "memories":[{"key":"network","body":"Network MCP memory"}]})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -155,7 +165,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
         .await?;
     assert_ne!(created.is_error, Some(true));
     let record = &created.structured_content.as_ref().unwrap()["memories"][0];
-    assert_eq!(record["author"], "test author");
+    assert!(record.get("author").is_none());
     assert_eq!(record["system_created_by"], "test-human");
     assert_eq!(record["system_updated_by"], "test-human");
     let large_body = format!(
@@ -165,7 +175,7 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
     let created_large = peer
         .call_tool(
             CallToolRequestParams::new("create_memories").with_arguments(
-                json!({"memories":[{"key":"network-large", "author":"test author", "body": large_body, "summary":"Authenticated manual summary", "scope":"network"}]})
+                json!({"commit_summary":"Test change", "memories":[{"key":"network-large", "body": large_body, "summary":"Authenticated manual summary", "scope":"network"}]})
                     .as_object().unwrap().clone(),
             ),
         ).await?;
