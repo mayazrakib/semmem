@@ -347,7 +347,7 @@ fn audit_log_is_append_only_and_cursor_pages_and_ids_are_stable() {
             .execute("DELETE FROM commits WHERE id = ?1", [id])
             .is_err()
     );
-    assert!(connection.execute("INSERT INTO commits (key,summary,operation,actor,changes,system_created_at,system_updated_at) VALUES ('bad',' ','update','actor','[]',1,1)", []).is_err());
+    assert!(connection.execute("INSERT INTO commits (key,summary,operation,actor,system_created_at,system_updated_at) VALUES ('bad',' ','update','actor',1,1)", []).is_err());
 }
 
 #[test]

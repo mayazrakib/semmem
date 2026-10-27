@@ -21,7 +21,7 @@ Create a memory with `semmem add reading --message "Record reading preferences."
 
 ## 3. Features
 
-Atomic writes use opaque concurrency tokens. Every mutation requires an audit message. Deletion permanently removes the selected records and their incoming and outgoing references. Previous bodies, snapshots, and historical search are unavailable. Retrieval returns complete Markdown bodies with metadata.
+Atomic writes use opaque concurrency tokens. Every mutation requires an audit message. Deletion permanently removes the selected records and their incoming and outgoing references. Previous bodies, snapshots, and historical search are unavailable. Retrieval returns complete Markdown bodies with metadata. Immutable Work events support atomic batched appends, idempotent UUID retries, and filtered chronological browsing through MCP and the CLI.
 
 ## 4. Architecture
 
@@ -34,6 +34,7 @@ SQLite is authoritative, and Tantivy is rebuildable. The service owns storage; c
 | Rust | 1.98.0 | Compiler and Cargo toolchain. |
 | SQLite and Tantivy | See `Cargo.lock` | Durable records and rebuildable lexical search. |
 | Axum, Tokio, and rmcp | See `Cargo.lock` | HTTP, asynchronous runtime, and MCP transport. |
+| Chrono | 0.4.45 | Strict event timestamp parsing and fixed-offset formatting. |
 | Clap and terminal libraries | See `Cargo.toml` and `Cargo.lock` | Command parsing and terminal interface. |
 
 ## 6. Roadmap

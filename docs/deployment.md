@@ -92,8 +92,8 @@ Scopes are independent:
 
 | Scope | Operations |
 |---|---|
-| `memory:read` | MCP discovery and session requests, search, reads, browsing, taxonomy lists, and commit audit reads |
-| `memory:write` | Memory creation, updates, and taxonomy writes |
+| `memory:read` | MCP discovery and session requests, search, reads, browsing, taxonomy lists, commit audit reads, and work-event reads |
+| `memory:write` | Memory creation, updates, taxonomy writes, and work-event appends |
 | `memory:purge` | Permanent memory deletion |
 
 Give a client all scopes needed by its workflow. A write-only token does not substitute for `memory:read` during MCP initialization. The local socket uses filesystem access control instead of OAuth and permits all operations. It is intended for the service account's CLI access, not exposure through the public reverse proxy.
@@ -102,7 +102,7 @@ Remote writes are attributed to `ai client`; local writes are attributed to `hum
 
 ## Editing and Audit
 
-Every mutating CLI command requires `--message "Describe the change."`. MCP mutation envelopes require `commit_summary`. The optional memory `summary` remains separate. Reads return an opaque `system_token`; existing-record writes require that value as `expected_token` through MCP or `--expected-token` where exposed by the CLI. The editor reads and preserves its concurrency token automatically. Conflicts require rereading and reconciling current state.
+Every mutating memory or taxonomy CLI command requires `--message "Describe the change."`. MCP memory and taxonomy mutation envelopes require `commit_summary`. Work event appends instead require `summary` in their JSON batch. The optional memory `summary` remains separate. Reads return an opaque `system_token`; existing-record writes require that value as `expected_token` through MCP or `--expected-token` where exposed by the CLI. The editor reads and preserves its concurrency token automatically. Conflicts require rereading and reconciling current state.
 
 `add` opens a private Markdown body draft using `VISUAL`, then `EDITOR`, then `vim`. `edit KEY` opens the complete memory object as YAML frontmatter followed by its Markdown body. Editor command arguments and quoted executable paths are supported. The frontmatter exposes title, type, tags, references, and all six memory metadata fields. Internal IDs, the key, and system metadata are read-only; changing them rejects the save. Optional fields can be cleared with YAML `null`. The body after the closing frontmatter delimiter is preserved exactly. The database transaction starts after the editor exits.
 
@@ -110,12 +110,16 @@ Editor errors, invalid UTF-8, concurrency-token conflicts, and service errors pr
 
 `delete` permanently removes a memory and its incoming and outgoing references. There is no soft deletion, restoration, historical search, or separate purge operation. Remote deletion requires `memory:purge`; `memory:write` alone is insufficient. `commits` lists audit entries, and `commit` reads an audit entry. Audit entries describe mutations without storing previous bodies or snapshots.
 
-SQLite is authoritative. The search directory is derived, and the service replays pending index events or rebuilds unusable indexes during startup. A successful write response follows search-index publication. Stop the service before making a simple filesystem copy of its data directory for backup; copying a live SQLite file alone is not a consistent backup procedure.
+SQLite is authoritative. The search directory is derived, and the service replays pending index events or rebuilds unusable indexes during startup. A successful memory write response follows search-index publication. Work logging is acknowledged after SQLite commit and does not publish to the search index. Stop the service before making a simple filesystem copy of its data directory for backup; copying a live SQLite file alone is not a consistent backup procedure.
 
 These instructions describe the delivered configuration. They do not establish a live public deployment or compatibility with a particular OAuth provider or AI client.
 
 ## Schema Reset Deployment
 
-The current initializer defines schema v2. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
+The current initializer defines schema v4. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
 
-For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v2 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.
+For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v4 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.
+
+## Batched Work Logging
+
+`semmem append_logs` reads one JSON object containing `summary` and `events` from standard input. Each event contains `id`, `level`, `source`, `message`, and `timestamp`; `task_id` and `scope` are optional. `semmem get_logs UUID...` reads events by ID. `semmem list_logs` accepts `--task-id`, `--scope`, `--source`, `--level`, `--since`, `--until`, `--limit`, and `--cursor`. These commands emit structured JSON. MCP exposes the same three operations. See [schema](schema.md) for timestamp, idempotency, and receipt contracts. Logs have no edit or delete operation.

@@ -1,0 +1,96 @@
+{
+    "architecture": "x86_64",
+    "measurements": [
+        {
+            "batch_size": 1,
+            "elapsed_seconds": 8.85626245,
+            "events": 2000,
+            "events_per_second": 225.8288991876026,
+            "index_events": 0,
+            "repetition": 0,
+            "request_p50_ms": 4.2558810000000005,
+            "request_p95_ms": 4.568115000000001,
+            "storage_growth_bytes": 5561384,
+            "transactions": 2000
+        },
+        {
+            "batch_size": 100,
+            "elapsed_seconds": 0.167988379,
+            "events": 2000,
+            "events_per_second": 11905.58544528845,
+            "index_events": 0,
+            "repetition": 0,
+            "request_p50_ms": 6.294715999999999,
+            "request_p95_ms": 26.275106,
+            "storage_growth_bytes": 3621480,
+            "transactions": 20
+        },
+        {
+            "batch_size": 1,
+            "elapsed_seconds": 19.004595727,
+            "events": 2000,
+            "events_per_second": 105.237702960373,
+            "index_events": 0,
+            "repetition": 1,
+            "request_p50_ms": 5.9431270000000005,
+            "request_p95_ms": 23.675161,
+            "storage_growth_bytes": 5561384,
+            "transactions": 2000
+        },
+        {
+            "batch_size": 100,
+            "elapsed_seconds": 0.131495943,
+            "events": 2000,
+            "events_per_second": 15209.594717306221,
+            "index_events": 0,
+            "repetition": 1,
+            "request_p50_ms": 6.0479449999999995,
+            "request_p95_ms": 10.116108,
+            "storage_growth_bytes": 3621480,
+            "transactions": 20
+        },
+        {
+            "batch_size": 1,
+            "elapsed_seconds": 11.192681905,
+            "events": 2000,
+            "events_per_second": 178.68818366995305,
+            "index_events": 0,
+            "repetition": 2,
+            "request_p50_ms": 4.3044839999999995,
+            "request_p95_ms": 8.952379,
+            "storage_growth_bytes": 5561384,
+            "transactions": 2000
+        },
+        {
+            "batch_size": 100,
+            "elapsed_seconds": 0.23704897,
+            "events": 2000,
+            "events_per_second": 8437.075259175352,
+            "index_events": 0,
+            "repetition": 2,
+            "request_p50_ms": 10.906676000000001,
+            "request_p95_ms": 32.698839,
+            "storage_growth_bytes": 3621480,
+            "transactions": 20
+        }
+    ],
+    "operating_system": "linux",
+    "revision": "d6fed984f1da6b652020725b7077d2b945cd9d61",
+    "working_tree": "Logging implementation under verification; recorded source hashes accompany results.",
+    "workload": "Sequential in-process durable appends; identical events, three repetitions, fresh databases, no warmup, transport excluded, OS caches not flushed.",
+    "toolchain": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "kernel": "6.18.54.1-microsoft-standard-WSL2",
+    "cpu": "AMD Ryzen 9 9950X3D",
+    "logical_cpus": 24,
+    "source_capture": "Source captured after measurement; src/service.rs gained an interleaved-writer unit test during the run, with no runtime changes.",
+    "source_sha256": {
+        "Cargo.toml": "21eafc909252731d5109573574fad2b9a9674346af74e7531628fa3f878ed146",
+        "Cargo.lock": "aab12f1c8445e09c06f3f3dfe0ebac5e8f6109ff311785acc56cd4ec3c3f3336",
+        "database/initialize.sql": "ede8ea42e76724800ca3b0abdb89cdc02b17fa51c73d0bfc0ecdf87b90021742",
+        "src/logging.rs": "a07cfbcc5c28491d4ca75e6c0f1a8826d966649a103ffa3f4bd7bf989e4ac8ea",
+        "src/storage.rs": "128efe14e4b141229f28cccb87d726f5b7c3768e4260f3e2e436a36c91b2cd7b",
+        "src/service.rs": "c51b27539fa4a5cd5051e8349b08cf69da1b7d4754cf259f523644f4b4fdfd79",
+        "tests/perf/logging.rs": "863957255440aca7ccae70b67f7890c1d58725a8726df768fc251063d09da7b3"
+    },
+    "benchmark_binary_sha256": "1e9b0cb618de46c5786e81b205c7ac33a1c6c6d51ab6e037ef6756e8a3308190"
+}

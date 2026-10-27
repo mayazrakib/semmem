@@ -12,6 +12,8 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::logging::{AppendLogs, GetLogs, ListLogs};
+
 use crate::models::{
     AppError, AppResult, CreateMemory, GetCommits, GetMemories, ListCommits, ListMemories, MemoryToken,
     SearchRequest, TaxonomyInput, UpdateMemory,
@@ -38,6 +40,7 @@ struct WriteRequest {
 #[derive(Default)]
 struct WriteMetrics {
     requests: AtomicU64,
+    log_transactions: AtomicU64,
     queue_nanoseconds: AtomicU64,
     maximum_queue_nanoseconds: AtomicU64,
     sqlite_nanoseconds: AtomicU64,
@@ -273,6 +276,7 @@ impl Service {
         let requests = self.metrics.requests.load(Ordering::Relaxed);
         json!({
             "requests": requests,
+            "log_transactions": self.metrics.log_transactions.load(Ordering::Relaxed),
             "queue_wait_mean_ms": self.metrics.queue_nanoseconds.load(Ordering::Relaxed) as f64 / requests.max(1) as f64 / 1_000_000.0,
             "queue_wait_max_ms": self.metrics.maximum_queue_nanoseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             "sqlite_transaction_total_ms": self.metrics.sqlite_nanoseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -337,6 +341,16 @@ impl Service {
         }
         let store = self.readers.acquire()?;
         match operation {
+            "get_logs" => {
+                let request: GetLogs = serde_json::from_value(arguments)?;
+
+                Ok(json!({"events":store.get_logs(&request)?}))
+            }
+            "list_logs" => {
+                let request: ListLogs = serde_json::from_value(arguments)?;
+
+                store.list_logs(&request)
+            }
             "get_memories" => {
                 let request: GetMemories = serde_json::from_value(arguments)?;
                 let records = store.get_memories(&request)?;
@@ -396,6 +410,8 @@ pub fn is_read_operation(operation: &str) -> bool {
     matches!(
         operation,
         "search_memories"
+            | "get_logs"
+            | "list_logs"
             | "get_memories"
             | "list_memories"
             | "list_commits"
@@ -473,86 +489,150 @@ fn run_writer(
     batch_window: Duration,
 ) {
     while let Ok(first) = receiver.recv() {
-        let mut requests = collect_write_requests(
-            first,
-            &receiver,
-            batch_window,
-            Instant::now(),
-        );
-        let mut results = Vec::with_capacity(requests.len());
-        for request in &mut requests {
-            let queued = request
-                .enqueued_at
-                .elapsed()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
-            metrics.requests.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .queue_nanoseconds
-                .fetch_add(queued, Ordering::Relaxed);
-            metrics
-                .maximum_queue_nanoseconds
-                .fetch_max(queued, Ordering::Relaxed);
-            let writing = Instant::now();
-            results.push(apply_write(
-                &mut store,
-                &request.operation,
-                std::mem::take(&mut request.arguments),
-                &request.writer,
-            ));
+        let mut requests = collect_write_requests(first, &receiver, batch_window, Instant::now());
+        while !requests.is_empty() {
+            if requests[0].operation != "append_logs" {
+                let end = requests
+                    .iter()
+                    .position(|request| request.operation == "append_logs")
+                    .unwrap_or(requests.len());
+                let memory_requests = requests.drain(..end).collect();
+                process_memory_requests(&mut store, &mut index, memory_requests, &metrics);
+
+                continue;
+            }
+
+            let end = requests
+                .iter()
+                .position(|request| request.operation != "append_logs")
+                .unwrap_or(requests.len());
+            let mut log_requests = requests.drain(..end).collect::<Vec<_>>();
+            let inputs = log_requests
+                .iter_mut()
+                .map(|request| {
+                    (
+                        serde_json::from_value::<AppendLogs>(std::mem::take(
+                            &mut request.arguments,
+                        ))
+                        .map_err(AppError::from),
+                        request.writer.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            let results = store.append_log_batches(&inputs);
+            metrics.log_transactions.fetch_add(1, Ordering::Relaxed);
             metrics.sqlite_nanoseconds.fetch_add(
-                writing.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
             );
+            let results = match results {
+                Ok(results) => results,
+                Err(error) => vec![Err(error); log_requests.len()],
+            };
+
+            for (request, result) in log_requests.into_iter().zip(results) {
+                metrics.requests.fetch_add(1, Ordering::Relaxed);
+                let queued = started
+                    .duration_since(request.enqueued_at)
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64;
+                metrics
+                    .queue_nanoseconds
+                    .fetch_add(queued, Ordering::Relaxed);
+                metrics
+                    .maximum_queue_nanoseconds
+                    .fetch_max(queued, Ordering::Relaxed);
+                let response = result
+                    .and_then(|receipt| serde_json::to_value(receipt).map_err(AppError::from));
+                let _ = request.result.send(response);
+            }
         }
-        fault_point("after_sqlite_commit");
-        let publishing = Instant::now();
-        let publication = publish_events(&mut store, &mut index);
-        metrics.publication_nanoseconds.fetch_add(
-            publishing.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+    }
+}
+
+fn process_memory_requests(
+    store: &mut Store,
+    index: &mut SearchIndex,
+    mut requests: Vec<WriteRequest>,
+    metrics: &WriteMetrics,
+) {
+    let mut results = Vec::with_capacity(requests.len());
+    for request in &mut requests {
+        let queued = request
+            .enqueued_at
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        metrics.requests.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .queue_nanoseconds
+            .fetch_add(queued, Ordering::Relaxed);
+        metrics
+            .maximum_queue_nanoseconds
+            .fetch_max(queued, Ordering::Relaxed);
+        let writing = Instant::now();
+        results.push(apply_write(
+            store,
+            &request.operation,
+            std::mem::take(&mut request.arguments),
+            &request.writer,
+        ));
+        metrics.sqlite_nanoseconds.fetch_add(
+            writing.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        fault_point("before_acknowledgment");
-        for (request, result) in requests.into_iter().zip(results) {
-            let response = match (result, &publication) {
-                (Ok(result), Ok(())) => Ok(result),
-                (Ok(result), Err(error)) => {
-                    let mut failure = AppError::new(
-                        "publication_incomplete",
-                        format!(
-                            "SQLite committed the write, but search publication failed: {error}. Inspect affected tokens before retrying."
-                        ),
-                    );
-                    failure.committed = true;
-                    failure.commit_id = result.get("commit_id").and_then(Value::as_i64);
-                    if let Some(memories) = result.get("memories").and_then(Value::as_array) {
-                        failure.affected = memories
-                            .iter()
-                            .filter_map(|memory| {
-                                Some(crate::models::MemoryReceipt {
-                                    key: memory.get("key")?.as_str()?.into(),
-                                    token: memory.get("system_token").and_then(Value::as_str).map(str::to_owned),
-                                })
+    }
+    fault_point("after_sqlite_commit");
+    let publishing = Instant::now();
+    let publication = publish_events(store, index);
+    metrics.publication_nanoseconds.fetch_add(
+        publishing.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    fault_point("before_acknowledgment");
+    for (request, result) in requests.into_iter().zip(results) {
+        let response = match (result, &publication) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Ok(result), Err(error)) => {
+                let mut failure = AppError::new(
+                    "publication_incomplete",
+                    format!(
+                        "SQLite committed the write, but search publication failed: {error}. Inspect affected tokens before retrying."
+                    ),
+                );
+                failure.committed = true;
+                failure.commit_id = result.get("commit_id").and_then(Value::as_i64);
+                if let Some(memories) = result.get("memories").and_then(Value::as_array) {
+                    failure.affected = memories
+                        .iter()
+                        .filter_map(|memory| {
+                            Some(crate::models::MemoryReceipt {
+                                key: memory.get("key")?.as_str()?.into(),
+                                token: memory
+                                    .get("system_token")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
                             })
-                            .collect();
-                    } else if let Some(keys) = result.get("keys").and_then(Value::as_array) {
-                        failure.affected = keys
-                            .iter()
-                            .filter_map(|key| {
-                                key.as_str().map(|key| crate::models::MemoryReceipt {
-                                    key: key.into(),
-                                    token: None,
-                                })
+                        })
+                        .collect();
+                } else if let Some(keys) = result.get("keys").and_then(Value::as_array) {
+                    failure.affected = keys
+                        .iter()
+                        .filter_map(|key| {
+                            key.as_str().map(|key| crate::models::MemoryReceipt {
+                                key: key.into(),
+                                token: None,
                             })
-                            .collect();
-                    }
-
-                    Err(failure)
+                        })
+                        .collect();
                 }
-                (Err(error), _) => Err(error),
-            };
-            let _ = request.result.send(response);
-        }
+
+                Err(failure)
+            }
+            (Err(error), _) => Err(error),
+        };
+        let _ = request.result.send(response);
     }
 }
 
@@ -593,9 +673,7 @@ fn apply_write(
             let batch: Batch<MemoryToken> = serde_json::from_value(arguments)?;
 
             let removed = store.delete_memories(&batch.memories, writer, &batch.commit_summary)?;
-            let receipts = removed.into_iter().map(|memory| {
-                json!({"key": memory.key, "system_token": memory.system_token})
-            }).collect::<Vec<_>>();
+            let receipts = removed.into_iter().map(|memory| json!({"key": memory.key, "system_token": memory.system_token})).collect::<Vec<_>>();
 
             json!({"memories": receipts})
         }
@@ -750,9 +828,9 @@ mod tests {
     }
     #[test]
     fn zero_window_batch_stops_at_the_enqueue_cutoff_without_a_size_ceiling() {
+        use serde_json::json;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
-        use serde_json::json;
 
         use super::{WriteRequest, collect_write_requests};
 
@@ -783,6 +861,57 @@ mod tests {
         assert_eq!(batch.len(), 1003);
         assert_eq!(batch.last().unwrap().operation, "later");
         assert_eq!(receiver.try_recv().unwrap().operation, "next batch");
+    }
+
+    #[test]
+    fn interleaved_log_batches_preserve_writer_order_and_memory_publication() -> anyhow::Result<()> {
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        use serde_json::json;
+
+        use super::{WriteMetrics, WriteRequest, run_writer};
+        use crate::models::SearchRequest;
+        use crate::search::SearchIndex;
+
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path().join("memory.sqlite3"))?;
+        let index = SearchIndex::open(&directory.path().join("search"))?;
+        let reader = index.reader();
+        let metrics = Arc::new(WriteMetrics::default());
+        let (sender, receiver) = mpsc::channel();
+        let mut responses = Vec::new();
+
+        for (operation, arguments) in [
+            ("append_logs", json!({"summary":"Record the first event.","events":[{"id":"00000000-0000-0000-0000-000000000001","level":"info","source":"Atlas","message":"First event.","timestamp":"2026-10-27T14:30:00.123+11:00"}]})),
+            ("append_logs", json!({"summary":"Reject malformed request.","events":[]})),
+            ("create_memories", json!({"commit_summary":"Create a memory between log groups.","memories":[{"key":"interleaved","body":"interleavedneedle"}]})),
+            ("append_logs", json!({"summary":"Record the second event.","events":[{"id":"00000000-0000-0000-0000-000000000002","level":"info","source":"Atlas","message":"Second event.","timestamp":"2026-10-27T14:30:00.123+11:00"}]})),
+        ] {
+            let (result, response) = mpsc::channel();
+            sender.send(WriteRequest {
+                operation: operation.into(),
+                arguments,
+                writer: "actor".into(),
+                result,
+                enqueued_at: Instant::now(),
+            })?;
+            responses.push(response);
+        }
+
+        drop(sender);
+        run_writer(store, index, receiver, Arc::clone(&metrics), Duration::ZERO);
+        let responses = responses.into_iter().map(|response| response.recv().unwrap()).collect::<Vec<_>>();
+        let first = responses[0].as_ref().unwrap()["commit_id"].as_i64().unwrap();
+        assert!(responses[1].is_err());
+        let middle = responses[2].as_ref().unwrap()["commit_id"].as_i64().unwrap();
+        let last = responses[3].as_ref().unwrap()["commit_id"].as_i64().unwrap();
+        assert!(first < middle && middle < last);
+        assert_eq!(metrics.log_transactions.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let request: SearchRequest = serde_json::from_value(json!({"query":"interleavedneedle","fuzzy":false}))?;
+        assert_eq!(reader.search(&request)?.hits[0].key, "interleaved");
+
+        Ok(())
     }
 
 }

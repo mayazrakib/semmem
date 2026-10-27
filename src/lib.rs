@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cli;
 pub mod document;
 pub mod lifecycle;
+pub mod logging;
 pub mod mcp;
 pub mod models;
 mod output;

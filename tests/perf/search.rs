@@ -171,7 +171,7 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "fixture_version": 2,
+            "fixture_version": 4,
             "startup_processes": {
                 "initial": initial_process,
                 "reopened": reopened_process,
@@ -217,7 +217,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 .context("Existing data directory is not a completed benchmark fixture")?,
         )?;
 
-        if identity.version != 2 || identity.memories != memories {
+        if identity.version != 4 || identity.memories != memories {
             bail!("Existing benchmark fixture differs; choose another data directory");
         }
 
@@ -260,7 +260,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     std::fs::write(
         identity_path,
         serde_json::to_vec(&FixtureIdentity {
-            version: 2,
+            version: 4,
             memories,
         })?,
     )?;

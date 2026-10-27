@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 colored_json = "5"
 comfy-table = "7"
 crossterm = "0.29"
@@ -54,4 +55,9 @@ codegen-units = 1
 [[bench]]
 name = "search"
 path = "tests/perf/search.rs"
+harness = false
+
+[[bench]]
+name = "logging"
+path = "tests/perf/logging.rs"
 harness = false

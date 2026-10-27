@@ -15,7 +15,7 @@ use crate::models::{
 
 const MEMORY_COLUMNS: &str = "id, key, title, body, type, system_token, system_created_at, system_updated_at, summary, basis, scope, observed_at, verified_at, review_after, system_created_by, system_updated_by";
 const COMMIT_COLUMNS: &str =
-    "id, key, summary, operation, actor, changes, system_created_at, system_updated_at";
+    "id, key, summary, operation, actor, system_created_at, system_updated_at";
 
 pub struct Store {
     connection: Connection,
@@ -28,7 +28,7 @@ impl Store {
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         validate_schema_version(version)?;
-        if version == 2 {
+        if version == 4 {
             validate_schema_shape(&connection)?;
         }
         if version == 0 && connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get::<_, bool>(0))? {
@@ -57,7 +57,7 @@ impl Store {
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 2 {
+        if version != 4 {
             return Err(unsupported_schema(version));
         }
         validate_schema_shape(&connection)?;
@@ -638,10 +638,16 @@ impl Store {
             .map(str::parse::<i64>)
             .transpose()
             .map_err(|_| AppError::invalid("Invalid commit cursor."))?;
-        let mut statement = self.connection.prepare_cached(&format!("SELECT {COMMIT_COLUMNS} FROM commits WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2"))?;
-        Ok(statement
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(&format!("SELECT {COMMIT_COLUMNS} FROM commits WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2"))?;
+        let mut records = statement
             .query_map(params![cursor, sqlite_limit(request.limit)?], read_commit)?
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        hydrate_commits(&transaction, &mut records)?;
+        transaction.commit()?;
+
+        Ok(records)
     }
 
     pub fn get_commits(&self, request: &GetCommits) -> AppResult<Vec<CommitRecord>> {
@@ -649,10 +655,11 @@ impl Store {
         let mut statement = transaction.prepare_cached(&format!(
             "SELECT {COMMIT_COLUMNS} FROM commits WHERE id IN (SELECT value FROM json_each(?1))"
         ))?;
-        let records = statement
+        let mut records = statement
             .query_map([serde_json::to_string(&request.ids)?], read_commit)?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
+        hydrate_commits(&transaction, &mut records)?;
         let records = records
             .into_iter()
             .map(|record| (record.id, record))
@@ -815,7 +822,7 @@ fn add_index_event(
     Ok(())
 }
 
-fn append_commit(
+pub(crate) fn append_commit(
     connection: &Connection,
     actor: &str,
     summary: &str,
@@ -824,28 +831,113 @@ fn append_commit(
     now: i64,
 ) -> AppResult<i64> {
     validate_write(actor, summary)?;
-    connection.execute("INSERT INTO commits (key, summary, operation, actor, changes, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)", params![new_token(), summary, operation, actor, serde_json::to_string(&changes)?, now])?;
-    Ok(connection.last_insert_rowid())
+    connection.execute("INSERT INTO commits (key, summary, operation, actor, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)", params![new_token(), summary, operation, actor, now])?;
+    let id = connection.last_insert_rowid();
+    let mut statement = connection.prepare_cached("INSERT INTO commit_changes (commit_id, ordinal, entity, key, operation, reason, associations, index_event, through_sequence, count, has_fields) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")?;
+    let mut fields_statement = connection.prepare_cached("INSERT INTO commit_change_fields (commit_id, change_ordinal, ordinal, name) VALUES (?1, ?2, ?3, ?4)")?;
+
+    for (ordinal, change) in changes.iter().enumerate() {
+        let fields = change.get("fields").and_then(Value::as_array);
+        statement.execute(params![
+            id,
+            ordinal as i64,
+            change["entity"].as_str(),
+            change["key"].as_str(),
+            change["operation"].as_str(),
+            change["reason"].as_str(),
+            change["associations"].as_str(),
+            change["index_event"].as_str(),
+            change["through_sequence"].as_i64(),
+            change["count"].as_i64(),
+            fields.is_some()
+        ])?;
+
+        if let Some(fields) = fields {
+            for (position, field) in fields.iter().enumerate() {
+                fields_statement.execute(params![
+                    id,
+                    ordinal as i64,
+                    position as i64,
+                    field.as_str()
+                ])?;
+            }
+        }
+    }
+
+    Ok(id)
 }
 
 fn read_commit(row: &Row<'_>) -> rusqlite::Result<CommitRecord> {
-    let changes: String = row.get(5)?;
     Ok(CommitRecord {
         id: row.get(0)?,
         key: row.get(1)?,
         summary: row.get(2)?,
         operation: row.get(3)?,
         actor: row.get(4)?,
-        changes: serde_json::from_str(&changes).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
-        system_created_at: row.get(6)?,
-        system_updated_at: row.get(7)?,
+        changes: json!([]),
+        system_created_at: row.get(5)?,
+        system_updated_at: row.get(6)?,
     })
+}
+
+fn hydrate_commits(connection: &Connection, records: &mut [CommitRecord]) -> AppResult<()> {
+    let ids = serde_json::to_string(&records.iter().map(|record| record.id).collect::<Vec<_>>())?;
+    let mut changes = BTreeMap::<(i64, i64), Value>::new();
+    let mut statement = connection.prepare_cached("SELECT commit_id, ordinal, entity, key, operation, reason, associations, index_event, through_sequence, count, has_fields FROM commit_changes WHERE commit_id IN (SELECT value FROM json_each(?1)) ORDER BY commit_id, ordinal")?;
+    let mut rows = statement.query([&ids])?;
+
+    while let Some(row) = rows.next()? {
+        let mut change =
+            json!({"entity": row.get::<_, String>(2)?, "operation":row.get::<_, String>(4)?});
+
+        for (column, name) in [
+            (3, "key"),
+            (5, "reason"),
+            (6, "associations"),
+            (7, "index_event"),
+        ] {
+            if let Some(value) = row.get::<_, Option<String>>(column)? {
+                change[name] = json!(value);
+            }
+        }
+
+        for (column, name) in [(8, "through_sequence"), (9, "count")] {
+            if let Some(value) = row.get::<_, Option<i64>>(column)? {
+                change[name] = json!(value);
+            }
+        }
+
+        if row.get::<_, bool>(10)? {
+            change["fields"] = json!([]);
+        }
+
+        changes.insert((row.get(0)?, row.get(1)?), change);
+    }
+
+    let mut statement = connection.prepare_cached("SELECT commit_id, change_ordinal, name FROM commit_change_fields WHERE commit_id IN (SELECT value FROM json_each(?1)) ORDER BY commit_id, change_ordinal, ordinal")?;
+    let mut rows = statement.query([&ids])?;
+
+    while let Some(row) = rows.next()? {
+        let change = changes
+            .get_mut(&(row.get(0)?, row.get(1)?))
+            .expect("Audit field has a parent change");
+        change["fields"]
+            .as_array_mut()
+            .expect("Audit change declares its fields")
+            .push(json!(row.get::<_, String>(2)?));
+    }
+
+    let mut by_commit = BTreeMap::<i64, Vec<Value>>::new();
+
+    for ((id, _), change) in changes {
+        by_commit.entry(id).or_default().push(change);
+    }
+
+    for record in records {
+        record.changes = json!(by_commit.remove(&record.id).unwrap_or_default());
+    }
+
+    Ok(())
 }
 
 fn read_taxonomy(row: &Row<'_>) -> rusqlite::Result<TaxonomyRecord> {
@@ -984,7 +1076,7 @@ fn parse_cursor(cursor: &str) -> AppResult<(i64, i64)> {
     ))
 }
 
-fn current_time() -> AppResult<i64> {
+pub(crate) fn current_time() -> AppResult<i64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| AppError::new("clock_failure", error.to_string()))?;
@@ -1005,13 +1097,13 @@ fn unsupported_schema(version: i64) -> AppError {
     AppError::new(
         "unsupported_schema",
         format!(
-            "Database schema version {version} is unsupported. This build requires a fresh current-state database initialized at version 2."
+            "Database schema version {version} is unsupported. This build requires a fresh current-state database initialized at version 4."
         ),
     )
 }
 
 fn validate_schema_version(version: i64) -> AppResult<()> {
-    if version != 0 && version != 2 {
+    if version != 0 && version != 4 {
         return Err(unsupported_schema(version));
     }
     Ok(())
@@ -1039,7 +1131,7 @@ fn validate_schema_shape(connection: &Connection) -> AppResult<()> {
             .collect()
     }
     if read_schema(connection)? != read_schema(&expected)? {
-        return Err(unsupported_schema(2));
+        return Err(unsupported_schema(4));
     }
     Ok(())
 }

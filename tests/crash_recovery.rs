@@ -380,3 +380,47 @@ async fn refuses_live_socket_without_displacing_its_listener() {
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     drop(listener);
 }
+
+#[cfg(feature = "fault-injection")]
+async fn assert_log_recovers(fault: &str, expected_before_retry: usize) {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("service.sock");
+    let mut interrupted = ServerProcess::start(
+        directory.path(),
+        &socket,
+        Some(fault),
+        "logging-interrupted",
+    );
+    let client = interrupted.wait_ready(&socket).await;
+    let batch = json!({"summary":"Record the completed report.","events":[{"id":"00000000-0000-0000-0000-000000000001","level":"info","source":"Atlas","message":"Saved report.","timestamp":"2026-10-27T14:30:00.123+11:00"}]});
+    let _ = client
+        .post("http://localhost/api/append_logs")
+        .json(&batch)
+        .send()
+        .await;
+    assert_eq!(interrupted.wait_exit().await.code(), Some(86));
+    let mut recovered = ServerProcess::start(directory.path(), &socket, None, "logging-recovered");
+    let client = recovered.wait_ready(&socket).await;
+    let events = invoke(&client, "list_logs", json!({})).await;
+    assert_eq!(
+        events["events"].as_array().unwrap().len(),
+        expected_before_retry
+    );
+    let receipt = invoke(&client, "append_logs", batch).await;
+    assert_eq!(receipt["inserted"], 1 - expected_before_retry);
+    assert_eq!(receipt["replayed"], expected_before_retry);
+    let commits = invoke(&client, "list_commits", json!({})).await;
+    assert_eq!(commits["commits"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_crash_before_commit_rolls_back_the_entire_batch() {
+    assert_log_recovers("before_log_commit", 0).await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_crash_after_commit_replays_without_duplicate_events_or_audits() {
+    assert_log_recovers("after_log_commit", 1).await;
+}

@@ -10,6 +10,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde_json::{Value, json};
 
+use crate::logging::{AppendLogs, GetLogs, ListLogs, LogLevel};
+
 use crate::models::{
     Basis, CreateMemory, GetCommits, GetMemories, ListCommits, ListMemories, MemoryMetadata, MemoryRecord,
     MemoryReference, MemoryToken, MemoryView, MetadataPatch, SearchRequest,
@@ -125,6 +127,35 @@ pub enum Command {
         about = "Permanently delete a memory and its incoming references."
     )]
     DELETE(TokenArguments),
+    #[command(
+        name = "append_logs",
+        about = "Append an atomic JSON log batch from standard input."
+    )]
+    APPEND_LOGS,
+    #[command(name = "get_logs", about = "Read immutable work events by UUID.")]
+    GET_LOGS { ids: Vec<String> },
+    #[command(
+        name = "list_logs",
+        about = "Browse work events chronologically with exact filters."
+    )]
+    LIST_LOGS {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, value_enum)]
+        level: Option<LogLevel>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     #[command(name = "commits", about = "List audit commits, newest first.")]
     COMMITS {
         #[arg(long, default_value_t = 20)]
@@ -369,7 +400,11 @@ impl LocalClient {
 
 pub async fn execute(cli: Cli) -> Result<()> {
     let client = LocalClient::connect(&cli.socket)?;
-    let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS);
+    let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS
+            | Command::APPEND_LOGS
+            | Command::GET_LOGS { .. }
+            | Command::LIST_LOGS { .. }
+    );
     let output = match cli.command {
         Command::RUN { .. } => bail!("The run command must be dispatched by the application entry point."),
         Command::START => crate::lifecycle::execute("start").await?,
@@ -465,6 +500,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
         },
         Command::DELETE(arguments) => {
             client.request("delete_memories", json!({"memories": [MemoryToken {key: arguments.key, expected_token: arguments.expected_token}], "commit_summary": validate_message(arguments.message)?})).await?
+        },
+        Command::APPEND_LOGS => {
+            let batch: AppendLogs = serde_json::from_reader(std::io::stdin().lock())?;
+            client.request("append_logs", serde_json::to_value(batch)?).await?
+        },
+        Command::GET_LOGS { ids } => {
+            client.request("get_logs", serde_json::to_value(GetLogs { ids })?).await?
+        },
+        Command::LIST_LOGS { task_id, scope, source, level, since, until, cursor, limit } => {
+            client.request("list_logs", serde_json::to_value(ListLogs { task_id, scope, source, level, since, until, cursor, limit })?).await?
         },
         Command::COMMITS { limit, cursor } => {
             client.request("list_commits", serde_json::to_value(ListCommits { limit, cursor })?).await?

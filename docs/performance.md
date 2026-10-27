@@ -1,10 +1,23 @@
 # Performance qualification
 
-The retained measurements predate the current-state architecture and required audit commits. They do not establish performance for the current implementation.
+The retained million-memory measurements predate the current-state architecture and required audit commits. They do not establish memory retrieval performance for the current implementation. The separate Work logging measurements below cover the new logging path only.
 
 The historical version-two section describes the earlier schema and its former application limits. They are retained as historical evidence, not measurements of the metadata update. New benchmark runs use a fresh compatible fixture and report construction, process startup, first request, and warm requests separately. A process restart reuses operating-system caches and does not establish cold-disk performance.
 
 Measurements use a release build on Linux x86-64 under a Microsoft hypervisor, with an AMD Ryzen 9 9950X3D reported by the host and 24 available logical CPUs. Rust 1.98.0 compiled the benchmark with thin LTO. SQLite uses WAL and FULL synchronization; successful writes include durable index publication. Storage and filesystem behavior affect these results.
+
+## Current Work Logging
+
+[The logging report](../benchmarks/results/logging-current-state.json) records three repetitions of 2,000 identical events on fresh databases per scenario. A release build used Rust 1.98.0 on Linux x86-64, WSL2, an AMD Ryzen 9 9950X3D, and 24 logical CPUs. Each synchronous request includes SQLite FULL durability, normalized audit inserts, serialization, and writer coordination. There are no warmups or OS cache flushes. HTTP, OAuth, MCP framing, and AI latency are excluded.
+
+| Events per request | Median events per second | Median request p95 | Transactions per repetition |
+|---|---:|---:|---:|
+| 1 | 179 | 8.95 ms | 2,000 |
+| 100 | 11,906 | 26.28 ms | 20 |
+
+Batching improved median event throughput by 66.6 times in this workload, using 100 times fewer transactions. Request latencies describe different batch sizes and are not per-event latencies. All runs verified the event count and zero search-index events. The report retains per-run storage growth, source-capture details, and the measured benchmark executable checksum. These results do not establish concurrent throughput or performance at millions of log events. Concurrent correctness and shared-transaction behavior are tested separately.
+
+Reproduce with `cargo bench --locked --bench logging`. The harness uses temporary dedicated databases and never opens production data.
 
 ## Semmem schema version three
 
