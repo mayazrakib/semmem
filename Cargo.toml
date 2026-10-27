@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 assert_cmd = "2"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.8"
 rsa = "0.9"
 rmcp = { version = "3.7", features = ["client", "transport-io", "transport-streamable-http-client-reqwest"] }
