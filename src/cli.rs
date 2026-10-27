@@ -72,6 +72,8 @@ pub enum Command {
         exact: bool,
         #[arg(long)]
         prefix: bool,
+        #[command(flatten)]
+        review: ReviewArguments,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
@@ -112,6 +114,8 @@ pub enum Command {
         tags: Vec<String>,
         #[arg(long = "reference", value_parser = parse_reference)]
         references: Vec<MemoryReference>,
+        #[arg(long)]
+        request_id: Option<String>,
     },
     #[command(
         name = "edit",
@@ -121,6 +125,8 @@ pub enum Command {
         key: String,
         #[arg(long)]
         message: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
     },
     #[command(
         name = "delete",
@@ -156,6 +162,11 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    #[command(
+        name = "mutation_receipts",
+        about = "Read this actor's durable mutation receipts by request UUID."
+    )]
+    MUTATION_RECEIPTS { request_ids: Vec<String> },
     #[command(name = "commits", about = "List audit commits, newest first.")]
     COMMITS {
         #[arg(long, default_value_t = 20)]
@@ -219,7 +230,36 @@ impl From<MetadataArguments> for MemoryMetadata {
 }
 
 #[derive(Debug, Args)]
+pub struct ReviewArguments {
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        conflicts_with = "is_due_for_review",
+        help = "Filter review dates at or before this UTC Unix millisecond cutoff."
+    )]
+    review_due_by: Option<i64>,
+    #[arg(long = "due-for-review", help = "Filter review dates at or before the current time.")]
+    is_due_for_review: bool,
+    #[arg(long = "never-verified", help = "Select memories with no recorded verification.")]
+    is_unverified: bool,
+}
+
+impl ReviewArguments {
+    fn resolve(&self) -> Result<(Option<i64>, Option<bool>)> {
+        let cutoff = if self.is_due_for_review {
+            Some(crate::storage::current_time()?)
+        } else {
+            self.review_due_by
+        };
+
+        Ok((cutoff, self.is_unverified.then_some(false)))
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct BrowseArguments {
+    #[command(flatten)]
+    review: ReviewArguments,
     #[arg(long)]
     scope: Option<String>,
     #[arg(long, value_enum)]
@@ -240,6 +280,8 @@ pub struct BrowseArguments {
 
 #[derive(Debug, Args)]
 pub struct TokenArguments {
+    #[arg(long)]
+    request_id: Option<String>,
     key: String,
     #[arg(long)]
     expected_token: String,
@@ -403,6 +445,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
     let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS
             | Command::APPEND_LOGS
             | Command::GET_LOGS { .. }
+            | Command::MUTATION_RECEIPTS { .. }
             | Command::LIST_LOGS { .. }
     );
     let output = match cli.command {
@@ -410,12 +453,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::START => crate::lifecycle::execute("start").await?,
         Command::STOP => crate::lifecycle::execute("stop").await?,
         Command::STATUS => crate::lifecycle::execute("status").await?,
-        Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit } => {
-            let request = SearchRequest { query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit };
+        Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit, review } => {
+            let (review_due_by, is_verified) = review.resolve()?;
+            let request = SearchRequest { review_due_by, is_verified, query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit };
             client.request("search_memories", serde_json::to_value(request)?).await?
         },
         Command::LIST(arguments) => {
+            let (review_due_by, is_verified) = arguments.review.resolve()?;
             let request = ListMemories {
+                review_due_by,
+                is_verified,
                 scope: arguments.scope,
                 basis: arguments.basis,
                 r#type: arguments.r#type,
@@ -430,7 +477,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::SHOW { keys, view } => {
             client.request("get_memories", serde_json::to_value(GetMemories { keys, view })?).await?
         },
-        Command::ADD { key, no_input, metadata, title, r#type, tags, references, message } => {
+        Command::ADD { key, no_input, metadata, title, r#type, tags, references, message, request_id } => {
             if no_input && message.as_ref().is_none_or(|message| message.trim().is_empty()) {
                 bail!("An audit message is required with --no-input. Supply --message.");
             }
@@ -460,10 +507,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
             let memory = CreateMemory { key, title, body, metadata: create_metadata(fields.metadata), r#type, tags: fields.tags, references: fields.references };
             let commit_summary = resolve_message(message, !no_input).with_context(|| format!("The draft was preserved at {}.", draft.path.display()))?;
-            let result = client.request("create_memories", json!({"memories": [memory], "commit_summary": commit_summary})).await;
+            let result = client.request("create_memories", json!({"memories": [memory], "commit_summary": commit_summary, "request_id": request_id})).await;
             finish_draft(draft, result)?
         },
-        Command::EDIT { key, message } => {
+        Command::EDIT { key, message, request_id } => {
             let value = client.request("get_memories", json!({"keys": [&key]})).await?;
             let memory = decode_memory(&value)?;
             let original = crate::document::encode_memory(&memory)?;
@@ -495,11 +542,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
 
             let commit_summary = resolve_message(message, std::io::stdin().is_terminal()).with_context(|| format!("The draft was preserved at {}.", draft.path.display()))?;
-            let result = client.request("update_memories", json!({"memories": [request], "commit_summary": commit_summary})).await;
+            let result = client.request("update_memories", json!({"memories": [request], "commit_summary": commit_summary, "request_id": request_id})).await;
             finish_draft(draft, result)?
         },
         Command::DELETE(arguments) => {
-            client.request("delete_memories", json!({"memories": [MemoryToken {key: arguments.key, expected_token: arguments.expected_token}], "commit_summary": validate_message(arguments.message)?})).await?
+            client.request("delete_memories", json!({"memories": [MemoryToken {key: arguments.key, expected_token: arguments.expected_token}], "commit_summary": validate_message(arguments.message)?, "request_id": arguments.request_id})).await?
         },
         Command::APPEND_LOGS => {
             let batch: AppendLogs = serde_json::from_reader(std::io::stdin().lock())?;
@@ -510,6 +557,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
         },
         Command::LIST_LOGS { task_id, scope, source, level, since, until, cursor, limit } => {
             client.request("list_logs", serde_json::to_value(ListLogs { task_id, scope, source, level, since, until, cursor, limit })?).await?
+        },
+        Command::MUTATION_RECEIPTS { request_ids } => {
+            client.request("get_mutation_receipts", json!({"request_ids":request_ids})).await?
         },
         Command::COMMITS { limit, cursor } => {
             client.request("list_commits", serde_json::to_value(ListCommits { limit, cursor })?).await?
@@ -915,7 +965,7 @@ fn print_output(
     value: &Value,
     is_json: bool,
 ) -> Result<()> {
-    if is_json || !std::io::stdout().is_terminal() {
+    if is_json || value.get("request_id").is_some() || !std::io::stdout().is_terminal() {
         crate::output::print_json(value)?;
 
         return Ok(());

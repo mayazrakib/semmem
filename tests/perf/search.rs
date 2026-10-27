@@ -217,7 +217,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
                 .context("Existing data directory is not a completed benchmark fixture")?,
         )?;
 
-        if identity.version != 4 || identity.memories != memories {
+        if identity.version != 5 || identity.memories != memories {
             bail!("Existing benchmark fixture differs; choose another data directory");
         }
 
@@ -260,7 +260,7 @@ fn prepare_fixture(directory: &Path, memories: usize) -> Result<bool> {
     std::fs::write(
         identity_path,
         serde_json::to_vec(&FixtureIdentity {
-            version: 4,
+            version: 5,
             memories,
         })?,
     )?;

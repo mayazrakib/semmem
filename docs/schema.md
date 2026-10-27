@@ -1,6 +1,6 @@
 # Database Schema
 
-SQLite stores canonical current Markdown bodies and metadata. Tantivy provides a rebuildable full-text index. [database/initialize.sql](../database/initialize.sql) is the sole initializer for schema v4. Existing incompatible databases are rejected intact and require an explicitly authorized reset rather than migration.
+SQLite stores canonical current Markdown bodies and metadata. Tantivy provides a rebuildable full-text index. [database/initialize.sql](../database/initialize.sql) is the sole initializer for schema v5. Existing incompatible databases are rejected intact and require an explicitly authorized reset rather than migration.
 
 ## Current State
 
@@ -18,6 +18,7 @@ SQLite stores canonical current Markdown bodies and metadata. Tantivy provides a
 | `commit_changes` | Ordered relational entity changes belonging to a commit. |
 | `commit_change_fields` | Ordered field names belonging to an entity change. |
 | `log` | Immutable Work events, event time, task context, and trusted ingestion metadata. |
+| `mutation_receipts` | Actor-scoped request fingerprints and compact durable memory mutation receipts. |
 
 The `current_memories` view exposes current memory records. There are no author fields, authors table, revisions, deleted states, snapshots, or version counters. References use `target_key` and `reference_type`. The default memory type is `general`. Strict normalized tables retain current content and associations. Referenced taxonomy entries cannot be deleted.
 
@@ -46,7 +47,7 @@ Each `commits` row includes a monotonic integer `id`, unique stable `key`, requi
 
 ## Retrieval and Publication
 
-Search, browsing, reads, and mutation responses return complete current bodies and stored summaries. The accepted `summary` view is a compatibility alias for full records. There are no generated excerpts. Historical search, timestamp snapshots, revision reads, and deleted-state queries are unavailable. Pagination and batch sizes are caller controlled; the service adds no token budgets, storage quotas, retention limits, or arbitrary request ceilings.
+Search, browsing, reads, and mutation responses without a request ID return complete current bodies and stored summaries. The accepted `summary` view is a compatibility alias for full records. There are no generated excerpts. Historical search, timestamp snapshots, revision reads, and deleted-state queries are unavailable. Pagination and batch sizes are caller controlled; the service adds no token budgets, storage quotas, retention limits, or arbitrary request ceilings.
 
 SQLite uses WAL with `synchronous=FULL`. A single writer coordinates transactions with a reusable read pool. Transactional index events identify changed memory keys after updates and deletion. Successful writes are acknowledged after index publication. Startup replays pending events or rebuilds an unusable index from current canonical records. SQLite validates indexed search candidates before returning results.
 
@@ -64,6 +65,24 @@ Adjacent logging requests share a durable SQLite transaction through the single 
 
 ## Normalization
 
-The persisted schema is in third normal form under its domain dependencies. Entity IDs and unique stable keys determine entity attributes. Junction keys determine relationship audit metadata. A commit and change ordinal determine one change; the full field key determines one ordered field name. Event UUIDs determine complete immutable work events. Actor labels, scope strings, fixed enums, and opaque Markdown content carry no separately stored dependent attributes and need no lookup tables.
+The persisted domain tables are in third normal form under their domain dependencies. Entity IDs and unique stable keys determine entity attributes. Junction keys determine relationship audit metadata. A commit and change ordinal determine one change; the full field key determines one ordered field name. Event UUIDs determine complete immutable work events. Actor labels, scope strings, fixed enums, and opaque Markdown content carry no separately stored dependent attributes and need no lookup tables.
 
 Typed change columns retain event-time audit descriptions even after referenced entities are deleted, so entity keys are intentionally not foreign keys to live records. The `has_fields` flag preserves the distinction between omitted fields and an explicit empty field list in the existing API. Views and the rebuildable Tantivy copy are projections rather than additional canonical facts. Immutable child facts inherit lifecycle metadata through their parent commit; log rows have no update lifecycle.
+
+Mutation receipts are immutable technical response artifacts. Their compact JSON repeats request identity and operation to serve exact retries without reconstructing records. This deliberate denormalization favors replay speed.
+
+## Review Filtering
+
+`list_memories` and `search_memories` accept optional `review_due_by` and `is_verified` filters. The cutoff is inclusive UTC Unix milliseconds: records require a nonnull `review_after` at or before the cutoff. `is_verified: false` selects `verified_at IS NULL`, meaning no recorded verification; `true` selects nonnull verification dates. These filters combine with existing filters using AND, without changing text relevance scores. Reuse the same cutoff and filters across browse pages. Filtering does not modify metadata or cause expiration or deletion.
+
+The CLI supports `--review-due-by MILLISECONDS`, `--due-for-review`, and `--never-verified` on `list` and `search`. The two cutoff flags are mutually exclusive. `--due-for-review` resolves the current time once per invocation. SQLite partial indexes support due dates and browsing unverified records in recent order. Tantivy filters review dates and verification presence before counting and selecting ranked results.
+
+## Mutation Receipts
+
+`create_memories`, `update_memories`, and `delete_memories` accept an optional canonical lowercase UUID `request_id`. Requests without an ID retain existing behavior. Requests with an ID return only `request_id`, `operation`, nullable `commit_id`, and `memories` containing keys and `system_token` values. Deletion receipts also include surviving sources whose references and tokens changed. Deleted-memory tokens identify the deleted instances; receipt tokens need not match later current records.
+
+The trusted actor and request ID identify one request. Identical typed inputs replay the same receipt before current-token validation. Different operations, audit summaries, or inputs under that ID return `conflict`. JSON object order and supported defaults normalize during parsing. Metadata omission and explicit null remain distinct, and array order remains significant. A new request ID always requires normal token validation.
+
+The receipt, SHA-256 fingerprint, required publication watermark, mutation, audit changes, and index events commit atomically. Receipts retain no request payloads or memory bodies, remain immutable, and do not expire. Failed transactions reserve no ID. Successful no-op requests retain a receipt with a null commit ID without adding a mutation audit entry. A normal success, including replay, waits for the existing publication barrier. Publication failures return `publication_incomplete`, `committed: true`, the request ID, commit ID, and affected keys/tokens; retry the identical request to finish publication.
+
+`get_mutation_receipts` accepts `request_ids` and returns `receipts` in caller order for the authenticated actor. Missing IDs reject the lookup with `not_found`; other actors' receipts are not exposed. Lookup confirms durable commit only, without promising current tokens or search publication. CLI memory writes accept `--request-id UUID`, and `semmem mutation_receipts UUID ...` recovers receipts. Interactive add/edit may generate different inputs when rerun, so recover uncertain outcomes before opening a new edit. Reuse an ID only with the original inputs; use a new ID for a new mutation.

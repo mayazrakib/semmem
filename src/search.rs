@@ -1,12 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
-    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery, TermSetQuery,
+    BooleanQuery, BoostQuery, ConstScoreQuery, FuzzyTermQuery, Occur, PhraseQuery, Query,
+    RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
@@ -44,6 +46,8 @@ struct SearchFields {
     body: Field,
     memory_type: Field,
     tags: Field,
+    review_after: Field,
+    is_verified: Field,
 }
 
 #[derive(Clone)]
@@ -170,6 +174,14 @@ impl SearchIndex {
             );
         }
 
+        if let Some(review_after) = memory.metadata.review_after {
+            document.add_i64(fields.review_after, review_after);
+        }
+
+        document.add_u64(
+            fields.is_verified,
+            u64::from(memory.metadata.verified_at.is_some()),
+        );
         document.add_text(fields.body, &memory.body);
         document.add_text(fields.memory_type, &memory.r#type);
 
@@ -366,6 +378,28 @@ impl SearchReader {
             ));
         }
 
+        if let Some(cutoff) = request.review_due_by {
+            let query = RangeQuery::new(
+                Bound::Included(Term::from_field_i64(self.fields.review_after, i64::MIN)),
+                Bound::Included(Term::from_field_i64(self.fields.review_after, cutoff)),
+            );
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(Box::new(query), 0.0)),
+            ));
+        }
+
+        if let Some(is_verified) = request.is_verified {
+            let query = TermQuery::new(
+                Term::from_field_u64(self.fields.is_verified, u64::from(is_verified)),
+                IndexRecordOption::Basic,
+            );
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(Box::new(query), 0.0)),
+            ));
+        }
+
         Ok(Box::new(BooleanQuery::new(clauses)))
     }
 
@@ -512,6 +546,8 @@ fn build_schema() -> (Schema, SearchFields) {
         body: builder.add_text_field("body", text_options),
         memory_type: builder.add_text_field("type", STRING),
         tags: builder.add_text_field("tags", STRING),
+        review_after: builder.add_i64_field("review_after", FAST),
+        is_verified: builder.add_u64_field("is_verified", tantivy::schema::INDEXED),
     };
 
     (builder.build(), fields)

@@ -296,7 +296,7 @@ fn concurrent_producers_share_commits_and_conflicting_retries_are_safe() -> anyh
 
 #[test]
 fn previous_schema_versions_are_rejected_without_changes() -> anyhow::Result<()> {
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("old.sqlite3");
         let connection = Connection::open(&path)?;

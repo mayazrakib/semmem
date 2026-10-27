@@ -1,0 +1,246 @@
+{
+    "architecture": "x86_64",
+    "cpu": "model name\t: AMD Ryzen 9 9950X3D 16-Core Processor",
+    "logical_cpus": 24,
+    "operating_system": "linux",
+    "results": [
+        {
+            "compact_response_bytes": 18964,
+            "legacy_response_bytes": 485565,
+            "measurements": {
+                "browse_baseline": {
+                    "p50_ms": 0.125883,
+                    "p95_ms": 0.209425,
+                    "p99_ms": 0.233455,
+                    "samples": 100
+                },
+                "browse_due": {
+                    "p50_ms": 0.34844800000000004,
+                    "p95_ms": 0.41056000000000004,
+                    "p99_ms": 0.44350999999999996,
+                    "samples": 100
+                },
+                "browse_unverified": {
+                    "p50_ms": 0.103773,
+                    "p95_ms": 0.16483399999999998,
+                    "p99_ms": 0.204995,
+                    "samples": 100
+                },
+                "compact_first_write": {
+                    "p50_ms": 81.067633,
+                    "p95_ms": 167.422715,
+                    "p99_ms": 220.33802899999998,
+                    "samples": 100
+                },
+                "compact_replay": {
+                    "p50_ms": 0.191164,
+                    "p95_ms": 0.293147,
+                    "p99_ms": 0.36705499999999996,
+                    "samples": 100
+                },
+                "legacy_first_write": {
+                    "p50_ms": 79.917886,
+                    "p95_ms": 194.870605,
+                    "p99_ms": 263.59651099999996,
+                    "samples": 100
+                },
+                "search_baseline": {
+                    "p50_ms": 8.123701,
+                    "p95_ms": 9.045882,
+                    "p99_ms": 11.708615,
+                    "samples": 100
+                },
+                "search_due": {
+                    "p50_ms": 1.544051,
+                    "p95_ms": 1.8617149999999998,
+                    "p99_ms": 2.137541,
+                    "samples": 100
+                },
+                "search_unverified": {
+                    "p50_ms": 1.3910280000000002,
+                    "p95_ms": 1.731401,
+                    "p99_ms": 1.829879,
+                    "samples": 100
+                }
+            },
+            "query_plans": {
+                "due": [
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1",
+                    "SEARCH memories USING INDEX memories_review_due (review_after>? AND review_after<?)",
+                    "USE TEMP B-TREE FOR ORDER BY"
+                ],
+                "unverified": [
+                    "SCAN memories USING INDEX memories_unverified_recent",
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1"
+                ]
+            },
+            "repetition": 0,
+            "response_reduction_percent": 96.09444667552232
+        },
+        {
+            "compact_response_bytes": 18964,
+            "legacy_response_bytes": 485565,
+            "measurements": {
+                "browse_baseline": {
+                    "p50_ms": 0.09900199999999999,
+                    "p95_ms": 0.18110500000000002,
+                    "p99_ms": 0.197185,
+                    "samples": 100
+                },
+                "browse_due": {
+                    "p50_ms": 0.305628,
+                    "p95_ms": 0.358709,
+                    "p99_ms": 0.388789,
+                    "samples": 100
+                },
+                "browse_unverified": {
+                    "p50_ms": 0.095292,
+                    "p95_ms": 0.144283,
+                    "p99_ms": 0.163964,
+                    "samples": 100
+                },
+                "compact_first_write": {
+                    "p50_ms": 141.41528300000002,
+                    "p95_ms": 280.855658,
+                    "p99_ms": 328.306854,
+                    "samples": 100
+                },
+                "compact_replay": {
+                    "p50_ms": 0.19623500000000002,
+                    "p95_ms": 0.27116599999999996,
+                    "p99_ms": 0.283086,
+                    "samples": 100
+                },
+                "legacy_first_write": {
+                    "p50_ms": 141.65030000000002,
+                    "p95_ms": 309.20164300000005,
+                    "p99_ms": 484.27712899999995,
+                    "samples": 100
+                },
+                "search_baseline": {
+                    "p50_ms": 7.873768999999999,
+                    "p95_ms": 8.651569,
+                    "p99_ms": 11.507968,
+                    "samples": 100
+                },
+                "search_due": {
+                    "p50_ms": 1.284611,
+                    "p95_ms": 1.692351,
+                    "p99_ms": 1.8598709999999998,
+                    "samples": 100
+                },
+                "search_unverified": {
+                    "p50_ms": 1.300657,
+                    "p95_ms": 1.524582,
+                    "p99_ms": 1.579833,
+                    "samples": 100
+                }
+            },
+            "query_plans": {
+                "due": [
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1",
+                    "SEARCH memories USING INDEX memories_review_due (review_after>? AND review_after<?)",
+                    "USE TEMP B-TREE FOR ORDER BY"
+                ],
+                "unverified": [
+                    "SCAN memories USING INDEX memories_unverified_recent",
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1"
+                ]
+            },
+            "repetition": 1,
+            "response_reduction_percent": 96.09444667552232
+        },
+        {
+            "compact_response_bytes": 18964,
+            "legacy_response_bytes": 485565,
+            "measurements": {
+                "browse_baseline": {
+                    "p50_ms": 0.105333,
+                    "p95_ms": 0.174424,
+                    "p99_ms": 0.211555,
+                    "samples": 100
+                },
+                "browse_due": {
+                    "p50_ms": 0.29552700000000004,
+                    "p95_ms": 0.383689,
+                    "p99_ms": 0.6833170000000001,
+                    "samples": 100
+                },
+                "browse_unverified": {
+                    "p50_ms": 0.09610199999999999,
+                    "p95_ms": 0.147084,
+                    "p99_ms": 0.208765,
+                    "samples": 100
+                },
+                "compact_first_write": {
+                    "p50_ms": 128.034508,
+                    "p95_ms": 191.04038400000002,
+                    "p99_ms": 353.907252,
+                    "samples": 100
+                },
+                "compact_replay": {
+                    "p50_ms": 0.19354100000000002,
+                    "p95_ms": 0.259672,
+                    "p99_ms": 0.294961,
+                    "samples": 100
+                },
+                "legacy_first_write": {
+                    "p50_ms": 128.37743700000001,
+                    "p95_ms": 195.28374000000002,
+                    "p99_ms": 522.978901,
+                    "samples": 100
+                },
+                "search_baseline": {
+                    "p50_ms": 8.365775000000001,
+                    "p95_ms": 9.984789000000001,
+                    "p99_ms": 11.962267,
+                    "samples": 100
+                },
+                "search_due": {
+                    "p50_ms": 1.335921,
+                    "p95_ms": 1.8241729999999998,
+                    "p99_ms": 2.2249079999999997,
+                    "samples": 100
+                },
+                "search_unverified": {
+                    "p50_ms": 1.325952,
+                    "p95_ms": 1.672834,
+                    "p99_ms": 2.0084679999999997,
+                    "samples": 100
+                }
+            },
+            "query_plans": {
+                "due": [
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1",
+                    "SEARCH memories USING INDEX memories_review_due (review_after>? AND review_after<?)",
+                    "USE TEMP B-TREE FOR ORDER BY"
+                ],
+                "unverified": [
+                    "SCAN memories USING INDEX memories_unverified_recent",
+                    "SCAN memory_types USING COVERING INDEX sqlite_autoindex_memory_types_1"
+                ]
+            },
+            "repetition": 2,
+            "response_reduction_percent": 96.09444667552232
+        }
+    ],
+    "revision": "8c4b8517876da97ec16b882ab03e070609065187",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "source_sha256": {
+        "Cargo.lock": "4a4f69cba59e12502c24fa0ba0233f3279d3bb1848b4c59dc1cbeb0c3365fd6d",
+        "Cargo.toml": "2feba9a7565b1964493679f05e86e1dcbc60466d9b6d211db89ef24c9281241c",
+        "database/initialize.sql": "4938b2f1e3c35fc8148a08dacb8e3f5323f355d0e0d92fb7570b0d58171778e3",
+        "src/models.rs": "5c14fdecbe42975901c5d0e55e60f07897b8756db290978252026e4712389dab",
+        "src/search.rs": "666349ac009eb6ac7f62948751a01d4078b1b853f5a05a2fc7ee2046cd63a36a",
+        "src/service.rs": "058e533ebb41db409216ec693edd3573ea435f4f049edbf6452eae927668e0e8",
+        "src/storage.rs": "bdc47849fe79fb042a5335153cb34c7a5e72a6fb066b5e211b10da58d0aca133",
+        "tests/perf/review_mutations.rs": "5dd64cec44fc3ded854b8a6eb71d0fa42a4da0cd19b3acd58306b8066a7b77cc"
+    },
+    "workload": {
+        "body_bytes": 4423,
+        "iterations": 100,
+        "memories": 10000,
+        "notes": "Release build, sequential in-process Service::dispatch including service response construction, durable SQLite FULL commit and search publication; transport/OAuth/MCP/model latency excluded. Three read warmups per scenario, no write warmups, OS caches not flushed, no result cache. Query plans use ANALYZE on each dedicated fixture. Latencies are per request; response bytes use compact JSON serialization, not tokenizer counts.",
+        "repetitions": 3
+    }
+}

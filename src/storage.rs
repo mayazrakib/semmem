@@ -6,6 +6,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, params_from_iter,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::models::{
     AppError, AppResult, CommitRecord, CreateMemory, GetCommits, GetMemories, IndexEvent,
@@ -28,7 +29,7 @@ impl Store {
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         validate_schema_version(version)?;
-        if version == 4 {
+        if version == 5 {
             validate_schema_shape(&connection)?;
         }
         if version == 0 && connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get::<_, bool>(0))? {
@@ -57,7 +58,7 @@ impl Store {
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_handler(Some(wait_for_database))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 4 {
+        if version != 5 {
             return Err(unsupported_schema(version));
         }
         validate_schema_shape(&connection)?;
@@ -119,95 +120,14 @@ impl Store {
         commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
         self.last_write_commit = None;
-        validate_write(actor, commit_summary)?;
-        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = current_time()?;
-        let mut changes = Vec::new();
-        let mut inserted = BTreeSet::new();
-        for input in inputs {
-            validate_key(&input.key)?;
-            validate_body(&input.body)?;
-            if let Some(existing) = transaction
-                .query_row(
-                    "SELECT id FROM memories WHERE key = ?1",
-                    [&input.key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-            {
-                let current = read_memory(&transaction, &input.key)?;
-                if current.id != existing || !matches_create(&current, input) {
-                    return Err(AppError::new(
-                        "already_exists",
-                        format!(
-                            "Memory '{}' already exists with different content.",
-                            input.key
-                        ),
-                    ));
-                }
-                continue;
-            }
-            let type_id = ensure_taxonomy(
-                &transaction,
-                "memory_types",
-                &input.r#type,
-                actor,
-                now,
-                &mut changes,
-            )?;
-            let metadata = create_metadata(input, now);
-            let basis = metadata.basis.map(|value| {
-                serde_json::to_value(value)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            });
-            transaction.execute("INSERT INTO memories (key, title, body, summary, basis, scope, observed_at, verified_at, review_after, type_id, system_token, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13)", params![input.key, input.title, input.body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now])?;
-            inserted.insert(input.key.clone());
-        }
-        for input in inputs {
-            if !inserted.contains(&input.key) {
-                continue;
-            }
-            let id: i64 = transaction.query_row(
-                "SELECT id FROM memories WHERE key = ?1",
-                [&input.key],
-                |row| row.get(0),
-            )?;
-            replace_associations(
-                &transaction,
-                id,
-                &input.tags,
-                &input.references,
-                actor,
-                now,
-                &mut changes,
-            )?;
-            add_index_event(&transaction, &input.key, "upsert", actor, now)?;
-            changes.push(json!({"entity":"memories","key":input.key,"operation":"create","fields":["title","body","metadata","type","tags","references"],"index_event":"upsert"}));
-        }
-        let commit_id = if !changes.is_empty() {
-            Some(append_commit(
-                &transaction,
-                actor,
-                commit_summary,
-                "create_memories",
-                changes,
-                now,
-            )?)
-        } else {
-            None
-        };
-        let records = inputs
-            .iter()
-            .map(|input| read_memory(&transaction, &input.key))
-            .collect::<AppResult<Vec<_>>>()?;
+        let (records, commit_id) =
+            apply_create_memories(&transaction, inputs, actor, commit_summary, false)?;
         transaction.commit()?;
         self.last_write_commit = commit_id;
+
         Ok(records)
     }
 
@@ -218,91 +138,14 @@ impl Store {
         commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
         self.last_write_commit = None;
-        validate_write(actor, commit_summary)?;
-        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = current_time()?;
-        let mut changes = Vec::new();
-        let mut records = Vec::new();
-        for input in inputs {
-            let current = read_memory(&transaction, &input.key)?;
-            validate_token(&current, &input.expected_token)?;
-            let title = input.title.as_deref().unwrap_or(&current.title);
-            let body = input.body.as_deref().unwrap_or(&current.body);
-            validate_body(body)?;
-            let metadata = input.metadata.apply(&current.metadata);
-            let basis = metadata.basis.map(|value| {
-                serde_json::to_value(value)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            });
-            let memory_type = input.r#type.as_deref().unwrap_or(&current.r#type);
-            let tags = input.tags.as_deref().unwrap_or(&current.tags);
-            let references = input.references.as_deref().unwrap_or(&current.references);
-            if title == current.title
-                && body == current.body
-                && metadata == current.metadata
-                && memory_type == current.r#type
-                && same_associations(tags, references, &current)
-            {
-                records.push(current);
-                continue;
-            }
-            let type_id = ensure_taxonomy(
-                &transaction,
-                "memory_types",
-                memory_type,
-                actor,
-                now,
-                &mut changes,
-            )?;
-            let changed = transaction.execute("UPDATE memories SET title = ?2, body = ?3, summary = ?4, basis = ?5, scope = ?6, observed_at = ?7, verified_at = ?8, review_after = ?9, type_id = ?10, system_token = ?11, system_updated_by = ?12, system_updated_at = ?13 WHERE id = ?1 AND system_token = ?14", params![current.id, title, body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now, input.expected_token])?;
-            if changed != 1 {
-                return Err(conflict(&input.key));
-            }
-            replace_associations(
-                &transaction,
-                current.id,
-                input.tags.as_deref().unwrap_or(&current.tags),
-                input.references.as_deref().unwrap_or(&current.references),
-                actor,
-                now,
-                &mut changes,
-            )?;
-            add_index_event(&transaction, &input.key, "upsert", actor, now)?;
-            let updated = read_memory(&transaction, &input.key)?;
-            let before = serde_json::to_value(&current)?;
-            let after = serde_json::to_value(&updated)?;
-            let fields = after
-                .as_object()
-                .unwrap()
-                .iter()
-                .filter(|(key, value)| {
-                    !key.starts_with("system_") && before.get(*key) != Some(*value)
-                })
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            changes.push(json!({"entity":"memories","key":input.key,"operation":"update","fields":fields,"index_event":"upsert"}));
-            records.push(updated);
-        }
-        let commit_id = if changes.is_empty() {
-            None
-        } else {
-            Some(append_commit(
-                &transaction,
-                actor,
-                commit_summary,
-                "update_memories",
-                changes,
-                now,
-            )?)
-        };
+        let (records, commit_id) =
+            apply_update_memories(&transaction, inputs, actor, commit_summary, false)?;
         transaction.commit()?;
         self.last_write_commit = commit_id;
+
         Ok(records)
     }
 
@@ -313,67 +156,128 @@ impl Store {
         commit_summary: &str,
     ) -> AppResult<Vec<MemoryRecord>> {
         self.last_write_commit = None;
-        validate_write(actor, commit_summary)?;
-        validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = current_time()?;
-        let records = inputs
-            .iter()
-            .map(|input| {
-                let record = read_memory(&transaction, &input.key)?;
-                validate_token(&record, &input.expected_token)?;
-                Ok(record)
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        let ids = records
-            .iter()
-            .map(|record| record.id)
-            .collect::<BTreeSet<_>>();
-        let mut surviving_sources = BTreeSet::new();
-        let mut changes = Vec::new();
-        for record in &records {
-            let mut statement = transaction.prepare_cached(
-                "SELECT DISTINCT memory_id FROM memory_references WHERE target_memory_id = ?1",
-            )?;
-            let sources = statement
-                .query_map([record.id], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for source in sources {
-                if !ids.contains(&source) {
-                    surviving_sources.insert(source);
-                }
-            }
-        }
-        for record in &records {
-            transaction.execute(
-                "DELETE FROM memories WHERE id = ?1 AND system_token = ?2",
-                params![record.id, record.system_token],
-            )?;
-            add_index_event(&transaction, &record.key, "delete", actor, now)?;
-            changes.push(json!({"entity":"memories","key":record.key,"operation":"delete","associations":"remove outgoing tags and references, and incoming references","index_event":"delete"}));
-        }
-        for id in surviving_sources {
-            transaction.execute("UPDATE memories SET system_token = ?2, system_updated_by = ?3, system_updated_at = ?4 WHERE id = ?1", params![id, new_token(), actor, now])?;
-            let key: String =
-                transaction.query_row("SELECT key FROM memories WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })?;
-            add_index_event(&transaction, &key, "upsert", actor, now)?;
-            changes.push(json!({"entity":"memories","key":key,"operation":"update","fields":["references"],"reason":"remove references to deleted targets","index_event":"upsert"}));
-        }
-        let commit_id = Some(append_commit(
-            &transaction,
-            actor,
-            commit_summary,
-            "delete_memories",
-            changes,
-            now,
-        )?);
+        let (records, commit_id) =
+            apply_delete_memories(&transaction, inputs, actor, commit_summary, false)?;
         transaction.commit()?;
         self.last_write_commit = commit_id;
+
         Ok(records)
+    }
+
+    pub(crate) fn mutate_memories(
+        &mut self,
+        mutation: MemoryMutation<'_>,
+        actor: &str,
+        commit_summary: &str,
+        request_id: &str,
+    ) -> AppResult<Value> {
+        validate_request_id(request_id)?;
+        validate_write(actor, commit_summary)?;
+        let operation = mutation.get_operation();
+        let fingerprint = mutation.compute_fingerprint(commit_summary)?;
+        self.last_write_commit = None;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction.query_row(
+            "SELECT operation, fingerprint, receipt FROM mutation_receipts WHERE actor = ?1 AND request_id = ?2",
+            params![actor, request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?)),
+        ).optional()?;
+
+        if let Some((original_operation, original_fingerprint, receipt)) = existing {
+            if original_operation != operation || original_fingerprint != fingerprint {
+                return Err(AppError::new(
+                    "conflict",
+                    "The request ID already belongs to a different memory mutation.",
+                ));
+            }
+
+            let receipt = serde_json::from_str(&receipt)?;
+            transaction.commit()?;
+
+            return Ok(receipt);
+        }
+
+        let (_, commit_id) = match mutation {
+            MemoryMutation::CREATE(inputs) => {
+                apply_create_memories(&transaction, inputs, actor, commit_summary, true)?
+            }
+            MemoryMutation::UPDATE(inputs) => {
+                apply_update_memories(&transaction, inputs, actor, commit_summary, true)?
+            }
+            MemoryMutation::DELETE(inputs) => {
+                apply_delete_memories(&transaction, inputs, actor, commit_summary, true)?
+            }
+        };
+        let mut memories = Vec::new();
+        let mut statement =
+            transaction.prepare_cached("SELECT system_token FROM memories WHERE key = ?1")?;
+
+        for (key, deleted_token) in mutation.get_keys() {
+            let token = match deleted_token {
+                Some(token) => token.to_owned(),
+                None => statement.query_row([key], |row| row.get::<_, String>(0))?,
+            };
+            memories.push(json!({"key":key,"system_token":token}));
+        }
+
+        drop(statement);
+
+        if matches!(mutation, MemoryMutation::DELETE(_)) {
+            let mut sources = transaction.prepare_cached("SELECT memories.key, memories.system_token FROM commit_changes AS changes INNER JOIN memories ON memories.key = changes.key WHERE changes.commit_id = ?1 AND changes.entity = 'memories' AND changes.operation = 'update' ORDER BY memories.key")?;
+
+            for source in sources.query_map([commit_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (key, token) = source?;
+                memories.push(json!({"key":key,"system_token":token}));
+            }
+        }
+
+        let receipt = json!({"request_id":request_id,"operation":operation,"commit_id":commit_id,"memories":memories});
+        let watermark: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'index_events'), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO mutation_receipts (request_id, actor, operation, fingerprint, receipt, publication_watermark, system_created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![request_id, actor, operation, fingerprint, serde_json::to_string(&receipt)?, watermark, current_time()?],
+        )?;
+        transaction.commit()?;
+        self.last_write_commit = commit_id;
+
+        Ok(receipt)
+    }
+
+    pub fn get_mutation_receipts(
+        &self,
+        request_ids: &[String],
+        actor: &str,
+    ) -> AppResult<Vec<Value>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(
+            "SELECT receipt FROM mutation_receipts WHERE actor = ?1 AND request_id = ?2",
+        )?;
+        let mut receipts = Vec::with_capacity(request_ids.len());
+
+        for request_id in request_ids {
+            validate_request_id(request_id)?;
+            let receipt: String = statement
+                .query_row(params![actor, request_id], |row| row.get(0))
+                .optional()?
+                .ok_or_else(|| not_found(request_id))?;
+            receipts.push(serde_json::from_str(&receipt)?);
+        }
+
+        drop(statement);
+        transaction.commit()?;
+
+        Ok(receipts)
     }
 
     pub fn list_memories(&self, request: &ListMemories) -> AppResult<Vec<MemoryRecord>> {
@@ -383,6 +287,19 @@ impl Store {
         let transaction = self.connection.unchecked_transaction()?;
         let mut sql = format!("SELECT {MEMORY_COLUMNS} FROM current_memories WHERE 1 = 1");
         let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(cutoff) = request.review_due_by {
+            sql.push_str(" AND review_after IS NOT NULL AND review_after <= ?");
+            values.push(cutoff.into());
+        }
+
+        if let Some(is_verified) = request.is_verified {
+            sql.push_str(if is_verified {
+                " AND verified_at IS NOT NULL"
+            } else {
+                " AND verified_at IS NULL"
+            });
+        }
+
         if let Some(value) = &request.scope {
             sql.push_str(" AND scope = ?");
             values.push(value.clone().into());
@@ -1097,13 +1014,13 @@ fn unsupported_schema(version: i64) -> AppError {
     AppError::new(
         "unsupported_schema",
         format!(
-            "Database schema version {version} is unsupported. This build requires a fresh current-state database initialized at version 4."
+            "Database schema version {version} is unsupported. This build requires a fresh current-state database initialized at version 5."
         ),
     )
 }
 
 fn validate_schema_version(version: i64) -> AppResult<()> {
-    if version != 0 && version != 4 {
+    if version != 0 && version != 5 {
         return Err(unsupported_schema(version));
     }
     Ok(())
@@ -1131,7 +1048,7 @@ fn validate_schema_shape(connection: &Connection) -> AppResult<()> {
             .collect()
     }
     if read_schema(connection)? != read_schema(&expected)? {
-        return Err(unsupported_schema(4));
+        return Err(unsupported_schema(5));
     }
     Ok(())
 }
@@ -1151,4 +1068,391 @@ fn same_associations(
                 .iter()
                 .map(|reference| (&reference.target_key, &reference.reference_type))
                 .collect::<BTreeSet<_>>()
+}
+
+fn apply_create_memories(
+    transaction: &Connection,
+    inputs: &[CreateMemory],
+    actor: &str,
+    commit_summary: &str,
+    is_compact: bool,
+) -> AppResult<(Vec<MemoryRecord>, Option<i64>)> {
+    validate_write(actor, commit_summary)?;
+    validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
+    let now = current_time()?;
+    let mut changes = Vec::new();
+    let mut inserted = BTreeSet::new();
+    for input in inputs {
+        validate_key(&input.key)?;
+        validate_body(&input.body)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id FROM memories WHERE key = ?1",
+                [&input.key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            let current = read_memory(transaction, &input.key)?;
+            if current.id != existing || !matches_create(&current, input) {
+                return Err(AppError::new(
+                    "already_exists",
+                    format!(
+                        "Memory '{}' already exists with different content.",
+                        input.key
+                    ),
+                ));
+            }
+            continue;
+        }
+        let type_id = ensure_taxonomy(
+            transaction,
+            "memory_types",
+            &input.r#type,
+            actor,
+            now,
+            &mut changes,
+        )?;
+        let metadata = create_metadata(input, now);
+        let basis = metadata.basis.map(|value| {
+            serde_json::to_value(value)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+        transaction.execute("INSERT INTO memories (key, title, body, summary, basis, scope, observed_at, verified_at, review_after, type_id, system_token, system_created_by, system_updated_by, system_created_at, system_updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?13)", params![input.key, input.title, input.body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now])?;
+        inserted.insert(input.key.clone());
+    }
+    for input in inputs {
+        if !inserted.contains(&input.key) {
+            continue;
+        }
+        let id: i64 = transaction.query_row(
+            "SELECT id FROM memories WHERE key = ?1",
+            [&input.key],
+            |row| row.get(0),
+        )?;
+        replace_associations(
+            transaction,
+            id,
+            &input.tags,
+            &input.references,
+            actor,
+            now,
+            &mut changes,
+        )?;
+        add_index_event(transaction, &input.key, "upsert", actor, now)?;
+        changes.push(json!({"entity":"memories","key":input.key,"operation":"create","fields":["title","body","metadata","type","tags","references"],"index_event":"upsert"}));
+    }
+    let commit_id = if !changes.is_empty() {
+        Some(append_commit(
+            transaction,
+            actor,
+            commit_summary,
+            "create_memories",
+            changes,
+            now,
+        )?)
+    } else {
+        None
+    };
+    let records = if is_compact {
+        Vec::new()
+    } else {
+        inputs
+            .iter()
+            .map(|input| read_memory(transaction, &input.key))
+            .collect::<AppResult<Vec<_>>>()?
+    };
+    Ok((records, commit_id))
+}
+
+fn apply_update_memories(
+    transaction: &Connection,
+    inputs: &[UpdateMemory],
+    actor: &str,
+    commit_summary: &str,
+    is_compact: bool,
+) -> AppResult<(Vec<MemoryRecord>, Option<i64>)> {
+    validate_write(actor, commit_summary)?;
+    validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
+    let now = current_time()?;
+    let mut changes = Vec::new();
+    let mut records = Vec::new();
+    for input in inputs {
+        let current = read_memory(transaction, &input.key)?;
+        validate_token(&current, &input.expected_token)?;
+        let title = input.title.as_deref().unwrap_or(&current.title);
+        let body = input.body.as_deref().unwrap_or(&current.body);
+        validate_body(body)?;
+        let metadata = input.metadata.apply(&current.metadata);
+        let basis = metadata.basis.map(|value| {
+            serde_json::to_value(value)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+        let memory_type = input.r#type.as_deref().unwrap_or(&current.r#type);
+        let tags = input.tags.as_deref().unwrap_or(&current.tags);
+        let references = input.references.as_deref().unwrap_or(&current.references);
+        if title == current.title
+            && body == current.body
+            && metadata == current.metadata
+            && memory_type == current.r#type
+            && same_associations(tags, references, &current)
+        {
+            if !is_compact {
+                records.push(current);
+            }
+            continue;
+        }
+        let type_id = ensure_taxonomy(
+            transaction,
+            "memory_types",
+            memory_type,
+            actor,
+            now,
+            &mut changes,
+        )?;
+        let changed = transaction.execute("UPDATE memories SET title = ?2, body = ?3, summary = ?4, basis = ?5, scope = ?6, observed_at = ?7, verified_at = ?8, review_after = ?9, type_id = ?10, system_token = ?11, system_updated_by = ?12, system_updated_at = ?13 WHERE id = ?1 AND system_token = ?14", params![current.id, title, body, metadata.summary, basis, metadata.scope, metadata.observed_at, metadata.verified_at, metadata.review_after, type_id, new_token(), actor, now, input.expected_token])?;
+        if changed != 1 {
+            return Err(conflict(&input.key));
+        }
+        replace_associations(
+            transaction,
+            current.id,
+            input.tags.as_deref().unwrap_or(&current.tags),
+            input.references.as_deref().unwrap_or(&current.references),
+            actor,
+            now,
+            &mut changes,
+        )?;
+        add_index_event(transaction, &input.key, "upsert", actor, now)?;
+        let normalized_tags = tags.iter().collect::<BTreeSet<_>>();
+        let normalized_references = references
+            .iter()
+            .map(|reference| (&reference.reference_type, &reference.target_key))
+            .collect::<BTreeSet<_>>();
+        let mut fields = [
+            ("title", title != current.title),
+            ("body", body != current.body),
+            ("summary", metadata.summary != current.metadata.summary),
+            ("basis", metadata.basis != current.metadata.basis),
+            ("scope", metadata.scope != current.metadata.scope),
+            (
+                "observed_at",
+                metadata.observed_at != current.metadata.observed_at,
+            ),
+            (
+                "verified_at",
+                metadata.verified_at != current.metadata.verified_at,
+            ),
+            (
+                "review_after",
+                metadata.review_after != current.metadata.review_after,
+            ),
+            ("type", memory_type != current.r#type),
+            (
+                "tags",
+                normalized_tags != current.tags.iter().collect::<BTreeSet<_>>(),
+            ),
+            (
+                "references",
+                normalized_references
+                    != current
+                        .references
+                        .iter()
+                        .map(|reference| (&reference.reference_type, &reference.target_key))
+                        .collect::<BTreeSet<_>>(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, has_changed)| has_changed.then_some(field))
+        .collect::<Vec<_>>();
+        fields.sort_unstable();
+        changes.push(json!({"entity":"memories","key":input.key,"operation":"update","fields":fields,"index_event":"upsert"}));
+
+        if !is_compact {
+            records.push(read_memory(transaction, &input.key)?);
+        }
+    }
+    let commit_id = if changes.is_empty() {
+        None
+    } else {
+        Some(append_commit(
+            transaction,
+            actor,
+            commit_summary,
+            "update_memories",
+            changes,
+            now,
+        )?)
+    };
+    Ok((records, commit_id))
+}
+
+fn apply_delete_memories(
+    transaction: &Connection,
+    inputs: &[MemoryToken],
+    actor: &str,
+    commit_summary: &str,
+    is_compact: bool,
+) -> AppResult<(Vec<MemoryRecord>, Option<i64>)> {
+    validate_write(actor, commit_summary)?;
+    validate_batch(inputs.iter().map(|input| input.key.as_str()))?;
+    let now = current_time()?;
+    let mut records = Vec::new();
+    let mut identities = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let identity = if is_compact {
+            transaction
+                .query_row(
+                    "SELECT id, key, system_token FROM memories WHERE key = ?1",
+                    [&input.key],
+                    |row| {
+                        Ok(MemoryIdentity {
+                            id: row.get(0)?,
+                            key: row.get(1)?,
+                            system_token: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| not_found(&input.key))?
+        } else {
+            let record = read_memory(transaction, &input.key)?;
+            let identity = MemoryIdentity {
+                id: record.id,
+                key: record.key.clone(),
+                system_token: record.system_token.clone(),
+            };
+            records.push(record);
+
+            identity
+        };
+
+        if identity.system_token != input.expected_token {
+            return Err(conflict(&input.key));
+        }
+
+        identities.push(identity);
+    }
+
+    let ids = identities
+        .iter()
+        .map(|record| record.id)
+        .collect::<BTreeSet<_>>();
+    let mut surviving_sources = BTreeSet::new();
+    let mut changes = Vec::new();
+    for record in &identities {
+        let mut statement = transaction.prepare_cached(
+            "SELECT DISTINCT memory_id FROM memory_references WHERE target_memory_id = ?1",
+        )?;
+        let sources = statement
+            .query_map([record.id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for source in sources {
+            if !ids.contains(&source) {
+                surviving_sources.insert(source);
+            }
+        }
+    }
+    for record in &identities {
+        transaction.execute(
+            "DELETE FROM memories WHERE id = ?1 AND system_token = ?2",
+            params![record.id, record.system_token],
+        )?;
+        add_index_event(transaction, &record.key, "delete", actor, now)?;
+        changes.push(json!({"entity":"memories","key":record.key,"operation":"delete","associations":"remove outgoing tags and references, and incoming references","index_event":"delete"}));
+    }
+    for id in surviving_sources {
+        transaction.execute("UPDATE memories SET system_token = ?2, system_updated_by = ?3, system_updated_at = ?4 WHERE id = ?1", params![id, new_token(), actor, now])?;
+        let key: String =
+            transaction.query_row("SELECT key FROM memories WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })?;
+        add_index_event(transaction, &key, "upsert", actor, now)?;
+        changes.push(json!({"entity":"memories","key":key,"operation":"update","fields":["references"],"reason":"remove references to deleted targets","index_event":"upsert"}));
+    }
+    let commit_id = Some(append_commit(
+        transaction,
+        actor,
+        commit_summary,
+        "delete_memories",
+        changes,
+        now,
+    )?);
+    Ok((records, commit_id))
+}
+
+struct MemoryIdentity {
+    id: i64,
+    key: String,
+    system_token: String,
+}
+
+#[derive(Clone, Copy)]
+#[allow(clippy::upper_case_acronyms)]
+pub(crate) enum MemoryMutation<'a> {
+    CREATE(&'a [CreateMemory]),
+    UPDATE(&'a [UpdateMemory]),
+    DELETE(&'a [MemoryToken]),
+}
+
+impl MemoryMutation<'_> {
+    fn get_operation(&self) -> &'static str {
+        match self {
+            Self::CREATE(_) => "create_memories",
+            Self::UPDATE(_) => "update_memories",
+            Self::DELETE(_) => "delete_memories",
+        }
+    }
+
+    fn compute_fingerprint(
+        &self,
+        commit_summary: &str,
+    ) -> AppResult<Vec<u8>> {
+        let mut hasher = Sha256::new();
+        serde_json::to_writer(&mut hasher, &(self.get_operation(), commit_summary))
+            .map_err(AppError::from)?;
+
+        match self {
+            Self::CREATE(inputs) => serde_json::to_writer(&mut hasher, inputs)?,
+            Self::UPDATE(inputs) => serde_json::to_writer(&mut hasher, inputs)?,
+            Self::DELETE(inputs) => serde_json::to_writer(&mut hasher, inputs)?,
+        }
+
+        Ok(hasher.finalize().to_vec())
+    }
+
+    fn get_keys(&self) -> Vec<(&str, Option<&str>)> {
+        match self {
+            Self::CREATE(inputs) => inputs
+                .iter()
+                .map(|input| (input.key.as_str(), None))
+                .collect(),
+            Self::UPDATE(inputs) => inputs
+                .iter()
+                .map(|input| (input.key.as_str(), None))
+                .collect(),
+            Self::DELETE(inputs) => inputs
+                .iter()
+                .map(|input| (input.key.as_str(), Some(input.expected_token.as_str())))
+                .collect(),
+        }
+    }
+}
+
+fn validate_request_id(request_id: &str) -> AppResult<()> {
+    let parsed = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| AppError::invalid("Request IDs must be canonical UUIDs."))?;
+
+    if parsed.to_string() != request_id {
+        return Err(AppError::invalid("Request IDs must be canonical UUIDs."));
+    }
+
+    Ok(())
 }

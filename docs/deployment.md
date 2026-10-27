@@ -116,9 +116,9 @@ These instructions describe the delivered configuration. They do not establish a
 
 ## Schema Reset Deployment
 
-The current initializer defines schema v4. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
+The current initializer defines schema v5. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
 
-For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v4 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.
+For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v5 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.
 
 ## Batched Work Logging
 

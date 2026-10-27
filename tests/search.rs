@@ -21,6 +21,8 @@ fn create_memory(id: i64, key: &str, title: &str, body: &str) -> MemoryRecord {
 
 fn create_request(query: &str) -> SearchRequest {
     SearchRequest {
+        review_due_by: None,
+        is_verified: None,
         query: query.into(),
         scope: None,
         basis: None,

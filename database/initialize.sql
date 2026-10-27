@@ -204,6 +204,35 @@ BEGIN
     SELECT RAISE(ABORT, 'Audit records cannot be replaced.');
 END;
 
+CREATE TABLE mutation_receipts (
+    request_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    receipt TEXT NOT NULL CHECK (json_valid(receipt)),
+    publication_watermark INTEGER NOT NULL CHECK (publication_watermark >= 0),
+    system_created_at INTEGER NOT NULL,
+    PRIMARY KEY (actor, request_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER mutation_receipts_no_update BEFORE UPDATE ON mutation_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'Mutation receipts are immutable.');
+END;
+
+CREATE TRIGGER mutation_receipts_no_delete BEFORE DELETE ON mutation_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'Mutation receipts cannot be deleted.');
+END;
+
+CREATE TRIGGER mutation_receipts_no_replace BEFORE INSERT ON mutation_receipts
+WHEN EXISTS (SELECT 1 FROM mutation_receipts WHERE actor = NEW.actor AND request_id = NEW.request_id)
+BEGIN
+    SELECT RAISE(ABORT, 'Mutation receipts cannot be replaced.');
+END;
+
+CREATE INDEX memories_review_due ON memories (review_after, id) WHERE review_after IS NOT NULL;
+CREATE INDEX memories_unverified_recent ON memories (system_updated_at DESC, id DESC) WHERE verified_at IS NULL;
 CREATE INDEX memories_recent ON memories (system_updated_at DESC, id DESC);
 CREATE INDEX memories_type ON memories (type_id, id);
 CREATE INDEX memories_scope ON memories (scope, id);
@@ -233,4 +262,4 @@ VALUES (lower(hex(randomblob(16))), 'Initialize the current-state database and d
 INSERT INTO commit_changes (commit_id, ordinal, entity, key, operation, has_fields)
 VALUES (1, 0, 'database', NULL, 'create', 0), (1, 1, 'memory_types', 'general', 'create', 0);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

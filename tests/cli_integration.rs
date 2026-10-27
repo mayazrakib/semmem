@@ -576,3 +576,74 @@ async fn readonly_frontmatter_change_preserves_draft_and_does_not_write() {
     fs::remove_file(path).unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_review_filters_and_request_ids_reach_the_service() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("service.sock");
+    let state = ServerState::default();
+    let server = start_service(&socket, state.clone()).await;
+    let editor = write_editor(
+        root.path(),
+        "if [ -s \"$1\" ]; then sed -i 's/Original body/Changed body/' \"$1\"; else printf 'Body\\n' > \"$1\"; fi",
+    );
+    let id = "00000000-0000-0000-0000-000000000001";
+
+    for arguments in [
+        vec!["list", "--review-due-by", "100", "--never-verified"],
+        vec!["search", "needle", "--due-for-review", "--never-verified"],
+        vec!["mutation_receipts", id],
+        vec!["add", "example", "--request-id", id],
+        vec!["edit", "example", "--request-id", id],
+        vec![
+            "delete",
+            "example",
+            "--expected-token",
+            "token",
+            "--request-id",
+            id,
+        ],
+    ] {
+        let output = run_cli(&socket, editor.clone(), &arguments).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let requests = state.requests.lock().unwrap();
+    let list = requests
+        .iter()
+        .find(|(operation, _)| operation == "list_memories")
+        .unwrap();
+    assert_eq!(list.1["review_due_by"], 100);
+    assert_eq!(list.1["is_verified"], false);
+    let search = requests
+        .iter()
+        .find(|(operation, _)| operation == "search_memories")
+        .unwrap();
+    assert!(search.1["review_due_by"].as_i64().unwrap() > 0);
+    assert_eq!(search.1["is_verified"], false);
+
+    for operation in ["create_memories", "update_memories", "delete_memories"] {
+        let request = requests.iter().find(|(name, _)| name == operation).unwrap();
+        assert_eq!(request.1["request_id"], id);
+    }
+
+    let receipt = requests
+        .iter()
+        .find(|(operation, _)| operation == "get_mutation_receipts")
+        .unwrap();
+    assert_eq!(receipt.1["request_ids"], json!([id]));
+    server.abort();
+}
+
+#[test]
+fn cli_review_cutoffs_are_mutually_exclusive() {
+    let output = Command::new(env!("CARGO_BIN_EXE_semmem"))
+        .args(["list", "--due-for-review", "--review-due-by", "100"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}

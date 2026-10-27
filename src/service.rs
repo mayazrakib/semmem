@@ -109,6 +109,7 @@ impl Drop for ReadConnection<'_> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Batch<T> {
+    request_id: Option<String>,
     commit_summary: String,
     memories: Vec<T>,
 }
@@ -166,7 +167,7 @@ impl Service {
         let marker = directory.join("search.identity");
         validate_derived_path(&index_path, true)?;
         validate_derived_path(&marker, false)?;
-        let expected_identity = format!("{identity}:search-current-state-v2");
+        let expected_identity = format!("{identity}:search-current-state-v3");
         let matches = index_path.join("meta.json").is_file()
             && std::fs::read_to_string(&marker).ok().as_deref() == Some(expected_identity.as_str());
 
@@ -246,7 +247,7 @@ impl Service {
         writer: &str,
     ) -> AppResult<Value> {
         if is_read_operation(operation) {
-            return self.read(operation, arguments);
+            return self.read(operation, arguments, writer);
         }
 
         let (sender, receiver) = mpsc::channel();
@@ -290,6 +291,7 @@ impl Service {
         &self,
         operation: &str,
         arguments: Value,
+        writer: &str,
     ) -> AppResult<Value> {
         if operation == "search_memories" {
             let request: SearchRequest = serde_json::from_value(arguments)?;
@@ -341,6 +343,12 @@ impl Service {
         }
         let store = self.readers.acquire()?;
         match operation {
+            "get_mutation_receipts" => {
+                let request: crate::models::GetMutationReceipts =
+                    serde_json::from_value(arguments)?;
+
+                Ok(json!({"receipts":store.get_mutation_receipts(&request.request_ids, writer)?}))
+            }
             "get_logs" => {
                 let request: GetLogs = serde_json::from_value(arguments)?;
 
@@ -410,6 +418,7 @@ pub fn is_read_operation(operation: &str) -> bool {
     matches!(
         operation,
         "search_memories"
+            | "get_mutation_receipts"
             | "get_logs"
             | "list_logs"
             | "get_memories"
@@ -602,6 +611,10 @@ fn process_memory_requests(
                     ),
                 );
                 failure.committed = true;
+                failure.request_id = result
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 failure.commit_id = result.get("commit_id").and_then(Value::as_i64);
                 if let Some(memories) = result.get("memories").and_then(Value::as_array) {
                     failure.affected = memories
@@ -662,15 +675,42 @@ fn apply_write(
         "create_memories" => {
             let batch: Batch<CreateMemory> = serde_json::from_value(arguments)?;
 
+            if let Some(request_id) = &batch.request_id {
+                return store.mutate_memories(
+                    crate::storage::MemoryMutation::CREATE(&batch.memories),
+                    writer,
+                    &batch.commit_summary,
+                    request_id,
+                );
+            }
+
             json!({"memories": summaries(store.create_memories(&batch.memories, writer, &batch.commit_summary)?)?})
         }
         "update_memories" => {
             let batch: Batch<UpdateMemory> = serde_json::from_value(arguments)?;
 
+            if let Some(request_id) = &batch.request_id {
+                return store.mutate_memories(
+                    crate::storage::MemoryMutation::UPDATE(&batch.memories),
+                    writer,
+                    &batch.commit_summary,
+                    request_id,
+                );
+            }
+
             json!({"memories": summaries(store.update_memories(&batch.memories, writer, &batch.commit_summary)?)?})
         }
         "delete_memories" => {
             let batch: Batch<MemoryToken> = serde_json::from_value(arguments)?;
+
+            if let Some(request_id) = &batch.request_id {
+                return store.mutate_memories(
+                    crate::storage::MemoryMutation::DELETE(&batch.memories),
+                    writer,
+                    &batch.commit_summary,
+                    request_id,
+                );
+            }
 
             let removed = store.delete_memories(&batch.memories, writer, &batch.commit_summary)?;
             let receipts = removed.into_iter().map(|memory| json!({"key": memory.key, "system_token": memory.system_token})).collect::<Vec<_>>();
@@ -783,6 +823,11 @@ fn publish_events(
         let events = store.index_events(watermark, 1000)?;
         if events.is_empty() {
             break;
+        }
+
+        #[cfg(feature = "fault-injection")]
+        if std::env::var("SEMMEM_FAILPOINT").as_deref() == Ok("publication_failure") {
+            anyhow::bail!("Injected search publication failure.");
         }
         let keys: BTreeSet<_> = events
             .iter()

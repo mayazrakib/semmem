@@ -203,7 +203,8 @@ fn error_response(error: AppError) -> Response {
     let status = match error.code.as_str() {
         "invalid_input" => StatusCode::BAD_REQUEST,
         "not_found" => StatusCode::NOT_FOUND,
-        "token_conflict"
+        "conflict"
+        | "token_conflict"
         | "already_exists"
         | "referenced"
         | "referenced_taxonomy"

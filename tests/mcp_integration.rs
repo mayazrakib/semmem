@@ -38,6 +38,13 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
         .json()
         .await?;
     assert_eq!(created["memories"][0]["system_updated_by"], "human");
+    let request_id = "00000000-0000-0000-0000-000000000009";
+    let mut request = json!({"request_id":request_id,"commit_summary":"Test local receipts.","memories":[{"key":"local-receipt","body":"Original"}]});
+    let local_receipt: Value = http.post("http://localhost/api/create_memories").json(&request).send().await?.error_for_status()?.json().await?;
+    request["memories"][0]["body"] = json!("Changed");
+    assert_eq!(http.post("http://localhost/api/create_memories").json(&request).send().await?.status(), 409);
+    let looked_up: Value = http.post("http://localhost/api/get_mutation_receipts").json(&json!({"request_ids":[request_id]})).send().await?.error_for_status()?.json().await?;
+    assert_eq!(looked_up["receipts"][0], local_receipt);
     let transport = StreamableHttpClientTransport::with_client(
         http.clone(),
         StreamableHttpClientTransportConfig::with_uri("http://localhost/mcp"),
@@ -61,6 +68,9 @@ async fn unix_socket_mcp_and_local_api_share_the_same_registry() -> anyhow::Resu
             .await
         }
     };
+    let other_actor = invoke("get_mutation_receipts", json!({"request_ids":[request_id]})).await?;
+    assert_eq!(other_actor.is_error, Some(true));
+    assert_eq!(other_actor.structured_content.unwrap()["code"], "not_found");
     let found = invoke(
         "search_memories",
         json!({"query": "unixregistryneedle", "fuzzy": false}),
@@ -143,6 +153,7 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
         "delete_memories",
         "list_commits",
         "get_commits",
+        "get_mutation_receipts",
         "create_type",
         "update_tag",
         "delete_reference_type",
@@ -164,6 +175,43 @@ async fn mcp_roundtrip_supports_discovery_writes_fuzzy_reads_and_conflicts() -> 
             .await
         }
     };
+    let request_id = "00000000-0000-0000-0000-000000000001";
+    let arguments = json!({"request_id":request_id,"commit_summary":"Create a review fixture.","memories":[{"key":"review","body":"reviewneedle","verified_at":null,"review_after":100}]});
+    let receipt = invoke("create_memories", arguments.clone()).await?;
+    assert_ne!(receipt.is_error, Some(true));
+    let receipt = receipt.structured_content.unwrap();
+    assert!(receipt["memories"][0].get("body").is_none());
+    assert_eq!(
+        invoke("create_memories", arguments)
+            .await?
+            .structured_content
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        invoke("get_mutation_receipts", json!({"request_ids":[request_id]}))
+            .await?
+            .structured_content
+            .unwrap()["receipts"][0],
+        receipt
+    );
+    let reviewed = invoke(
+        "search_memories",
+        json!({"query":"reviewneedle","review_due_by":100,"is_verified":false}),
+    )
+    .await?;
+    assert_eq!(reviewed.structured_content.unwrap()["total"], 1);
+    let excluded = invoke(
+        "list_memories",
+        json!({"review_due_by":99,"is_verified":false}),
+    )
+    .await?;
+    assert!(
+        excluded.structured_content.unwrap()["memories"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let created = invoke("create_memories", json!({"commit_summary":"Test change", "memories": [{"key": "reading", "title": "Reading", "body": "Remember the beautiful library.", "summary": "Library knowledge", "scope": "personal", "basis": "observed", "observed_at": 100, "verified_at": 200, "review_after": 300}]})).await?;
     assert_ne!(created.is_error, Some(true));
     assert_eq!(

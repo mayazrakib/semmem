@@ -424,3 +424,101 @@ async fn log_crash_before_commit_rolls_back_the_entire_batch() {
 async fn log_crash_after_commit_replays_without_duplicate_events_or_audits() {
     assert_log_recovers("after_log_commit", 1).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "fault-injection")]
+async fn idempotent_mutations_recover_receipts_at_every_commit_boundary() {
+    for operation in ["create_memories", "update_memories", "delete_memories"] {
+        for fault in [
+            "after_sqlite_commit",
+            "after_index_commit",
+            "before_acknowledgment",
+            "publication_failure",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("service.sock");
+            let mut initial = ServerProcess::start(directory.path(), &socket, None, "initialize");
+            let client = initial.wait_ready(&socket).await;
+            let input = if operation == "create_memories" {
+                json!({"key":"memory","body":"recoveryneedle"})
+            } else {
+                let created = invoke(&client, "create_memories", json!({"commit_summary":"Seed.","memories":[{"key":"memory","body":"originalneedle"}]})).await;
+                let mut input =
+                    json!({"key":"memory","expected_token":created["memories"][0]["system_token"]});
+
+                if operation == "update_memories" {
+                    input["body"] = json!("recoveryneedle");
+                }
+
+                input
+            };
+            drop(client);
+            drop(initial);
+            let request_id = "00000000-0000-0000-0000-000000000001";
+            let arguments = json!({"request_id":request_id,"commit_summary":"Crash recovery mutation.","memories":[input]});
+            let mut interrupted =
+                ServerProcess::start(directory.path(), &socket, Some(fault), "interrupted");
+            let client = interrupted.wait_ready(&socket).await;
+            let response = client
+                .post(format!("http://localhost/api/{operation}"))
+                .json(&arguments)
+                .send()
+                .await;
+
+            if fault == "publication_failure" {
+                let response = response.unwrap();
+                assert_eq!(response.status(), 500);
+                let error: Value = response.json().await.unwrap();
+                assert_eq!(error["code"], "publication_incomplete");
+                assert_eq!(error["committed"], true);
+                assert_eq!(error["request_id"], request_id);
+                let lookup = invoke(
+                    &client,
+                    "get_mutation_receipts",
+                    json!({"request_ids":[request_id]}),
+                )
+                .await;
+                assert_eq!(lookup["receipts"][0]["commit_id"], error["commit_id"]);
+            } else {
+                assert!(
+                    response.is_err(),
+                    "{operation} at {fault} unexpectedly returned a response."
+                );
+                assert_eq!(interrupted.wait_exit().await.code(), Some(86));
+            }
+
+            drop(client);
+            drop(interrupted);
+            let persisted = Store::open_read_only(directory.path().join("memory.sqlite3")).unwrap();
+            let receipt = persisted
+                .get_mutation_receipts(&[request_id.to_owned()], "human")
+                .unwrap()
+                .remove(0);
+            drop(persisted);
+            let mut recovered = ServerProcess::start(directory.path(), &socket, None, "recovered");
+            let client = recovered.wait_ready(&socket).await;
+            assert_eq!(invoke(&client, operation, arguments.clone()).await, receipt);
+            assert_eq!(invoke(&client, operation, arguments).await, receipt);
+            let found = invoke(
+                &client,
+                "search_memories",
+                json!({"query":"recoveryneedle","fuzzy":false}),
+            )
+            .await;
+            assert_eq!(
+                found["total"],
+                if operation == "delete_memories" { 0 } else { 1 }
+            );
+            let commits = invoke(&client, "list_commits", json!({"limit":100})).await;
+            assert_eq!(
+                commits["commits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|commit| commit["summary"] == "Crash recovery mutation.")
+                    .count(),
+                1
+            );
+        }
+    }
+}

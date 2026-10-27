@@ -14,6 +14,8 @@ pub struct AppError {
     pub commit_id: Option<i64>,
     #[serde(default)]
     pub affected: Vec<MemoryReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,7 @@ impl AppError {
             searchable: false,
             commit_id: None,
             affected: Vec::new(),
+            request_id: None,
         }
     }
 
@@ -276,6 +279,8 @@ pub struct GetMemories {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListMemories {
+    pub review_due_by: Option<i64>,
+    pub is_verified: Option<bool>,
     pub scope: Option<String>,
     pub basis: Option<Basis>,
     pub r#type: Option<String>,
@@ -295,6 +300,8 @@ impl Default for ListMemories {
             basis: None,
             r#type: None,
             tags: vec![],
+            review_due_by: None,
+            is_verified: None,
             referenced_to: None,
             referenced_from: None,
             limit: 20,
@@ -306,6 +313,8 @@ impl Default for ListMemories {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
+    pub review_due_by: Option<i64>,
+    pub is_verified: Option<bool>,
     pub scope: Option<String>,
     pub basis: Option<Basis>,
     pub query: String,
@@ -394,6 +403,12 @@ pub struct ListCommits {
 #[serde(deny_unknown_fields)]
 pub struct GetCommits {
     pub ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetMutationReceipts {
+    pub request_ids: Vec<String>,
 }
 
 #[cfg(test)]

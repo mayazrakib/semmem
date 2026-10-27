@@ -6,6 +6,28 @@ The historical version-two section describes the earlier schema and its former a
 
 Measurements use a release build on Linux x86-64 under a Microsoft hypervisor, with an AMD Ryzen 9 9950X3D reported by the host and 24 available logical CPUs. Rust 1.98.0 compiled the benchmark with thin LTO. SQLite uses WAL and FULL synchronization; successful writes include durable index publication. Storage and filesystem behavior affect these results.
 
+## Current Review Filtering and Mutation Receipts
+
+[The review and receipt report](../benchmarks/results/review-mutations-current-state.json) measures the current schema-v5 implementation on three fresh 10,000-memory fixtures, each with 4,423-byte bodies and 100 requests per scenario. One percent of fixture memories are due and have no recorded verification. Each read scenario has three warmup requests. First writes alternate the order of legacy and compact modes. Replays reuse the exact original inputs. The report includes source SHA-256 hashes, revision, toolchain, environment, query plans, response sizes, and p50/p95/p99 for every repetition.
+
+| Scenario | Request p95 range across three repetitions |
+|---|---:|
+| Browse without review filters | 0.174 to 0.209 ms |
+| Browse due for review | 0.359 to 0.411 ms |
+| Browse with no recorded verification | 0.144 to 0.165 ms |
+| Search without review filters | 8.652 to 9.985 ms |
+| Search due for review | 1.692 to 1.862 ms |
+| Search with no recorded verification | 1.525 to 1.731 ms |
+| First write without a request ID | 194.871 to 309.202 ms |
+| First write with a request ID | 167.423 to 280.856 ms |
+| Identical request replay | 0.260 to 0.293 ms |
+
+Compact first-write responses used 96.1 percent fewer serialized JSON bytes in this workload. This is a byte comparison, not a tokenizer measurement. SQLite query plans used the partial review-date index and the partial recent-order index for unverified records after fixture statistics were collected with `ANALYZE`. Due-date browsing still sorts the matching rows to preserve the existing recent-first order.
+
+These sequential release-build measurements cover in-process `Service::dispatch`, including response construction, SQLite FULL durability, and search publication. They exclude transport, OAuth, MCP framing, final JSON encoding latency, and model latency. Operating-system caches were not flushed. First-write tails vary across repetitions; these results do not establish a general first-write speed improvement or performance at millions of memories. The retained legacy million-memory reports remain historical evidence.
+
+Reproduce with `cargo bench --locked --bench review_mutations`. The benchmark uses dedicated temporary databases and never opens production data.
+
 ## Current Work Logging
 
 [The logging report](../benchmarks/results/logging-current-state.json) records three repetitions of 2,000 identical events on fresh databases per scenario. A release build used Rust 1.98.0 on Linux x86-64, WSL2, an AMD Ryzen 9 9950X3D, and 24 logical CPUs. Each synchronous request includes SQLite FULL durability, normalized audit inserts, serialization, and writer coordination. There are no warmups or OS cache flushes. HTTP, OAuth, MCP framing, and AI latency are excluded.
