@@ -87,5 +87,3 @@ Read `AGENTS.md` and the applicable skills in `.ai/skills/` before contributing.
 ## 8. License
 
 `semmem` is pending license classification. No license is granted until the owner resolves it.
-
-See `ACKNOWLEDGEMENTS.md` for third-party notices and attributions.
