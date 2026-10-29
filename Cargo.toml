@@ -1,6 +1,6 @@
 [package]
 name = "semmem"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 description = "Current-state human-readable memory, audited writes, and retrieval for AI."
 repository = "https://github.com/mayazrakib/semmem"

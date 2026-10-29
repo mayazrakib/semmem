@@ -55,6 +55,11 @@ pub enum Command {
     #[command(name = "status", about = "Show structured service status.")]
     STATUS,
     #[command(
+        name = "check_mcp",
+        about = "Verify logging tool discovery on the running private MCP endpoint without writing."
+    )]
+    CHECK_MCP,
+    #[command(
         name = "search",
         about = "Search memory text, tolerating spelling mistakes by default."
     )]
@@ -392,6 +397,86 @@ impl LocalClient {
         Ok(Self { client })
     }
 
+    pub async fn check_mcp(&self) -> Result<Value> {
+        let initialize = self.mcp_request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "semmem-check", "version": env!("CARGO_PKG_VERSION")}
+            }),
+            None,
+        ).await?;
+        let protocol = initialize["protocolVersion"].as_str()
+            .context("MCP initialization did not return a protocol version.")?;
+        let mut names = Vec::new();
+        let mut cursor = Value::Null;
+
+        loop {
+            let params = if cursor.is_null() { json!({}) } else { json!({"cursor": cursor}) };
+            let result = self.mcp_request(
+                2,
+                "tools/list",
+                params,
+                Some(protocol),
+            ).await?;
+            let tools = result["tools"].as_array().context("MCP discovery did not return tools.")?;
+
+            for tool in tools {
+                let name = tool["name"].as_str().context("MCP discovery returned an unnamed tool.")?;
+                names.push(name.to_owned());
+            }
+
+            let next = result.get("nextCursor").cloned().unwrap_or(Value::Null);
+
+            if next.is_null() {
+                break;
+            }
+
+            anyhow::ensure!(next.is_string() && next != cursor, "MCP discovery returned an invalid cursor.");
+            cursor = next;
+        }
+
+        let missing: Vec<_> = ["append_logs", "get_logs", "list_logs"].into_iter()
+            .filter(|name| !names.iter().any(|found| found == name))
+            .collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "MCP capability mismatch: missing {}. Install the current Semmem executable and restart its service, then refresh the registered client tool catalog. This is not an authentication denial.",
+            missing.join(", "),
+        );
+
+        Ok(json!({"ready": true, "server_info": initialize["serverInfo"], "tools": names}))
+    }
+
+    async fn mcp_request(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        protocol: Option<&str>,
+    ) -> Result<Value> {
+        let mut request = self.client.post("http://localhost/mcp")
+            .header("Accept", "application/json, text/event-stream")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+
+        if let Some(protocol) = protocol {
+            request = request.header("MCP-Protocol-Version", protocol);
+        }
+
+        let response: Value = request.send().await?
+            .error_for_status()?
+            .json().await?;
+
+        if let Some(error) = response.get("error") {
+            bail!("MCP {method} failed: {error}");
+        }
+
+        response.get("result").cloned().context("MCP response did not contain a result.")
+    }
+
     pub async fn request(
         &self,
         operation: &str,
@@ -442,7 +527,7 @@ impl LocalClient {
 
 pub async fn execute(cli: Cli) -> Result<()> {
     let client = LocalClient::connect(&cli.socket)?;
-    let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS
+    let is_structured = matches!(&cli.command, Command::SEARCH { .. } | Command::STATUS | Command::CHECK_MCP
             | Command::APPEND_LOGS
             | Command::GET_LOGS { .. }
             | Command::MUTATION_RECEIPTS { .. }
@@ -453,6 +538,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::START => crate::lifecycle::execute("start").await?,
         Command::STOP => crate::lifecycle::execute("stop").await?,
         Command::STATUS => crate::lifecycle::execute("status").await?,
+        Command::CHECK_MCP => client.check_mcp().await?,
         Command::SEARCH { query, scope, basis, r#type, tags, exact, prefix, limit, review } => {
             let (review_due_by, is_verified) = review.resolve()?;
             let request = SearchRequest { review_due_by, is_verified, query, scope, basis, r#type, tags, prefix, fuzzy: !exact, limit };

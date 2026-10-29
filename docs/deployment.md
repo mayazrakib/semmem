@@ -27,7 +27,7 @@ Select the socket with `--socket` or `SEMMEM_SOCKET`. Without OAuth configuratio
 
 ## Private ChatGPT tunnel
 
-The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and uses the trusted private MCP identity for system audit attribution. Every mutation requires a nonempty `commit_summary`. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
+The same private Unix socket also serves stateless MCP at `/mcp`. It shares the CLI registry and uses the trusted private MCP identity for system audit attribution. Memory and taxonomy mutations require a nonempty `commit_summary`; work-event appends require a nonempty `summary`. Filesystem permissions protect the socket; this endpoint does not open a TCP listener or weaken the separate OAuth-protected remote router.
 
 For OpenAI Secure MCP Tunnel, create a dedicated tunnel associated with the intended ChatGPT workspace. Store the runtime key in a private file outside this repository and use a file reference. An example foreground launch is:
 
@@ -116,6 +116,8 @@ These instructions describe the delivered configuration. They do not establish a
 
 ## Schema Reset Deployment
 
+Routine deployments with an unchanged schema preserve the existing database, work events, and search data. They require no migration, database reset, or additional SQL files; `database/initialize.sql` remains the sole schema definition. The reset procedure below applies only to a separately authorized incompatible-schema reset.
+
 The current initializer defines schema v5. Existing incompatible databases, including databases with the previous architecture, are rejected without migration. Build and verify the default-feature release before deployment.
 
 For an explicitly authorized reset, stop both Semmem and its tunnel before permanently removing the old SQLite file, its WAL and SHM sidecars, the derived `search/` directory, and `search.identity`. Verify the exact configured data directory first. Preserve credentials, environment files, systemd overrides, tunnel state, and unrelated backups. Install the validated revision, restart the services, verify schema v5 and integrity, and confirm that no memories exist. Verify actual MCP calls separately from tunnel health.
@@ -123,3 +125,16 @@ For an explicitly authorized reset, stop both Semmem and its tunnel before perma
 ## Batched Work Logging
 
 `semmem append_logs` reads one JSON object containing `summary` and `events` from standard input. Each event contains `id`, `level`, `source`, `message`, and `timestamp`; `task_id` and `scope` are optional. `semmem get_logs UUID...` reads events by ID. `semmem list_logs` accepts `--task-id`, `--scope`, `--source`, `--level`, `--since`, `--until`, `--limit`, and `--cursor`. These commands emit structured JSON. MCP exposes the same three operations. See [schema](schema.md) for timestamp, idempotency, and receipt contracts. Logs have no edit or delete operation.
+
+## Logging Capability Verification
+
+After installing an updated executable, restart `semmem.service` before restarting its tunnel. Replacing the executable alone leaves the old process and tool catalog running. Verify the running private MCP endpoint without writing data:
+```sh
+semmem --socket "$HOME/.local/share/semmem/service.sock" check_mcp
+```
+
+This command initializes MCP and reads `tools/list`, including pagination. It reports the running server version and advertised tool names, and exits unsuccessfully when `append_logs`, `get_logs`, or `list_logs` is missing. It uses the same Unix-socket `/mcp` endpoint as the private tunnel. A successful CLI append through `/api` or direct SQLite access does not verify MCP logging.
+
+Refresh the existing registered Semmem app connection and its tool catalog in each affected ChatGPT, Dots, and Codex client after updating the server. Confirm the active schemas expose all three logging tools. A packaged skill, successful tunnel poll, or local `check_mcp` result does not prove that the client refreshed its catalog. If the local check succeeds but the client lacks tools, inspect the existing app binding and client catalog rather than creating a replacement registry or changing credentials. Missing discovery is a capability mismatch; explicit HTTP authentication and scope failures are separate errors.
+
+Before claiming end-to-end logging, append one authorized event through the affected connected client's `append_logs`, verify its returned ID and inserted plus replayed count, and read that same ID through `get_logs`. Preserve the event UUID and payload for recovery. Use the single actual completion event when the standing completion policy applies; do not create extra automatic probe events. Local integration tests use temporary registries and do not establish live client availability.

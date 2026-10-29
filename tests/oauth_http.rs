@@ -153,6 +153,49 @@ async fn oauth_issuer_tokens_scopes_and_http_discovery_are_enforced() -> anyhow:
             .iter()
             .any(|tool| tool.name == "create_memories")
     );
+    let invoke = |name: &'static str, arguments: serde_json::Value| {
+        let peer = peer.peer().clone();
+
+        async move {
+            peer.call_tool(
+                CallToolRequestParams::new(name)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            ).await
+        }
+    };
+    let logging_tools = peer.list_tools(None).await?.tools;
+
+    for name in ["append_logs", "get_logs", "list_logs"] {
+        assert!(logging_tools.iter().any(|tool| tool.name == name), "Missing tool {name}.");
+    }
+
+    let event_id = "00000000-0000-0000-0000-000000000099";
+    let log_batch = json!({
+        "summary": "Record the test completion event.",
+        "events": [{
+            "id": event_id,
+            "level": "info",
+            "source": "Codex",
+            "message": "Verified MCP completion logging.",
+            "timestamp": "2026-10-29T15:00:00.123+11:00",
+            "scope": "mcp regression"
+        }]
+    });
+    let appended = invoke("append_logs", log_batch.clone()).await?;
+    assert_ne!(appended.is_error, Some(true));
+    let receipt = appended.structured_content.unwrap();
+    assert_eq!(receipt["ids"], json!([event_id]));
+    assert_eq!(receipt["inserted"], 1);
+    assert_eq!(receipt["replayed"], 0);
+    let replay = invoke("append_logs", log_batch).await?.structured_content.unwrap();
+    assert_eq!(replay["inserted"], 0);
+    assert_eq!(replay["replayed"], 1);
+    let fetched = invoke("get_logs", json!({"ids": [event_id]})).await?;
+    let fetched = fetched.structured_content.unwrap();
+    assert_eq!(fetched["events"][0]["id"], event_id);
+    assert_eq!(fetched["events"][0]["system_created_by"], "test-human");
+    let listed = invoke("list_logs", json!({"scope": "mcp regression"})).await?;
+    assert_eq!(listed.structured_content.unwrap()["events"][0]["id"], event_id);
     let created = peer
         .call_tool(
             CallToolRequestParams::new("create_memories").with_arguments(
