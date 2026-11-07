@@ -13,7 +13,7 @@
 *.token
 *.secret
 
-# Os Metadata
+# OS Metadata
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -24,7 +24,7 @@ $RECYCLE.BIN/
 .Trash-*
 .directory
 
-# Editor And Ide Metadata
+# Editor And IDE Metadata
 .idea/
 .vscode/
 *.code-workspace
@@ -105,5 +105,5 @@ Cargo.lock.local
 *.dump
 /.semmem/
 
-# Ai
+# AI
 .dmux/

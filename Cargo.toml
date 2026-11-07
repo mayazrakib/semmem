@@ -55,15 +55,15 @@ codegen-units = 1
 
 [[bench]]
 name = "search"
-path = "tests/perf/search.rs"
+path = "benchmarks/search.rs"
 harness = false
 
 [[bench]]
 name = "logging"
-path = "tests/perf/logging.rs"
+path = "benchmarks/logging.rs"
 harness = false
 
 [[bench]]
 name = "review_mutations"
-path = "tests/perf/review_mutations.rs"
+path = "benchmarks/review_mutations.rs"
 harness = false

@@ -196,7 +196,7 @@ fn main() -> Result<()> {
         "src/service.rs",
         "src/search.rs",
         "src/models.rs",
-        "tests/perf/review_mutations.rs",
+        "benchmarks/review_mutations.rs",
     ];
     let hashes = source_paths
         .into_iter()

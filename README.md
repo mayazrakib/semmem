@@ -1,7 +1,5 @@
-# `semmem`
-
 ![Version](https://img.shields.io/badge/Version-0.1.0-737373?style=flat-square)
-![License](https://img.shields.io/badge/License-Unknown-737373?style=flat-square)
+![License](https://img.shields.io/badge/License-Proprietary-737373?style=flat-square)
 ![Languages](https://img.shields.io/badge/Languages-Rust-737373?style=flat-square)
 ![Frameworks](https://img.shields.io/badge/Frameworks-SQLite%2C%20Tantivy-737373?style=flat-square)
 ![Compatibility](https://img.shields.io/badge/Compatibility-Unknown-737373?style=flat-square)
@@ -36,7 +34,7 @@ semmem search "reading"
 
 ## 4. Architecture
 
-SQLite is authoritative, and the Tantivy index can be rebuilt from it. The service owns storage, and clients connect through a private Unix socket. MCP can reach the same registry through a private tunnel or an OAuth-protected HTTP endpoint. `database/initialize.sql` initializes new databases, and existing incompatible schemas are rejected intact. Benchmark code lives in `tests/perf/`, and historical results stay byte-preserved under `benchmarks/results/`.
+SQLite is authoritative, and the Tantivy index can be rebuilt from it. The service owns storage, and clients connect through a private Unix socket. MCP can reach the same registry through a private tunnel or an OAuth-protected HTTP endpoint. `database/initialize.sql` initializes new databases, and existing incompatible schemas are rejected intact. Benchmark code lives in `benchmarks/`, and historical results stay byte-preserved under `benchmarks/results/`.
 
 ## 5. Dependencies
 
@@ -86,4 +84,4 @@ Read `AGENTS.md` and the applicable skills in `.ai/skills/` before contributing.
 
 ## 8. License
 
-`semmem` is pending license classification. No license is granted until the owner resolves it.
+`semmem` is proprietary. All rights are reserved. Use, modification, and redistribution require authorization.
